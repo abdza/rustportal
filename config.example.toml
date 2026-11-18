@@ -14,6 +14,10 @@ module_dir = "modulemigration"
 # run scheduled pages and send queued e-mail; turn off when the other portal on the
 # same database already does, or every job runs twice
 # run_scheduler = true
+# time zone for the database session (SQL now(), current_date). Unset: this
+# machine's zone when g6_schema is on (as a Grails portal's JDBC driver uses),
+# otherwise UTC
+# db_timezone = "Asia/Kuala_Lumpur"
 # Content-Security-Policy header for every page; unset sends none. To match a g6
 # portal, which keeps pages to their own site's resources, use its policy:
 # content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; frame-ancestors 'self'"

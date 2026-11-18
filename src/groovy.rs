@@ -650,3 +650,26 @@ pub fn select_html(kw: &Row) -> String {
     h.push_str("</select>");
     h
 }
+
+/// A value as Java's toString() writes it (what a Grails page prints for a
+/// returned value): lists as [a, b], maps as {k=v}, null as null.
+pub fn to_groovy_string(v: &Value) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::String(s) => s.clone(),
+        Value::Array(a) => format!("[{}]", a.iter().map(to_groovy_string).collect::<Vec<_>>().join(", ")),
+        Value::Object(m) => format!("{{{}}}", m.iter().map(|(k, x)| format!("{}={}", k, to_groovy_string(x))).collect::<Vec<_>>().join(", ")),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod groovy_string_tests {
+    use super::*;
+    #[test]
+    fn groovy_strings() {
+        assert_eq!(to_groovy_string(&serde_json::json!([])), "[]");
+        assert_eq!(to_groovy_string(&serde_json::json!({})), "{}");
+        assert_eq!(to_groovy_string(&serde_json::json!([{"a": 1, "b": "x"}, null])), "[{a=1, b=x}, null]");
+    }
+}

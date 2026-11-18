@@ -316,7 +316,8 @@ async fn main() -> anyhow::Result<()> {
     }
     db::set_page_tables(&cfg.page_table, &cfg.page_data_table);
     db::set_g6(cfg.g6_schema);
-    let database = db::Db::connect(&cfg.database_url, cfg.db_pool).await?;
+    let tz = cfg.db_timezone.clone().or_else(|| if cfg.g6_schema { db::local_timezone() } else { None });
+    let database = db::Db::connect(&cfg.database_url, cfg.db_pool, tz).await?;
     if cfg.g6_schema {
         entity::g6_views(&database).await?;
     }

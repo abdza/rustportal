@@ -38,6 +38,10 @@ pub struct Config {
     pub address: String,
     pub database_url: String,
     pub db_pool: u32,
+    /// session time zone for the database (now(), current_date). Unset: this
+    /// machine's zone with g6_schema (as the Grails portal's JDBC driver uses),
+    /// otherwise UTC.
+    pub db_timezone: Option<String>,
     pub upload_dir: String,
     pub module_dir: String,
     /// link on "Designed by ... Team" in the footer
@@ -78,6 +82,7 @@ impl Default for Config {
             address: "0.0.0.0".into(),
             database_url: "postgres://postgres@localhost/rustportal".into(),
             db_pool: 20,
+            db_timezone: None,
             upload_dir: "uploads".into(),
             module_dir: "modulemigration".into(),
             credits_url: String::new(),

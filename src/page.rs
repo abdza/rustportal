@@ -475,6 +475,8 @@ pub async fn runpage(mut ctx: Ctx, module: &str, slug: &str, args: Vec<String>) 
         Value::Object(o) if o.contains_key("content") => s(o, "content"),
         Value::String(x) => x.clone(),
         Value::Null => "<div class='alert alert-success'>Done</div>".to_string(),
+        // a g6 portal prints what the script returned as Java would ([a, b], {k=v})
+        other if crate::db::g6() => esc(&crate::groovy::to_groovy_string(other)),
         other => format!("<pre>{}</pre>", esc(&serde_json::to_string_pretty(other).unwrap_or_default())),
     };
     let title = s(&page, "title");

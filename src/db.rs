@@ -167,8 +167,23 @@ pub fn no_params() -> Row {
 }
 
 impl Db {
-    pub async fn connect(url: &str, max: u32) -> Result<Db> {
-        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(max).connect(url).await?;
+    /// `timezone`: the session time zone for SQL's now() / current_date (sqlx
+    /// would otherwise start every connection in UTC).
+    pub async fn connect(url: &str, max: u32, timezone: Option<String>) -> Result<Db> {
+        let tz = timezone.filter(|z| !z.is_empty() && z.chars().all(|c| c.is_ascii_alphanumeric() || "/_+-:".contains(c)));
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(max)
+            .after_connect(move |conn, _meta| {
+                let tz = tz.clone();
+                Box::pin(async move {
+                    if let Some(z) = tz {
+                        sqlx::Executor::execute(&mut *conn, format!("SET TIME ZONE '{}'", z).as_str()).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .connect(url)
+            .await?;
         Ok(Db { pool })
     }
 }
@@ -401,4 +416,17 @@ pub fn ts_text(d: chrono::NaiveDateTime) -> String {
     let frac = d.format("%.f").to_string();
     let frac = frac.trim_end_matches('0');
     if frac.len() > 1 { format!("{}{}", base, frac) } else { base }
+}
+
+/// This machine's time zone name (TZ, else what /etc/localtime points at).
+pub fn local_timezone() -> Option<String> {
+    if let Ok(t) = std::env::var("TZ") {
+        let t = t.trim_start_matches(':').to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    let target = std::fs::read_link("/etc/localtime").ok()?;
+    let t = target.to_string_lossy().to_string();
+    t.split_once("zoneinfo/").map(|(_, z)| z.to_string())
 }
