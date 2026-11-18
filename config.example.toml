@@ -1,0 +1,19 @@
+# Copy to config.toml and adjust. Every key is optional.
+port = 9090
+address = "0.0.0.0"
+database_url = "postgres://postgres@localhost/rustportal"
+upload_dir = "uploads"
+module_dir = "modulemigration"
+# a Grails/GSP portal's modulemigration folder: modules there can be imported directly (read only)
+# g5_module_dir = "/path/to/other-portal/modulemigration"
+app_name = "Portal"
+# link on "Designed by <app name> Team" in the footer
+# credits_url = "https://example.com/"
+allow_registration = false
+session_hours = 12
+
+[mail]
+host = "127.0.0.1"
+port = 1025
+from = "portal@localhost"
+disabled = false

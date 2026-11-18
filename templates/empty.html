@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta content="width=device-width, initial-scale=1.0" name="viewport">
+
+  <title>{{ app_name }} {{ title }}</title>
+  <meta content="" name="description">
+  <meta content="" name="keywords">
+  <link rel="icon" type="image/x-ico" href="/static/images/favicon.ico">
+  <link href="/static/images/apple-touch-icon.png" rel="apple-touch-icon">
+
+  {# same stylesheets, in the same order, as the Grails portal's application.css #}
+  <link href="/static/css/fonts.css" rel="stylesheet">
+  <link href="/static/css/grails.css" rel="stylesheet">
+  <link href="/static/libs/bootstrap-5.3.3/css/bootstrap.min.css" rel="stylesheet">
+  <link href="/static/libs/bootstrap-icons/bootstrap-icons.css" rel="stylesheet">
+  <link href="/static/libs/boxicons/css/boxicons.min.css" rel="stylesheet">
+  <link href="/static/libs/quill/quill.snow.css" rel="stylesheet">
+  <link href="/static/libs/quill/quill.bubble.css" rel="stylesheet">
+  <link href="/static/libs/remixicon/remixicon.css" rel="stylesheet">
+  <link href="/static/libs/simple-datatables/style.css" rel="stylesheet">
+  <link href="/static/libs/tagify/tagify.css" rel="stylesheet">
+  <link href="/static/libs/dragsort/dragsort.css" rel="stylesheet">
+  <link href="/static/libs/select2/css/select2.min.css" rel="stylesheet">
+  <link href="/static/libs/niceadmin/css/style.css" rel="stylesheet">
+  <link href="/static/css/main.css" rel="stylesheet">
+  <link href="/static/css/mobile.css" rel="stylesheet">
+  <link href="/static/css/portal.css" rel="stylesheet">
+
+  {# jQuery first: page templates use $ in inline scripts #}
+  <!-- Vendor JS Files (same set as the Grails portal; in the head because page
+       templates use them in inline scripts) -->
+  <script src="/static/libs/jquery/jquery.min.js"></script>
+  <script src="/static/libs/tagify/tagify.min.js"></script>
+  <script src="/static/libs/tagify/tagify.polyfills.min.js"></script>
+  <script src="/static/libs/dragsort/dragsort.js"></script>
+  <script src="/static/libs/select2/js/select2.min.js"></script>
+  <script src="/static/libs/bootstrap-5.3.3/js/bootstrap.bundle.min.js"></script>
+  <script src="/static/libs/simple-datatables/simple-datatables.js"></script>
+  <script src="/static/libs/chart.js/chart.min.js"></script>
+  <script src="/static/libs/echarts/echarts.min.js"></script>
+  <script src="/static/libs/apexcharts/apexcharts.min.js"></script>
+  <script src="/static/libs/quill/quill.min.js"></script>
+  <script src="/static/libs/tinymce/tinymce.min.js"></script>
+  <script src="/static/js/htmx.min.js"></script>
+  <script src="/static/js/hyperscript.min.js"></script>
+  <script>
+    var CSRF_TOKEN = "{{ csrf }}";
+    $.ajaxSetup({ headers: { "X-CSRF-Token": CSRF_TOKEN } });
+    // every POST form carries the session token, including forms written by page authors
+    document.addEventListener("submit", function (ev) {
+      var f = ev.target;
+      if (f && f.tagName === "FORM" && (f.method || "").toLowerCase() === "post" && !f.querySelector("input[name=csrf_token]")) {
+        var i = document.createElement("input");
+        i.type = "hidden"; i.name = "csrf_token"; i.value = CSRF_TOKEN;
+        f.appendChild(i);
+      }
+    }, true);
+  </script>
+</head>
+
+<body>
+  {% if flash %}<script>alert({{ flash|tojson }});</script>{% endif %}
+{{ content|safe }}
+  <script>window.tinymce = window.tinymce || { init: function () {} };</script>
+  <script src="/static/libs/niceadmin/js/main.js"></script>
+</body>
+
+</html>

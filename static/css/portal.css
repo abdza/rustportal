@@ -1,0 +1,5 @@
+/* rustportal additions; everything else comes from the Grails portal's stylesheets */
+.code-edit, .code-view { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+.code-view { background: #f6f8fa; padding: 8px; max-height: 400px; overflow: auto; white-space: pre-wrap; }
+.numbercell { text-align: right; }
+.tree-list { list-style: none; border-left: 1px dashed #bbb; padding-left: 16px; }

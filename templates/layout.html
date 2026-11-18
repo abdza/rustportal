@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta content="width=device-width, initial-scale=1.0" name="viewport">
+
+  <title>{{ app_name }} {{ title }}</title>
+  <meta content="" name="description">
+  <meta content="" name="keywords">
+  <link rel="icon" type="image/x-ico" href="/static/images/favicon.ico">
+  <link href="/static/images/apple-touch-icon.png" rel="apple-touch-icon">
+
+  {# same stylesheets, in the same order, as the Grails portal's application.css #}
+  <link href="/static/css/fonts.css" rel="stylesheet">
+  <link href="/static/css/grails.css" rel="stylesheet">
+  <link href="/static/libs/bootstrap-5.3.3/css/bootstrap.min.css" rel="stylesheet">
+  <link href="/static/libs/bootstrap-icons/bootstrap-icons.css" rel="stylesheet">
+  <link href="/static/libs/boxicons/css/boxicons.min.css" rel="stylesheet">
+  <link href="/static/libs/quill/quill.snow.css" rel="stylesheet">
+  <link href="/static/libs/quill/quill.bubble.css" rel="stylesheet">
+  <link href="/static/libs/remixicon/remixicon.css" rel="stylesheet">
+  <link href="/static/libs/simple-datatables/style.css" rel="stylesheet">
+  <link href="/static/libs/tagify/tagify.css" rel="stylesheet">
+  <link href="/static/libs/dragsort/dragsort.css" rel="stylesheet">
+  <link href="/static/libs/select2/css/select2.min.css" rel="stylesheet">
+  <link href="/static/libs/niceadmin/css/style.css" rel="stylesheet">
+  <link href="/static/css/main.css" rel="stylesheet">
+  <link href="/static/css/mobile.css" rel="stylesheet">
+  <link href="/static/css/portal.css" rel="stylesheet">
+
+  {# jQuery first: page templates use $ in inline scripts #}
+  <!-- Vendor JS Files (same set as the Grails portal; in the head because page
+       templates use them in inline scripts) -->
+  <script src="/static/libs/jquery/jquery.min.js"></script>
+  <script src="/static/libs/tagify/tagify.min.js"></script>
+  <script src="/static/libs/tagify/tagify.polyfills.min.js"></script>
+  <script src="/static/libs/dragsort/dragsort.js"></script>
+  <script src="/static/libs/select2/js/select2.min.js"></script>
+  <script src="/static/libs/bootstrap-5.3.3/js/bootstrap.bundle.min.js"></script>
+  <script src="/static/libs/simple-datatables/simple-datatables.js"></script>
+  <script src="/static/libs/chart.js/chart.min.js"></script>
+  <script src="/static/libs/echarts/echarts.min.js"></script>
+  <script src="/static/libs/apexcharts/apexcharts.min.js"></script>
+  <script src="/static/libs/quill/quill.min.js"></script>
+  <script src="/static/libs/tinymce/tinymce.min.js"></script>
+  <script src="/static/js/htmx.min.js"></script>
+  <script src="/static/js/hyperscript.min.js"></script>
+  <script>
+    var CSRF_TOKEN = "{{ csrf }}";
+    $.ajaxSetup({ headers: { "X-CSRF-Token": CSRF_TOKEN } });
+    // every POST form carries the session token, including forms written by page authors
+    document.addEventListener("submit", function (ev) {
+      var f = ev.target;
+      if (f && f.tagName === "FORM" && (f.method || "").toLowerCase() === "post" && !f.querySelector("input[name=csrf_token]")) {
+        var i = document.createElement("input");
+        i.type = "hidden"; i.name = "csrf_token"; i.value = CSRF_TOKEN;
+        f.appendChild(i);
+      }
+    }, true);
+    // and so does every same-origin request a script makes, not only jQuery's
+    // (calendars, charts and other libraries post with fetch or XMLHttpRequest)
+    (function () {
+      var same = function (u) { try { return new URL(u, location.href).origin === location.origin; } catch (e) { return true; } };
+      if (window.fetch) {
+        var f0 = window.fetch;
+        window.fetch = function (input, init) {
+          init = init || {};
+          var url = typeof input === "string" ? input : (input && input.url) || "";
+          var method = (init.method || (input && input.method) || "GET").toUpperCase();
+          if (method !== "GET" && method !== "HEAD" && same(url)) {
+            var h = new Headers(init.headers || (typeof input !== "string" && input.headers) || {});
+            if (!h.has("X-CSRF-Token")) h.set("X-CSRF-Token", CSRF_TOKEN);
+            init.headers = h;
+          }
+          return f0.call(this, input, init);
+        };
+      }
+      var open0 = XMLHttpRequest.prototype.open, send0 = XMLHttpRequest.prototype.send, set0 = XMLHttpRequest.prototype.setRequestHeader;
+      XMLHttpRequest.prototype.open = function (m, u) { this.__m = String(m).toUpperCase(); this.__u = u; this.__tok = false; return open0.apply(this, arguments); };
+      // jQuery and htmx set the header themselves; setting it twice would join the values
+      XMLHttpRequest.prototype.setRequestHeader = function (k, v) { if (String(k).toLowerCase() === "x-csrf-token") this.__tok = true; return set0.apply(this, arguments); };
+      XMLHttpRequest.prototype.send = function () {
+        if (!this.__tok && this.__m && this.__m !== "GET" && this.__m !== "HEAD" && same(this.__u)) { try { set0.call(this, "X-CSRF-Token", CSRF_TOKEN); } catch (e) {} }
+        return send0.apply(this, arguments);
+      };
+    })();
+  </script>
+</head>
+
+<body hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'>
+  {% if flash %}<script>alert({{ flash|tojson }});</script>{% endif %}
+
+  <!-- ======= Header ======= -->
+  <header id="header" class="header fixed-top d-flex align-items-center">
+
+    <div class="d-flex align-items-center justify-content-between">
+      <a href="/" class="logo d-flex align-items-center">
+        <img src="/static/images/logo.png" alt="">
+        <span class="d-none d-lg-block">{{ app_name }}</span>
+      </a>
+      <i class="bi bi-list toggle-sidebar-btn"></i>
+    </div><!-- End Logo -->
+
+    <div class="search-bar">
+      <form class="search-form d-flex align-items-center" method="get" action="/portalSearch/index">
+        <input type="text" name="q" placeholder="Search" title="Enter search keyword">
+        <button type="submit" title="Search"><i class="bi bi-search"></i></button>
+      </form>
+    </div><!-- End Search Bar -->
+
+    <nav class="header-nav ms-auto">
+      <ul class="d-flex align-items-center">
+
+        <li class="nav-item d-block d-lg-none">
+          <a class="nav-link nav-icon search-bar-toggle" href="#">
+            <i class="bi bi-search"></i>
+          </a>
+        </li><!-- End Search Icon-->
+
+        <li class="nav-item dropdown has-megamenu">
+          <a class="nav-link nav-icon" href="#" data-bs-toggle="dropdown">
+            <i class="bi bi-bank"></i>
+          </a>
+          <ul class="dropdown-menu dropdown-menu-end dropdown-menu-arrow megamenu">
+            <div class='row g-3'>
+            {{ megamenu|safe }}
+            </div>
+          </ul>
+        </li><!-- End main menu Nav -->
+
+        <li class="nav-item dropdown pe-3">
+
+          <a class="nav-link nav-profile d-flex align-items-center pe-0" href="#" data-bs-toggle="dropdown">
+          {% if user %}
+            <img src="{% if user.profilepic_id %}/fileLink/get/{{ user.profilepic_id }}?inline=1{% else %}/static/images/profile.png{% endif %}" alt="Profile" class="rounded-circle">
+            <span class="d-none d-md-block dropdown-toggle ps-2">{{ user.emp_name }}</span>
+          {% else %}
+            <img src="/static/images/profile.png" alt="Profile" class="rounded-circle">
+            <span class="d-none d-md-block dropdown-toggle ps-2">Login</span>
+          {% endif %}
+          </a><!-- End Profile Image Icon -->
+
+          <ul class="dropdown-menu dropdown-menu-end dropdown-menu-arrow profile">
+          {% if user %}
+            <li class="dropdown-header">
+              <h6>{{ user.emp_name }}</h6>
+              <label>Role &#58; {{ role_label }}</label>
+            </li>
+            <li>
+              <hr class="dropdown-divider">
+            </li>
+
+            <li>
+              <a class="dropdown-item d-flex align-items-center" href="/user/my_profile">
+                <i class="bi bi-person"></i>
+                <span>My Profile</span>
+              </a>
+            </li>
+            <li>
+              <hr class="dropdown-divider">
+            </li>
+
+            <li>
+              <a class="dropdown-item d-flex align-items-center" href="/user/change_password">
+                <i class="bi bi-key"></i>
+                <span>Change Password</span>
+              </a>
+            </li>
+            <li>
+              <hr class="dropdown-divider">
+            </li>
+
+            <li>
+              <a class="dropdown-item d-flex align-items-center" href="/view/portal/help">
+                <i class="bi bi-question-circle"></i>
+                <span>Need Help?</span>
+              </a>
+            </li>
+            <li>
+              <hr class="dropdown-divider">
+            </li>
+
+            {% if switched %}
+            <li>
+              <a class="dropdown-item d-flex align-items-center" href="/user/restoreadmin">
+                <i class="bi bi-box-arrow-right"></i>
+                <span>Restore Admin</span>
+              </a>
+            </li>
+            <li>
+              <hr class="dropdown-divider">
+            </li>
+            {% endif %}
+
+            <li>
+              <a class="dropdown-item d-flex align-items-center" href="/user/logout">
+                <i class="bi bi-box-arrow-right"></i>
+                <span>Sign Out</span>
+              </a>
+            </li>
+          {% else %}
+            <li class="dropdown-header">
+              <form action="/login" method="post" class="row g-3 needs-validation">
+                <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                <div class="col-12">
+                  <div class="input-group has-validation">
+                    <span class="input-group-text" id="inputGroupPrepend">@</span>
+                    <input type="text" placeholder="Username" name="staffid" class="form-control" id="menu_username" required="required">
+                    <div class="invalid-feedback">Please enter your username.</div>
+                  </div>
+                </div>
+                <div class="col-12">
+                  <input type="password" placeholder="Password" name="password" class="form-control" id="menu_password">
+                  <div class="invalid-feedback">Please enter your password!</div>
+                </div>
+                <div class="col-12">
+                  <button class="btn btn-primary w-100" type="submit">Login</button>
+                </div>
+                {% if allow_registration %}
+                <div class="col-12">
+                  <p class="small mb-0">Don't have account? <a href="/user/register">Create an account</a></p>
+                </div>
+                {% endif %}
+              </form>
+            </li>
+          {% endif %}
+          </ul><!-- End Profile Dropdown Items -->
+        </li><!-- End Profile Nav -->
+
+      </ul>
+    </nav><!-- End Icons Navigation -->
+
+  </header><!-- End Header -->
+
+  <!-- ======= Sidebar ======= -->
+  <aside id="sidebar" class="sidebar">
+
+    <ul class="sidebar-nav" id="sidebar-nav">
+
+      <li class="nav-item">
+        <a href="/" class="nav-link ">
+          <i class="bi bi-grid"></i>
+          <span>Dashboard</span>
+        </a>
+      </li><!-- End Dashboard Nav -->
+      {{ sidemenu|safe }}
+
+{% if adminish %}
+<li class='nav-item'>
+<a class='nav-link collapsed' data-bs-target='#admin-sidemenu-nav' data-bs-toggle='collapse' href='#'>
+<i class='bi bi-tools'></i> <span>Admin</span>
+<i class='bi bi-chevron-down ms-auto'></i></a><ul class='nav-content collapse' data-bs-parent='#sidebar-nav' id='admin-sidemenu-nav'>
+
+        <li class="nav-item">
+          <a href="/fileLink/index" class='nav-link collapsed'>
+            <i class="bi bi-file-richtext"></i>
+            <span>File</span>
+          </a>
+        </li>
+
+        <li class="nav-item">
+          <a href="/portalFileManager/index" class='nav-link collapsed'>
+            <i class="bi bi-folder"></i>
+            <span>File Manager</span>
+          </a>
+        </li>
+
+        <li class="nav-item">
+          <a href="/portalTrackerData/index" class='nav-link collapsed'>
+            <i class="bi bi-upload"></i>
+            <span>Data Update</span>
+          </a>
+        </li>
+
+        <li class="nav-item">
+          <a href="/userRole/index" class='nav-link collapsed'>
+            <i class="bi bi-person-bounding-box"></i>
+            <span>Role</span>
+          </a>
+        </li>
+
+        <li class="nav-item">
+          <a href="/portalSetting/index" class='nav-link collapsed'>
+            <i class="bi bi-sliders"></i>
+            <span>Settings</span>
+          </a>
+        </li>
+
+        <li class="nav-item">
+          <a href="/portalModule/index" class='nav-link collapsed'>
+            <i class="bi bi-stack-overflow"></i>
+            <span>Module</span>
+          </a>
+        </li>
+
+    {% if dev %}
+        <li class="nav-item">
+          <a href="/portalPage/index" class='nav-link collapsed'>
+            <i class="bi bi-window-sidebar"></i>
+            <span>Page</span>
+          </a>
+        </li>
+
+        <li class="nav-item">
+          <a href="/portalTracker/index" class='nav-link collapsed'>
+            <i class="bi bi-ui-checks"></i>
+            <span>Tracker</span>
+          </a>
+        </li>
+    {% endif %}
+
+        <li class="nav-item">
+          <a href="/portalTree/index" class='nav-link collapsed'>
+            <i class="bi bi-diagram-3"></i>
+            <span>Tree</span>
+          </a>
+        </li>
+
+        <li class="nav-item">
+          <a href="/portalScheduler/index" class='nav-link collapsed'>
+            <i class="bi bi-clock"></i>
+            <span>Scheduler</span>
+          </a>
+        </li>
+
+    {% if superadmin %}
+        <li class="nav-item">
+          <a href="/portalEndpoint/index" class='nav-link collapsed'>
+            <i class="bi bi-hdd-network"></i>
+            <span>Endpoint</span>
+          </a>
+        </li>
+    {% endif %}
+
+        <li class="nav-item">
+          <a href="/portalEmail/index" class='nav-link collapsed'>
+            <i class="bi bi-mailbox"></i>
+            <span>E-mail</span>
+          </a>
+        </li>
+
+        <li class="nav-item">
+          <a href="/user/index" class='nav-link collapsed'>
+            <i class="bi bi-person"></i>
+            <span>User</span>
+          </a>
+        </li>
+
+        <li class="nav-item">
+          <a href="/portalErrorLog/index" class='nav-link collapsed'>
+            <i class="bi bi-clipboard-x"></i>
+            <span>Error</span>
+          </a>
+        </li>
+
+    {% if superadmin %}
+        {# screens the Grails portal does not have #}
+        <li class="nav-item">
+          <a href="/portalAuditTrail/index" class='nav-link collapsed'>
+            <i class="bi bi-list-check"></i>
+            <span>Audit Trail</span>
+          </a>
+        </li>
+        <li class="nav-item">
+          <a href="/userLog/index" class='nav-link collapsed'>
+            <i class="bi bi-journal-text"></i>
+            <span>User Log</span>
+          </a>
+        </li>
+        <li class="nav-item">
+          <a href="/portalSchedulerRun/index" class='nav-link collapsed'>
+            <i class="bi bi-clock-history"></i>
+            <span>Scheduler Runs</span>
+          </a>
+        </li>
+        <li class="nav-item">
+          <a href="/portalBackgroundTrail/index" class='nav-link collapsed'>
+            <i class="bi bi-hourglass-split"></i>
+            <span>Background Jobs</span>
+          </a>
+        </li>
+        <li class="nav-item">
+          <a href="/portalModuleImportLog/index" class='nav-link collapsed'>
+            <i class="bi bi-journal-arrow-down"></i>
+            <span>Import Log</span>
+          </a>
+        </li>
+    {% endif %}
+
+</ul></li>
+{% endif %}<!-- End Admin sidebar -->
+
+    </ul>
+
+  </aside><!-- End Sidebar-->
+
+  <main id="main" class="main {{ pageslug }}">
+
+    <section class="section">
+      <div class="row">
+{{ content|safe }}
+      </div>
+    </section>
+
+  </main><!-- End #main -->
+
+  <!-- ======= Footer ======= -->
+  <footer id="footer" class="footer">
+    <div class="copyright">
+      &copy; Copyright <strong><span>{{ app_name }}</span></strong>. All Rights Reserved
+    </div>
+    <div class="credits">
+      Designed by {% if credits_url %}<a href="{{ credits_url }}">{{ app_name }} Team</a>{% else %}{{ app_name }} Team{% endif %}
+    </div>
+  </footer><!-- End Footer -->
+
+  <a href="#" class="back-to-top d-flex align-items-center justify-content-center"><i class="bi bi-arrow-up-short"></i></a>
+
+  <script>window.tinymce = window.tinymce || { init: function () {} };</script>
+  <script src="/static/libs/niceadmin/js/main.js"></script>
+  <script src="/static/js/portal.js"></script>
+</body>
+
+</html>
