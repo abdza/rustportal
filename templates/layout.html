@@ -8,7 +8,7 @@
   <title>{{ app_name }} {{ title }}</title>
   <meta content="" name="description">
   <meta content="" name="keywords">
-  <link rel="icon" type="image/x-ico" href="/static/images/favicon.ico">
+  <link rel="icon" type="image/x-icon" href="{{ brand.favicon }}">
   <link href="/static/images/apple-touch-icon.png" rel="apple-touch-icon">
 
   {# same stylesheets, in the same order, as the Grails portal's application.css #}
@@ -96,7 +96,7 @@
 
     <div class="d-flex align-items-center justify-content-between">
       <a href="/" class="logo d-flex align-items-center">
-        <img src="/static/images/logo.png" alt="">
+        <img src="{{ brand.logo }}" alt="{{ app_name }}">
         <span class="d-none d-lg-block">{{ app_name }}</span>
       </a>
       <i class="bi bi-list toggle-sidebar-btn"></i>
@@ -274,13 +274,6 @@
         </li>
 
         <li class="nav-item">
-          <a href="/userRole/index" class='nav-link collapsed'>
-            <i class="bi bi-person-bounding-box"></i>
-            <span>Role</span>
-          </a>
-        </li>
-
-        <li class="nav-item">
           <a href="/portalSetting/index" class='nav-link collapsed'>
             <i class="bi bi-sliders"></i>
             <span>Settings</span>
@@ -340,6 +333,7 @@
           </a>
         </li>
 
+    {% if superadmin %}
         <li class="nav-item">
           <a href="/user/index" class='nav-link collapsed'>
             <i class="bi bi-person"></i>
@@ -347,43 +341,19 @@
           </a>
         </li>
 
+        {# error log, audit trail, user log and background jobs: each links to the others #}
         <li class="nav-item">
           <a href="/portalErrorLog/index" class='nav-link collapsed'>
-            <i class="bi bi-clipboard-x"></i>
-            <span>Error</span>
-          </a>
-        </li>
-
-    {% if superadmin %}
-        {# screens the Grails portal does not have #}
-        <li class="nav-item">
-          <a href="/portalAuditTrail/index" class='nav-link collapsed'>
-            <i class="bi bi-list-check"></i>
-            <span>Audit Trail</span>
-          </a>
-        </li>
-        <li class="nav-item">
-          <a href="/userLog/index" class='nav-link collapsed'>
             <i class="bi bi-journal-text"></i>
-            <span>User Log</span>
+            <span>Logs</span>
           </a>
         </li>
+    {% else %}
+        {# module admins cannot open the user list, only the roles of their modules #}
         <li class="nav-item">
-          <a href="/portalSchedulerRun/index" class='nav-link collapsed'>
-            <i class="bi bi-clock-history"></i>
-            <span>Scheduler Runs</span>
-          </a>
-        </li>
-        <li class="nav-item">
-          <a href="/portalBackgroundTrail/index" class='nav-link collapsed'>
-            <i class="bi bi-hourglass-split"></i>
-            <span>Background Jobs</span>
-          </a>
-        </li>
-        <li class="nav-item">
-          <a href="/portalModuleImportLog/index" class='nav-link collapsed'>
-            <i class="bi bi-journal-arrow-down"></i>
-            <span>Import Log</span>
+          <a href="/userRole/index" class='nav-link collapsed'>
+            <i class="bi bi-person-bounding-box"></i>
+            <span>Role</span>
           </a>
         </li>
     {% endif %}
@@ -408,10 +378,10 @@
   <!-- ======= Footer ======= -->
   <footer id="footer" class="footer">
     <div class="copyright">
-      &copy; Copyright <strong><span>{{ app_name }}</span></strong>. All Rights Reserved
+      &copy; Copyright <strong><span>{{ brand.copyright }}</span></strong>. All Rights Reserved
     </div>
     <div class="credits">
-      Designed by {% if credits_url %}<a href="{{ credits_url }}">{{ app_name }} Team</a>{% else %}{{ app_name }} Team{% endif %}
+      Designed by {% if brand.homepage %}<a href="{{ brand.homepage }}">{{ brand.team }}</a>{% else %}{{ brand.team }}{% endif %}
     </div>
   </footer><!-- End Footer -->
 

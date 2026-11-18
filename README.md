@@ -105,11 +105,22 @@ Admin -> Module exports a module to `modulemigration/{module}/`
 The JSON layout is the one Grails/GSP portals use, so their tracker definitions
 import as-is — but page sources and expressions written in Groovy/GSP must be ported.
 
+## Sharing a database with a Grails portal
+
+Set `page_table` / `page_data_table` in `config.toml` (e.g. `rp_portal_page` /
+`rp_portal_page_data`) to keep this portal's pages in their own tables while every
+other table - users, trackers and their data, settings, files - is shared with the
+Grails portal on the same database. Tracker definitions refer to pages by id
+(post-process, run-on-update and e-mail body pages), so pages copied across keep
+their ids; on such a database new tables take ids from `hibernate_sequence`, so
+pages added on either side never collide.
+
 ## Importing Grails/GSP modules
 
-Set `g5_module_dir` in `config.toml` to the other portal's `modulemigration`
-folder (it is only read) and open the import screen from the Module page.
-Uploading one of its module zips works too.
+Upload the Grails portal's module zip with Module -> Import Zip, the same as a
+zip exported here. A Grails zip is recognised by its layout (`pagelist.json`,
+`trackerlist.json` and `pages/` at the top of the zip, no module folder) and the
+module is named after the zip file, as the Grails portal does.
 
 What the import does with the page sources (`pages/*.gsp`):
 

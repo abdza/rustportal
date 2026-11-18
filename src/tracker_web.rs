@@ -399,7 +399,7 @@ pub async fn send_tracker_email(sc: &Sc, t: &Tracker, email: &Row, datas: &Row) 
     }
     let cc = eval_recipients(sc, &s(email, "emailcc"), datas).await;
     let Some(body_id) = i(email, "body_id") else { return };
-    let Ok(Some(page)) = sc.db().get("portal_page", body_id).await else { return };
+    let Ok(Some(page)) = sc.db().get(crate::db::page_t(), body_id).await else { return };
     let vars = row! {"datas"=>Value::Object(datas.clone()),"tracker"=>tracker_json(t)};
     let body = sc.render(&s(&page, "content"), &vars, true);
     let title = sc.render(&s(&page, "title"), &vars, false);
@@ -521,7 +521,7 @@ pub async fn transition_post(mut ctx: Ctx, module: &str, slug: &str, tname: &str
     // postprocess script of the transition, then of the tracker
     let mut post = Value::Null;
     for pid in [i(&tr.row, "postprocess_id"), i(&t.row, "postprocess_id")].into_iter().flatten() {
-        let Ok(Some(page)) = ctx.db().get("portal_page", pid).await else { continue };
+        let Ok(Some(page)) = ctx.db().get(crate::db::page_t(), pid).await else { continue };
         let mut trow = tr.row.clone();
         trow.insert("roles".into(), json!(tr.roles));
         let vars = row! {
@@ -620,7 +620,7 @@ pub async fn update_record(mut ctx: Ctx, module: &str, slug: &str, id: i64) -> R
     let trail_id = t.update_trail(&sc, &tp, ctx.uid(), upload.as_ref()).await;
     if let Some(st) = &status {
         if let Some(pid) = i(st, "runonupdate_id") {
-            if let Ok(Some(page)) = ctx.db().get("portal_page", pid).await {
+            if let Ok(Some(page)) = ctx.db().get(crate::db::page_t(), pid).await {
                 let vars = row! {"datas"=>Value::Object(datas.clone()),"tracker"=>tracker_json(&t),"curstatus"=>Value::Object(st.clone()),"trail_id"=>json!({"id": trail_id})};
                 match sc.eval(&s(&page, "content"), &vars) {
                     Ok(v) => {
@@ -889,7 +889,7 @@ pub async fn create_default_pages(db: &db::Db, t: &Tracker) -> anyhow::Result<us
     let mut n = 0;
     for (slug, title, content) in pages {
         if find_page(db, &t.module, &slug).await.is_none() {
-            db.insert("portal_page", &row! {"title"=>title,"slug"=>slug,"module"=>t.module.clone(),"content"=>content,"published"=>true,"requirelogin"=>false,"runable"=>false,"fullpage"=>false,"last_updated"=>web::now_str()}).await?;
+            db.insert(crate::db::page_t(), &row! {"title"=>title,"slug"=>slug,"module"=>t.module.clone(),"content"=>content,"published"=>true,"requirelogin"=>false,"runable"=>false,"fullpage"=>false,"last_updated"=>web::now_str()}).await?;
             n += 1;
         }
     }

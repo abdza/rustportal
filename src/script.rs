@@ -462,7 +462,7 @@ pub async fn run_page(inner: &Arc<Inner>, module: &str, slug: &str, vars: Row) -
         inner.depth.fetch_sub(1, Ordering::SeqCst);
         return Err(anyhow!("run_page nesting too deep"));
     }
-    let page = inner.db().first("select * from portal_page where module=:m and slug=:s order by id limit 1", &row! {"m"=>module,"s"=>slug}).await?;
+    let page = inner.db().first(&format!("select * from {} where module=:m and slug=:s order by id limit 1", crate::db::page_t()), &row! {"m"=>module,"s"=>slug}).await?;
     let out = match page {
         Some(p) => Sc::from_inner(inner.clone()).eval(&s(&p, "content"), &vars),
         None => Err(anyhow!("Page {}:{} not found", module, slug)),
@@ -477,7 +477,7 @@ pub async fn include_page(inner: &Arc<Inner>, module: &str, slug: &str, mut vars
         inner.depth.fetch_sub(1, Ordering::SeqCst);
         return Err(anyhow!("include_page nesting too deep"));
     }
-    let page = inner.db().first("select * from portal_page where module=:m and slug=:s order by id limit 1", &row! {"m"=>module,"s"=>slug}).await?;
+    let page = inner.db().first(&format!("select * from {} where module=:m and slug=:s order by id limit 1", crate::db::page_t()), &row! {"m"=>module,"s"=>slug}).await?;
     let out = match page {
         Some(p) => {
             let sc = Sc::from_inner(inner.clone());

@@ -49,7 +49,9 @@ async fn tick(st: &St) {
             continue;
         }
         let last = crate::script::parse_dt(&s(&sch, "lastrun"));
-        let hours = { let h = csv(&s(&sch, "hour")); if h.is_empty() || h == ["*"] { (0..24).map(|x| x.to_string()).collect() } else { h } };
+        // g6 portals keep the hours in hour_of_day
+        let hour = { let h = s(&sch, "hour"); if h.trim().is_empty() { s(&sch, "hour_of_day") } else { h } };
+        let hours = { let h = csv(&hour); if h.is_empty() || h == ["*"] { (0..24).map(|x| x.to_string()).collect() } else { h } };
         for h in hours {
             let (hh, mm) = match h.split_once(':') {
                 Some((a, b2)) => (a.trim().parse::<u32>().unwrap_or(99), b2.trim().parse::<u32>().unwrap_or(0)),
@@ -67,7 +69,7 @@ async fn tick(st: &St) {
     }
 }
 
-pub fn spawn(st: St) {
+pub fn spawn(st: St, run_jobs: bool) {
     tokio::spawn(async move {
         let mut n: u64 = 0;
         loop {
@@ -75,6 +77,9 @@ pub fn spawn(st: St) {
             // each tick in its own task so one failing script cannot stop the loop
             let st2 = st.clone();
             let _ = tokio::spawn(async move {
+                if !run_jobs {
+                    return;
+                }
                 tick(&st2).await;
                 crate::mail::flush(&st2).await;
             })

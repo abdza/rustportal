@@ -1,6 +1,6 @@
 //! Trees: nested-set maintenance and the menus built from them.
 
-use crate::db::{b, i, s, Db, Row};
+use crate::db::{i, s, Db, Row};
 use crate::row;
 use crate::web::esc;
 use serde_json::Value;
@@ -25,9 +25,25 @@ pub fn node_url(n: &Row) -> String {
     }
 }
 
-fn node_data(n: &Row, key: &str) -> Option<String> {
+/// A value from a node's `data`: `key=value;key2=value2` as the Grails portals
+/// write it (key case-insensitive, last one wins), or a JSON object.
+pub fn node_data(n: &Row, key: &str) -> Option<String> {
     let d = s(n, "data");
-    serde_json::from_str::<Value>(&d).ok().and_then(|v| v.get(key).map(crate::db::vs)).filter(|x| !x.is_empty())
+    let d = d.trim();
+    if d.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<Value>(d) {
+            return v.get(key).map(crate::db::vs).filter(|x| !x.is_empty());
+        }
+    }
+    let mut found = None;
+    for part in d.split(';') {
+        if let Some((k, v)) = part.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(key.trim()) && !v.trim().is_empty() {
+                found = Some(v.trim().to_string());
+            }
+        }
+    }
+    found
 }
 
 pub fn node_icon(n: &Row) -> String {
@@ -35,7 +51,7 @@ pub fn node_icon(n: &Row) -> String {
         return format!("<i class='bi bi-{}'></i> ", esc(&ic));
     }
     if let Some(img) = node_data(n, "img") {
-        return format!("<img src='/download/portal/{}' class='img-fluid' style='max-height:1.5em;max-width:1.5em'/> ", esc(&img));
+        return format!("<img src='/download/portal/{}' class='img-fluid' style='max-height: 1.5em; max-width: 1.5em;'/>", esc(&img));
     }
     String::new()
 }
@@ -81,22 +97,25 @@ pub async fn mega_menu(db: &Db, module: &str, name: &str) -> String {
     o
 }
 
-/// Sidebar menu for a page or tracker whose `side_menu` names a tree `<name>_menu`.
-pub async fn side_menu(db: &Db, name: &str) -> String {
+/// Sidebar menu for a page or tracker whose `side_menu` names a tree `<name>_menu`,
+/// in the Grails portals' markup. Nodes with `adminonly=true` in their data only
+/// show for the module's admins.
+pub async fn side_menu(db: &Db, name: &str, module_admin: bool) -> String {
     let Some((tree, nodes)) = tree_nodes(db, "portal", name).await else { return String::new() };
+    let visible = |n: &Row| module_admin || node_data(n, "adminonly").as_deref() != Some("true");
     let mut o = String::new();
-    for group in kids(&nodes, root_id(&tree, &nodes)) {
+    for group in kids(&nodes, root_id(&tree, &nodes)).into_iter().filter(|g| visible(g)) {
         let items = kids(&nodes, i(group, "id"));
         if items.is_empty() {
-            o.push_str(&format!("<li class='nav-item'><a class='nav-link collapsed' href='{}'>{}<span>{}</span></a></li>", esc(&node_url(group)), node_icon(group), esc(&s(group, "name"))));
+            o.push_str(&format!("<li class='nav-item'><a class='nav-link' href='{}'>{} {}</a></li>", esc(&node_url(group)), node_icon(group), esc(&s(group, "name"))));
         } else {
-            let ulid: String = s(group, "name").to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+            let ulid = s(group, "name").replace(' ', "-").to_lowercase();
             o.push_str(&format!(
-                "<li class='nav-item'><a class='nav-link collapsed' data-bs-target='#{id}-nav' data-bs-toggle='collapse' href='#'>{ic}<span>{n}</span><i class='bi bi-chevron-down ms-auto'></i></a><ul id='{id}-nav' class='nav-content collapse' data-bs-parent='#sidebar-nav'>",
-                id = ulid, ic = node_icon(group), n = esc(&s(group, "name"))
+                "<li class='nav-item'><a class='nav-link collapsed' data-bs-target='#{id}-nav' data-bs-toggle='collapse' href='#'>{ic} {n}<i class='bi bi-chevron-down ms-auto'></i></a><ul class='nav-content collapse' data-bs-parent='#sidebar-nav' id='{id}-nav'>",
+                id = esc(&ulid), ic = node_icon(group), n = esc(&s(group, "name"))
             ));
-            for it in items {
-                o.push_str(&format!("<li><a href='{}'>{}<span>{}</span></a></li>", esc(&node_url(it)), node_icon(it), esc(&s(it, "name"))));
+            for it in items.into_iter().filter(|x| visible(x)) {
+                o.push_str(&format!("<li><a href='{}'>{} {}</a></li>", esc(&node_url(it)), node_icon(it), esc(&s(it, "name"))));
             }
             o.push_str("</ul></li>");
         }
@@ -130,42 +149,187 @@ pub async fn rebuild(db: &Db, tree_id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Nested HTML view of a tree with its users (for /portalTree/show).
-pub async fn tree_html(db: &Db, tree_id: i64) -> String {
-    let nodes = db.rows("select * from tree_node where tree_id=:t order by lft nulls last, id", &row! {"t"=>tree_id}).await.unwrap_or_default();
-    let users = db
-        .rows("select tnu.id, tnu.node_id, tnu.role, u.emp_name, u.staffid, u.id as uid from tree_node_user tnu join tree_node n on n.id=tnu.node_id left join iap_user u on u.id=tnu.user_id where n.tree_id=:t order by u.emp_name", &row! {"t"=>tree_id})
-        .await
-        .unwrap_or_default();
-    fn render(nodes: &[Row], users: &[Row], parent: Option<i64>, tree_id: i64, o: &mut String) {
-        let ks = kids(nodes, parent);
-        if ks.is_empty() {
-            return;
+// ---------------------------------------------------------------------------
+// Tree export/import in the Grails portal's format: a list of trees, each with
+// its root nodes, every node carrying its children in `nodes` (sibling order
+// kept) and, when asked for, its role holders as `users: [{staffid, role}]`.
+// Used for single-tree files and for a module's treelist.json alike.
+
+/// A node's key among its siblings: the slug, else the name (as the Grails portal).
+fn node_key(n: &Row) -> String {
+    let k = s(n, "slug").trim().to_string();
+    if k.is_empty() { s(n, "name").trim().to_string() } else { k }
+}
+
+/// One tree as the Grails portal exports it.
+pub async fn export_tree(db: &Db, tree_id: i64, staff_on: bool) -> anyhow::Result<Value> {
+    let tree = db.get("tree", tree_id).await?.ok_or_else(|| anyhow::anyhow!("tree {} not found", tree_id))?;
+    let nodes = db.rows("select * from tree_node where tree_id=:t order by lft nulls last, id", &row! {"t"=>tree_id}).await?;
+    let users = if staff_on {
+        db.rows("select tnu.node_id, tnu.role, coalesce(nullif(u.new_staffid,''), u.staffid) as staffid from tree_node_user tnu join tree_node n on n.id=tnu.node_id join iap_user u on u.id=tnu.user_id where n.tree_id=:t order by 3, 2", &row! {"t"=>tree_id}).await?
+    } else {
+        vec![]
+    };
+    fn node(nodes: &[Row], users: &[Row], n: &Row, staff_on: bool) -> Value {
+        let id = i(n, "id");
+        let us: Value = if staff_on {
+            Value::Array(users.iter().filter(|u| i(u, "node_id") == id).map(|u| serde_json::json!({"staffid": s(u, "staffid"), "role": s(u, "role")})).collect())
+        } else {
+            Value::Null
+        };
+        let opt = |k: &str| n.get(k).cloned().unwrap_or(Value::Null);
+        serde_json::json!({
+            "name": opt("name"), "slug": opt("slug"), "data": opt("data"), "domain": opt("domain"), "domainid": opt("domainid"),
+            "domainkeyfield": Value::Null, "domainkey": Value::Null, "mainrole": opt("mainrole"), "hiderole": opt("hiderole"),
+            "disabled": opt("disabled"), "users": us,
+            "nodes": kids(nodes, id).into_iter().map(|c| node(nodes, users, c, staff_on)).collect::<Vec<_>>(),
+        })
+    }
+    let root = i(&tree, "root_id").and_then(|r| nodes.iter().find(|n| i(n, "id") == Some(r))).map(node_key);
+    let date = |k: &str| { let v = s(&tree, k); if v.is_empty() { Value::Null } else { Value::String(v.chars().take(10).collect()) } };
+    Ok(serde_json::json!({
+        "module": s(&tree, "module"), "name": s(&tree, "name"), "valid": date("valid"), "expire": date("expire"), "root": root,
+        "nodes": kids(&nodes, None).into_iter().map(|n| node(&nodes, &users, n, staff_on)).collect::<Vec<_>>(),
+    }))
+}
+
+#[derive(Default, Debug)]
+pub struct ImportStats {
+    pub trees_added: usize,
+    pub trees_updated: usize,
+    pub nodes_added: usize,
+    pub nodes_updated: usize,
+    pub users_added: usize,
+    pub users_skipped: Vec<String>,
+}
+
+impl ImportStats {
+    pub fn summary(&self) -> String {
+        let mut o = vec![];
+        if self.trees_added > 0 { o.push(format!("{} tree(s) added", self.trees_added)); }
+        if self.trees_updated > 0 { o.push(format!("{} tree(s) updated", self.trees_updated)); }
+        o.push(format!("{} node(s) added, {} updated", self.nodes_added, self.nodes_updated));
+        if self.users_added > 0 { o.push(format!("{} role holder(s) added", self.users_added)); }
+        if !self.users_skipped.is_empty() { o.push(format!("{} role holder(s) skipped (staff id not found here)", self.users_skipped.len())); }
+        o.join(", ")
+    }
+}
+
+/// Turn this portal's older flat export (`nodes` with `id`/`parent_id`) into the nested form.
+fn nest_flat(nodes: &[Row]) -> Vec<Value> {
+    fn build(nodes: &[Row], parent: Option<i64>) -> Vec<Value> {
+        nodes.iter().filter(|n| i(n, "parent_id") == parent).map(|n| {
+            let mut o = n.clone();
+            o.remove("id");
+            o.remove("parent_id");
+            o.insert("nodes".into(), Value::Array(build(nodes, i(n, "id"))));
+            Value::Object(o)
+        }).collect()
+    }
+    let ids: Vec<Option<i64>> = nodes.iter().map(|n| i(n, "id")).collect();
+    // nodes whose parent is not in the list are roots
+    let mut out = build(nodes, None);
+    for n in nodes.iter().filter(|n| i(n, "parent_id").is_some() && !ids.contains(&i(n, "parent_id"))) {
+        let mut o = n.clone();
+        o.remove("id");
+        o.remove("parent_id");
+        o.insert("nodes".into(), Value::Array(build(nodes, i(n, "id"))));
+        out.push(Value::Object(o));
+    }
+    out
+}
+
+/// Create or update one tree from its exported form (the Grails portal's merge
+/// rules): the tree is matched by module and name, nodes by slug-or-name among
+/// their siblings; nothing here is deleted, and role holders are only added.
+/// `module` overrides the module named in the file. Returns the tree id.
+pub async fn import_tree(db: &Db, itree: &Row, module: Option<&str>, staff_on: bool, st: &mut ImportStats) -> anyhow::Result<i64> {
+    let name = s(itree, "name");
+    if name.trim().is_empty() {
+        anyhow::bail!("a tree in the file has no name");
+    }
+    let module = module.map(String::from).unwrap_or_else(|| { let m = s(itree, "module"); if m.is_empty() { "portal".into() } else { m } });
+    let date = |k: &str| { let v = s(itree, k); if v.len() >= 10 { Value::String(v[..10].to_string()) } else { Value::Null } };
+    let tree_id = match db.first("select id from tree where module=:m and name=:n order by id limit 1", &row! {"m"=>module.clone(),"n"=>name.clone()}).await? {
+        Some(t) => {
+            let id = i(&t, "id").unwrap_or(0);
+            db.update("tree", id, &row! {"valid"=>date("valid"),"expire"=>date("expire")}).await?;
+            st.trees_updated += 1;
+            id
         }
-        o.push_str("<ul class='tree-list'>");
-        for n in ks {
-            let id = i(n, "id").unwrap_or(0);
-            o.push_str(&format!(
-                "<li><a href='/portalTreeNode/show/{id}'><b>{}</b></a>{} <small class='text-muted'>{}</small> <a class='btn btn-sm btn-outline-secondary py-0' href='/portalTreeNode/create?tree_id={tree_id}&parent_id={id}'>+ node</a> <a class='btn btn-sm btn-outline-secondary py-0' href='/portalTreeNodeUser/create?node_id={id}'>+ user</a>",
-                esc(&s(n, "name")), if b(n, "disabled") { " <span class='badge bg-secondary'>disabled</span>" } else { "" }, esc(&s(n, "slug"))
-            ));
-            let us: Vec<&Row> = users.iter().filter(|u| i(u, "node_id") == Some(id)).collect();
-            if !us.is_empty() {
-                o.push_str("<div class='ms-3'>");
-                for u in us {
-                    o.push_str(&format!("<span class='badge bg-light text-dark border me-1'><a href='/portalTreeNodeUser/show/{}'>{} ({})</a> &middot; {}</span>", i(u, "id").unwrap_or(0), esc(&s(u, "emp_name")), esc(&s(u, "staffid")), esc(&s(u, "role"))));
+        None => {
+            st.trees_added += 1;
+            db.insert("tree", &row! {"module"=>module.clone(),"name"=>name.clone(),"valid"=>date("valid"),"expire"=>date("expire")}).await?
+        }
+    };
+    let inodes: Vec<Value> = match itree.get("nodes") {
+        Some(Value::Array(a)) => {
+            let rows: Vec<Row> = a.iter().filter_map(|v| v.as_object().cloned()).collect();
+            if rows.iter().any(|n| n.contains_key("parent_id")) { nest_flat(&rows) } else { a.clone() }
+        }
+        _ => vec![],
+    };
+    import_nodes(db, tree_id, None, &inodes, staff_on, st).await?;
+    rebuild(db, tree_id).await?;
+    let root_key = s(itree, "root");
+    if !root_key.is_empty() {
+        let roots = db.rows("select * from tree_node where tree_id=:t and parent_id is null order by lft nulls last, id", &row! {"t"=>tree_id}).await?;
+        if let Some(r) = roots.iter().find(|n| node_key(n) == root_key) {
+            db.update("tree", tree_id, &row! {"root_id"=>i(r, "id")}).await?;
+        }
+    }
+    Ok(tree_id)
+}
+
+fn import_nodes<'a>(db: &'a Db, tree_id: i64, parent: Option<i64>, inodes: &'a [Value], staff_on: bool, st: &'a mut ImportStats) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let existing = match parent {
+            Some(p) => db.rows("select * from tree_node where parent_id=:p order by lft nulls last, id", &row! {"p"=>p}).await?,
+            None => db.rows("select * from tree_node where tree_id=:t and parent_id is null order by lft nulls last, id", &row! {"t"=>tree_id}).await?,
+        };
+        let mut pool: Vec<(String, i64)> = existing.iter().map(|n| (node_key(n), i(n, "id").unwrap_or(0))).collect();
+        for v in inodes {
+            let Some(n) = v.as_object() else { continue };
+            let key = node_key(n);
+            let disabled = n.get("disabled").map(|d| d == &Value::Bool(true)).unwrap_or(false);
+            let mut d = row! {"name"=>n.get("name").cloned().unwrap_or(Value::Null),"slug"=>n.get("slug").cloned().unwrap_or(Value::Null),"data"=>n.get("data").cloned().unwrap_or(Value::Null),
+                "domain"=>n.get("domain").cloned().unwrap_or(Value::Null),"domainid"=>i(n, "domainid"),"mainrole"=>n.get("mainrole").cloned().unwrap_or(Value::Null),
+                "hiderole"=>n.get("hiderole").cloned().unwrap_or(Value::Null),"disabled"=>disabled};
+            let nid = match pool.iter().position(|(k, _)| *k == key) {
+                Some(ix) => {
+                    let id = pool.remove(ix).1;
+                    db.update("tree_node", id, &d).await?;
+                    st.nodes_updated += 1;
+                    id
                 }
-                o.push_str("</div>");
+                None => {
+                    d.insert("tree_id".into(), serde_json::json!(tree_id));
+                    d.insert("parent_id".into(), parent.map(|p| serde_json::json!(p)).unwrap_or(Value::Null));
+                    st.nodes_added += 1;
+                    db.insert("tree_node", &d).await?
+                }
+            };
+            if staff_on {
+                if let Some(Value::Array(us)) = n.get("users") {
+                    for u in us.iter().filter_map(|u| u.as_object()) {
+                        let (sid, role) = (s(u, "staffid"), s(u, "role"));
+                        match crate::web::find_user_by_staffid(db, &sid).await {
+                            Some(user) => {
+                                let p = row! {"n"=>nid,"u"=>i(&user, "id"),"r"=>role.clone()};
+                                if db.count("select count(*) from tree_node_user where node_id=:n and user_id=:u and role=:r", &p).await? == 0 {
+                                    db.insert("tree_node_user", &row! {"node_id"=>nid,"user_id"=>i(&user, "id"),"role"=>role}).await?;
+                                    st.users_added += 1;
+                                }
+                            }
+                            None => st.users_skipped.push(format!("{} ({}) on node '{}'", sid, role, s(n, "name"))),
+                        }
+                    }
+                }
             }
-            render(nodes, users, Some(id), tree_id, o);
-            o.push_str("</li>");
+            if let Some(Value::Array(kids)) = n.get("nodes") {
+                import_nodes(db, tree_id, Some(nid), kids, staff_on, st).await?;
+            }
         }
-        o.push_str("</ul>");
-    }
-    let mut o = String::new();
-    render(&nodes, &users, None, tree_id, &mut o);
-    if o.is_empty() {
-        o = format!("<p>No nodes yet. <a href='/portalTreeNode/create?tree_id={}'>Create the root node</a></p>", tree_id);
-    }
-    o
+        Ok(())
+    })
 }

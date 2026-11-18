@@ -258,7 +258,7 @@ pub async fn index(mut ctx: Ctx, e: &Entity) -> Response {
     };
     let total = ctx.db().count(&format!("select count(*) from \"{}\"{}", e.table, wh), &db::no_params()).await.unwrap_or(0);
     let rows = ctx.db().rows(&format!("select * from \"{}\"{} order by {} limit {} offset {}", e.table, wh, order, max, offset), &db::no_params()).await.unwrap_or_default();
-    let extra = index_extras(e);
+    let extra = index_extras(e, ctx.is_admin());
     let m = ctx.p("module");
     let navh = if e.name != "portalModule" && e.field("module").is_some() && !m.is_empty() && m != "All" {
         let back = module_url(ctx.db(), &m).await.map(|u| format!("                        <li><a class=\"list\" href=\"{}\">Module {}</a></li>\n", u, esc(&m))).unwrap_or_default();
@@ -378,7 +378,7 @@ async fn module_sections(ctx: &Ctx, m: &Row, csrf: &str) -> String {
     h.push_str(&section("Trackers", &links, &["Title", "Slug", "Type", "Fields", "Transitions", "Action"], trs, "No trackers in this module."));
 
     // pages
-    let rows = db.rows("select id, title, slug, runable, published from portal_page where module=:m order by slug", &p).await.unwrap_or_default();
+    let rows = db.rows(&format!("select id, title, slug, runable, published from {} where module=:m order by slug", db::page_t()), &p).await.unwrap_or_default();
     let prs = rows.iter().map(|g| {
         let id = i(g, "id").unwrap_or(0);
         let run = b(g, "runable");
@@ -454,13 +454,32 @@ async fn module_sections(ctx: &Ctx, m: &Row, csrf: &str) -> String {
     h
 }
 
-fn index_extras(e: &Entity) -> String {
-    match e.name {
-        "portalModule" => "                        <li><a class=\"list\" href=\"/portalModule/update_module_list\">Refresh module list</a></li>\n                        <li><a class=\"list\" href=\"/portalModule/upload\">Upload module zip</a></li>\n                        <li><a class=\"list\" href=\"/portalModule/g5list\">Import from Grails portal</a></li>\n".into(),
-        "fileLink" => "                        <li><a class=\"create\" href=\"/fileLink/upload\">Upload file</a></li>\n".into(),
-        "portalErrorLog" => "                        <li><a class=\"list\" href=\"/portalErrorLog/index?resolved=false\">Unresolved only</a></li>\n".into(),
+/// The logs share one sidebar entry ("Logs", opening the error log); each log
+/// list links to the others. All of them are portal-admin only.
+const LOGS: &[(&str, &str)] = &[("portalErrorLog", "Error Log"), ("portalAuditTrail", "Audit Trail"), ("userLog", "User Log"), ("portalBackgroundTrail", "Background Jobs")];
+
+fn li(class: &str, href: &str, label: &str) -> String {
+    format!("                        <li><a class=\"{}\" href=\"{}\">{}</a></li>\n", class, href, label)
+}
+
+fn index_extras(e: &Entity, is_admin: bool) -> String {
+    let mut o = match e.name {
+        "portalModule" => [li("list", "/portalModule/update_module_list", "Refresh module list"), li("create", "/portalModule/upload", "Import Zip"), li("list", "/portalModuleImportLog/index", "Import Logs")].concat(),
+        "fileLink" => li("create", "/fileLink/upload", "Upload file"),
+        "portalErrorLog" => li("list", "/portalErrorLog/index?resolved=false", "Unresolved only"),
+        "portalScheduler" if is_admin => li("list", "/portalSchedulerRun/index", "Scheduler Runs"),
+        "portalSchedulerRun" => li("list", "/portalScheduler/index", "Scheduler List"),
+        "user" => li("list", "/userRole/index", "Roles"),
+        "portalTree" => [li("create", "/portalTreeNode/fixnodes", "Fix Nodes"), li("create", "/portalTree/importtreeform", "Import Tree")].concat(),
+        "userRole" if is_admin => li("list", "/user/index", "User List"),
         _ => String::new(),
+    };
+    if LOGS.iter().any(|(n, _)| *n == e.name) {
+        for (n, label) in LOGS.iter().filter(|(n, _)| *n != e.name) {
+            o.push_str(&li("list", &format!("/{}/index", n), label));
+        }
     }
+    o
 }
 
 fn post_button(ctx: &mut Ctx, url: &str, label: &str, class: &str, confirm: Option<&str>) -> String {
@@ -505,7 +524,7 @@ async fn show_extras(ctx: &mut Ctx, e: &Entity, r: &Row) -> String {
         "portalFileManager" => o.push_str(&format!("<a class='btn btn-sm btn-success' href='/portalFileManager/browse/{}'>Browse</a> ", id)),
         "portalEmail" => o.push_str(&post_button(ctx, &format!("/portalEmail/resend/{}", id), "Send now", "btn-outline-primary", None)),
         "portalScheduler" => o.push_str(&post_button(ctx, &format!("/portalScheduler/run/{}", id), "Run now", "btn-outline-primary", None)),
-        "portalTree" => o.push_str(&post_button(ctx, &format!("/portalTree/rebuild/{}", id), "Rebuild", "btn-outline-secondary", None)),
+        "portalTree" => o.push_str(&format!("<a class=\"save\" href=\"/portalTree/exporttree/{id}\">Export</a> <a class=\"save\" href=\"/portalTree/exporttree/{id}?staff=on\">Export with Role Holders</a> <a class=\"save\" href=\"/portalTree/importtreeform\">Import</a> ")),
         "portalErrorLog" => o.push_str(&post_button(ctx, &format!("/portalErrorLog/resolve/{}", id), "Mark resolved", "btn-outline-primary", None)),
         "portalEndpoint" => o.push_str(&format!("<code>/svc/{}/{}</code> ", esc(&s(r, "module")), esc(&s(r, "slug")))),
         "portalModuleAccessReview" => o.push_str(&post_button(ctx, &format!("/portalModuleAccessReview/approve/{}", id), "Approve review", "btn-outline-success", Some("Confirm that the access list of this module is correct?"))),
@@ -570,7 +589,13 @@ pub async fn show(mut ctx: Ctx, e: &Entity, id: i64) -> Response {
         h.push_str(&module_sections(&ctx, &r, &csrf).await);
     }
     if e.name == "portalTree" {
-        h.push_str(&format!("<h3>Nodes</h3>{}", crate::tree::tree_html(ctx.db(), id).await));
+        // as the Grails portal: the nodes are browsed from the root node's page
+        let root = match i(&r, "root_id") {
+            Some(rid) => ctx.db().get("tree_node", rid).await.ok().flatten().map(|n| format!("<a href=\"/portalTreeNode/show/{}\">{}</a>", rid, esc(&s(&n, "name")))),
+            None => None,
+        }
+        .unwrap_or_else(|| format!("<a href=\"/portalTree/create_root/{}\">Create root node</a>", id));
+        h = h.replacen(&format!("<ol class=\"property-list {}\">\n", e.name), &format!("<ol class=\"property-list {}\">\n    <li class=\"fieldcontain\">\n        <span id=\"root-label\" class=\"property-label\">Root</span>\n        <div class=\"property-value\" aria-labelledby=\"root-label\">{}</div>\n    </li>\n", e.name, root), 1);
     } else {
         for (child, fk) in e.children {
             let Some(ce) = ctx.st.entity(child) else { continue };
@@ -849,7 +874,7 @@ async fn gather(ctx: &Ctx, e: &Entity, existing: Option<&Row>) -> Result<Row, St
             if s(&d, "title").is_empty() {
                 d.insert("title".into(), json!(s(&d, "slug")));
             }
-            let dup = ctx.db().count("select count(*) from portal_page where module=:m and slug=:s and id!=:id", &row! {"m"=>s(&d, "module"),"s"=>s(&d, "slug"),"id"=>existing.and_then(|x| i(x, "id")).unwrap_or(0)}).await.unwrap_or(0);
+            let dup = ctx.db().count(&format!("select count(*) from {} where module=:m and slug=:s and id!=:id", db::page_t()), &row! {"m"=>s(&d, "module"),"s"=>s(&d, "slug"),"id"=>existing.and_then(|x| i(x, "id")).unwrap_or(0)}).await.unwrap_or(0);
             if dup > 0 {
                 return Err("A page with that module and slug already exists".into());
             }
@@ -1161,7 +1186,7 @@ pub async fn search(ctx: Ctx) -> Response {
     if !q.trim().is_empty() {
         let pages = ctx
             .db()
-            .rows("select module, slug, title, runable, requirelogin from portal_page where published is true and runable is not true and (title ilike :q or slug ilike :q) and (allowedroles is null or allowedroles='' or allowedroles='All') order by module, title limit 50", &row! {"q"=>like.clone()})
+            .rows(&format!("select module, slug, title, runable, requirelogin from {} where published is true and runable is not true and (title ilike :q or slug ilike :q) and (allowedroles is null or allowedroles='' or allowedroles='All') order by module, title limit 50", db::page_t()), &row! {"q"=>like.clone()})
             .await
             .unwrap_or_default();
         h.push_str("<h4>Pages</h4><ul>");

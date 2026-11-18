@@ -102,6 +102,8 @@ pub fn note_sql(sql: &str) {
     };
     match target {
         Some(t) => {
+            // the page tables may be configured under other names
+            let t = if t == crate::db::page_t() { "portal_page".to_string() } else if t == crate::db::page_data_t() { "portal_page_data".to_string() } else { t };
             if t.starts_with("portal_tracker") {
                 crate::tracker::definitions_changed();
             }

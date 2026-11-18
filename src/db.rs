@@ -359,3 +359,36 @@ macro_rules! row {
         m
     }};
 }
+
+
+static PAGE_TABLES: std::sync::OnceLock<(&'static str, &'static str)> = std::sync::OnceLock::new();
+
+/// Set once at start-up from config.toml (`page_table`, `page_data_table`).
+pub fn set_page_tables(page: &str, data: &str) {
+    let ok = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let page = if ok(page) { page } else { "portal_page" };
+    let data = if ok(data) { data } else { "portal_page_data" };
+    let _ = PAGE_TABLES.set((Box::leak(page.to_string().into_boxed_str()), Box::leak(data.to_string().into_boxed_str())));
+}
+
+/// The table pages are kept in (`portal_page` unless configured otherwise).
+pub fn page_t() -> &'static str {
+    PAGE_TABLES.get().map(|x| x.0).unwrap_or("portal_page")
+}
+
+/// The table page data sources are kept in (`portal_page_data` unless configured otherwise).
+pub fn page_data_t() -> &'static str {
+    PAGE_TABLES.get().map(|x| x.1).unwrap_or("portal_page_data")
+}
+
+static G6: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set once at start-up from config.toml (`g6_schema`).
+pub fn set_g6(on: bool) {
+    G6.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Running on a g6 Grails portal's database (see `entity::g6_views`).
+pub fn g6() -> bool {
+    G6.load(std::sync::atomic::Ordering::Relaxed)
+}

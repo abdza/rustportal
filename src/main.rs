@@ -21,6 +21,7 @@ mod tags;
 mod tracker;
 mod tracker_web;
 mod tree;
+mod tree_web;
 mod upload;
 mod user;
 mod web;
@@ -64,6 +65,9 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
             return if action == "display" { page::display(ctx, &m, &sl, vec![]).await } else { page::runpage(ctx, &m, &sl, vec![]).await };
         }
         ("portalSearch", _) => return admin::search(ctx).await,
+        ("portalTreeNode", _) => return tree_web::node_action(ctx, action, id).await,
+        ("portalTree", "create_root" | "exporttree" | "importtreeform" | "importtree") => return tree_web::tree_action(ctx, action, id).await,
+        ("user", "api_list") => return tree_web::user_api_list(ctx).await,
         ("portalTracker", "list" | "create_data" | "display_data") => {
             let (m, sl) = (ctx.p("module"), ctx.p("slug"));
             return match action {
@@ -157,7 +161,7 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
             ctx.flash(&if errs.is_empty() { format!("Database updated for {} tracker(s)", done) } else { format!("Database updated for {} tracker(s); failed: {}", done, errs.join("; ")) });
             return ctx.redirect(&format!("/portalModule/show/{}", id.unwrap_or(0))).await;
         }
-        ("portalModule", "update_module_list" | "g5list" | "g5import" | "export" | "import" | "download" | "upload") => return module::action(ctx, action, id).await,
+        ("portalModule", "update_module_list" | "export" | "import" | "download" | "upload") => return module::action(ctx, action, id).await,
         ("fileLink", "get") => return files::get(ctx, id.unwrap_or(0)).await,
         ("fileLink", "download") => {
             let (m, sl) = ({ let m = ctx.p("module"); if m.is_empty() { "portal".to_string() } else { m } }, ctx.p("slug"));
@@ -287,13 +291,15 @@ async fn main() -> anyhow::Result<()> {
         return gsp_check(&argv[2..]);
     }
     let translate_modules: Option<Vec<String>> = if argv.get(1).map(|x| x.as_str()) == Some("translate-pages") { Some(argv[2..].to_vec()) } else { None };
+    // `copy-pages [module...]`: copy the other portal's pages into this portal's page tables
+    let copy_modules: Option<Vec<String>> = if argv.get(1).map(|x| x.as_str()) == Some("copy-pages") { Some(argv[2..].to_vec()) } else { None };
     // `module-export <module>` / `module-import <module> [dir]`: the Module screen's
     // export and import, from the command line (config.toml, or CONFIG=path)
     let module_cmd: Option<Vec<String>> = match argv.get(1).map(|x| x.as_str()) {
         Some("module-export") | Some("module-import") => Some(argv[1..].to_vec()),
         _ => None,
     };
-    let cfg_path = if translate_modules.is_some() || module_cmd.is_some() {
+    let cfg_path = if translate_modules.is_some() || module_cmd.is_some() || copy_modules.is_some() {
         std::env::var("CONFIG").unwrap_or_else(|_| "config.toml".to_string())
     } else {
         std::env::args().nth(1).unwrap_or_else(|| "config.toml".to_string())
@@ -308,11 +314,19 @@ async fn main() -> anyhow::Result<()> {
     if let Ok(p) = std::env::var("PORT") {
         cfg.port = p.parse().unwrap_or(cfg.port);
     }
+    db::set_page_tables(&cfg.page_table, &cfg.page_data_table);
+    db::set_g6(cfg.g6_schema);
     let database = db::Db::connect(&cfg.database_url, cfg.db_pool).await?;
+    if cfg.g6_schema {
+        entity::g6_views(&database).await?;
+    }
     let entities = entity::entities();
     entity::sync_schema(&database, &entities).await?;
     if let Some(mods) = translate_modules {
         return translate_pages(&database, &mods).await;
+    }
+    if let Some(mods) = copy_modules {
+        return copy_pages(&database, &mods).await;
     }
     std::fs::create_dir_all(&cfg.upload_dir)?;
     std::fs::create_dir_all(&cfg.module_dir)?;
@@ -331,16 +345,23 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let st_for_shutdown = st.clone();
-    scheduler::spawn(st.clone());
+    scheduler::spawn(st.clone(), cfg.run_scheduler);
     audit::start(st.db.clone()).await;
     let app = Router::new()
         .nest_service("/static", tower_http::services::ServeDir::new(&cfg.static_dir))
-        // like the Grails asset pipeline: /assets/x is looked up in js, libs, css and images
-        .nest_service("/assets", {
-            use tower_http::services::ServeDir;
-            let d = |sub: &str| std::path::Path::new(&cfg.static_dir).join(sub);
-            ServeDir::new(d("js")).fallback(ServeDir::new(d("libs")).fallback(ServeDir::new(d("css")).fallback(ServeDir::new(d("images")).fallback(ServeDir::new(&cfg.static_dir)))))
-        })
+        // like the Grails asset pipeline: /assets/x is looked up in the configured
+        // assets_dirs first, then this portal's js, libs, css and images
+        .route("/assets/*path", axum::routing::get({
+            let mut dirs: Vec<std::path::PathBuf> = cfg.assets_dirs.iter().map(std::path::PathBuf::from).collect();
+            for sub in ["js", "libs", "css", "images", ""] {
+                dirs.push(std::path::Path::new(&cfg.static_dir).join(sub));
+            }
+            let dirs = Arc::new(dirs);
+            move |axum::extract::Path(p): axum::extract::Path<String>| {
+                let dirs = dirs.clone();
+                async move { serve_asset(&dirs, &p).await }
+            }
+        }))
         .fallback(any(dispatch))
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         .with_state(st);
@@ -433,6 +454,46 @@ fn gsp_check(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One file from the first of `dirs` that has it (no `..`, no absolute paths).
+async fn serve_asset(dirs: &[std::path::PathBuf], rel: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let rel = rel.trim_start_matches('/');
+    let safe = !rel.is_empty() && std::path::Path::new(rel).components().all(|c| matches!(c, std::path::Component::Normal(_)));
+    if safe {
+        for d in dirs {
+            let f = d.join(rel);
+            if let Ok(data) = tokio::fs::read(&f).await {
+                let mime = mime_guess::from_path(&f).first_or_octet_stream().to_string();
+                return ([(axum::http::header::CONTENT_TYPE, mime), (axum::http::header::CACHE_CONTROL, "public, max-age=3600".to_string())], data).into_response();
+            }
+        }
+    }
+    (axum::http::StatusCode::NOT_FOUND, "Not found").into_response()
+}
+
+/// `rustportal copy-pages [module...]`: with `page_table` set to tables of this
+/// portal's own, copy the pages (and their data sources) of the Grails portal on
+/// the same database across, keeping their ids - tracker definitions point at
+/// pages by id. Pages already copied are left alone, so it can be run again to
+/// pick up pages added since. No modules = every module.
+async fn copy_pages(db: &db::Db, modules: &[String]) -> anyhow::Result<()> {
+    let (pt, dt) = (db::page_t(), db::page_data_t());
+    if pt == "portal_page" || dt == "portal_page_data" {
+        anyhow::bail!("copy-pages needs page_table and page_data_table set to this portal's own tables in the config");
+    }
+    let cols = |t: &'static str| async move {
+        db.rows("select column_name from information_schema.columns where table_schema=current_schema() and table_name=:t", &row! {"t"=>t}).await.map(|r| r.iter().map(|x| s(x, "column_name")).collect::<Vec<_>>())
+    };
+    let common = |a: Vec<String>, b: Vec<String>| a.into_iter().filter(|c| b.contains(c)).map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
+    let pcols = common(cols("portal_page").await?, cols(pt).await?);
+    let dcols = common(cols("portal_page_data").await?, cols(dt).await?);
+    let filter = if modules.is_empty() { String::new() } else { format!(" and module in {}", db::lit(&serde_json::json!(modules))) };
+    let n = db.exec(&format!("insert into {pt} ({c}) select {c} from portal_page p where not exists (select 1 from {pt} x where x.id=p.id){f}", c = pcols, f = filter), &db::no_params()).await?;
+    let d = db.exec(&format!("insert into {dt} ({c}) select {c} from portal_page_data d where d.page_id in (select id from {pt}) and not exists (select 1 from {dt} x where x.id=d.id)", c = dcols), &db::no_params()).await?;
+    println!("copied {} page(s) and {} data source(s) into {} / {}", n, d, pt, dt);
+    Ok(())
+}
+
 /// `rustportal translate-pages <module>...`: for a database copied from the
 /// Grails portal, translate the GSP pages of these modules in place (same
 /// rules as importing a Grails module; tracker definitions are left alone).
@@ -441,7 +502,7 @@ async fn translate_pages(db: &db::Db, modules: &[String]) -> anyhow::Result<()> 
         anyhow::bail!("usage: rustportal translate-pages <module> [module...]");
     }
     for m in modules {
-        let pages = db.rows("select * from portal_page where module=:m order by slug", &row! {"m"=>m.clone()}).await?;
+        let pages = db.rows(&format!("select * from {} where module=:m order by slug", db::page_t()), &row! {"m"=>m.clone()}).await?;
         let (mut tr, mut warned, mut stub) = (0, 0, 0);
         for p in &pages {
             let id = i(p, "id").unwrap_or(0);
@@ -474,16 +535,16 @@ async fn translate_pages(db: &db::Db, modules: &[String]) -> anyhow::Result<()> 
                 stub += 1;
             }
             if !upd.is_empty() {
-                db.update("portal_page", id, &upd).await?;
+                db.update(db::page_t(), id, &upd).await?;
             }
-            for d in db.rows("select id, name, query from portal_page_data where page_id=:p", &row! {"p"=>id}).await? {
+            for d in db.rows(&format!("select id, name, query from {} where page_id=:p", db::page_data_t()), &row! {"p"=>id}).await? {
                 let q = s(&d, "query");
                 if !q.contains("{{") && !q.trim().is_empty() {
                     let t = gsp::translate_expr(&q);
                     for w in &t.warnings {
                         println!("{}/{} data source {}: {}", m, slug, s(&d, "name"), w);
                     }
-                    db.update("portal_page_data", i(&d, "id").unwrap_or(0), &row! {"query"=>t.text}).await?;
+                    db.update(db::page_data_t(), i(&d, "id").unwrap_or(0), &row! {"query"=>t.text}).await?;
                 }
             }
         }

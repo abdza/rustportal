@@ -63,7 +63,7 @@ const ENDPOINT_KEYS: &[&str] = &["module", "slug", "name", "description", "handl
 
 async fn page_slug(db: &Db, id: Option<i64>) -> Value {
     match id {
-        Some(x) => db.get("portal_page", x).await.ok().flatten().map(|p| json!(s(&p, "slug"))).unwrap_or(Value::Null),
+        Some(x) => db.get(db::page_t(), x).await.ok().flatten().map(|p| json!(s(&p, "slug"))).unwrap_or(Value::Null),
         None => Value::Null,
     }
 }
@@ -73,12 +73,12 @@ pub async fn export(st: &St, module: &str, with_roles: bool) -> Result<PathBuf> 
     let dir = folder(st, module);
     std::fs::create_dir_all(dir.join("pages"))?;
     // pages
-    let pages = db.rows("select * from portal_page where module=:m order by slug", &row! {"m"=>module}).await?;
+    let pages = db.rows(&format!("select * from {} where module=:m order by slug", db::page_t()), &row! {"m"=>module}).await?;
     let mut plist = vec![];
     for p in &pages {
         let mut o = pick(p, PAGE_KEYS);
         o.insert("lastUpdated".into(), p.get("last_updated").cloned().unwrap_or(Value::Null));
-        let ds = db.rows("select name, query, return_one from portal_page_data where page_id=:p order by id", &row! {"p"=>i(p, "id")}).await?;
+        let ds = db.rows(&format!("select name, query, return_one from {} where page_id=:p order by id", db::page_data_t()), &row! {"p"=>i(p, "id")}).await?;
         o.insert("datasources".into(), if ds.is_empty() { Value::Null } else { Value::Array(ds.into_iter().map(Value::Object).collect()) });
         let slug = s(p, "slug");
         for old in ["html", "rhai", "gsp"] {
@@ -159,8 +159,8 @@ pub async fn export(st: &St, module: &str, with_roles: bool) -> Result<PathBuf> 
     let trees = db.rows("select * from tree where module=:m order by name", &row! {"m"=>module}).await?;
     let mut tl = vec![];
     for t in trees {
-        let nodes = db.rows("select id, parent_id, name, slug, domain, domainid, mainrole, hiderole, data, disabled from tree_node where tree_id=:t order by lft nulls last, id", &row! {"t"=>i(&t, "id")}).await?;
-        tl.push(json!({"name": s(&t, "name"), "module": module, "nodes": nodes}));
+        // the Grails portal's nested format, so the zip imports there too
+        tl.push(crate::tree::export_tree(db, i(&t, "id").unwrap_or(0), with_roles).await?);
     }
     write_json(&dir.join("treelist.json"), &Value::Array(tl))?;
     if with_roles {
@@ -275,8 +275,8 @@ pub async fn import_from(st: &St, module: &str, dir: &Path, with_roles: bool) ->
                 Some((c, false)) => json!(c),
                 _ => Value::Null,
             });
-            let pid = upsert(db, "portal_page", "module=:m and slug=:s", &row! {"m"=>module,"s"=>slug.clone()}, &d).await?;
-            db.exec("delete from portal_page_data where page_id=:p", &row! {"p"=>pid}).await?;
+            let pid = upsert(db, db::page_t(), "module=:m and slug=:s", &row! {"m"=>module,"s"=>slug.clone()}, &d).await?;
+            db.exec(&format!("delete from {} where page_id=:p", db::page_data_t()), &row! {"p"=>pid}).await?;
             if let Some(Value::Array(ds)) = p.get("datasources") {
                 for x in ds.iter().filter_map(|v| v.as_object()) {
                     let mut q = s(x, "query");
@@ -288,7 +288,7 @@ pub async fn import_from(st: &St, module: &str, dir: &Path, with_roles: bool) ->
                         }
                         q = t.text;
                     }
-                    db.insert("portal_page_data", &row! {"page_id"=>pid,"name"=>s(x, "name"),"query"=>q,"return_one"=>b(x, "return_one")}).await?;
+                    db.insert(db::page_data_t(), &row! {"page_id"=>pid,"name"=>s(x, "name"),"query"=>q,"return_one"=>b(x, "return_one")}).await?;
                 }
             }
         }
@@ -462,24 +462,50 @@ pub async fn import_from(st: &St, module: &str, dir: &Path, with_roles: bool) ->
         }
     }
     if let Some(list) = read_json(&dir.join("treelist.json")) {
+        // nested (Grails portal / this portal now) or flat (this portal's older exports);
+        // merged into existing trees the way the Grails portal does - nothing is deleted
+        let mut stats = crate::tree::ImportStats::default();
         for x in &list {
-            let name = s(x, "name");
-            if db.count("select count(*) from tree where module=:m and name=:n", &row! {"m"=>module,"n"=>name.clone()}).await? > 0 {
-                continue; // trees are edited locally; never overwrite
+            if let Err(e) = crate::tree::import_tree(db, x, Some(module), with_roles, &mut stats).await {
+                detail.push(format!("tree {}: {}", s(x, "name"), e));
             }
-            let tree_id = db.insert("tree", &row! {"module"=>module,"name"=>name}).await?;
-            let mut idmap = std::collections::HashMap::new();
-            if let Some(Value::Array(nodes)) = x.get("nodes") {
-                for n in nodes.iter().filter_map(|v| v.as_object()) {
-                    let mut d = vals(n, &["name", "slug", "domain", "domainid", "mainrole", "hiderole", "data", "disabled"]);
-                    d.insert("tree_id".into(), json!(tree_id));
-                    d.insert("parent_id".into(), i(n, "parent_id").and_then(|p| idmap.get(&p).copied()).map(|v: i64| json!(v)).unwrap_or(Value::Null));
-                    let nid = db.insert("tree_node", &d).await?;
-                    idmap.insert(i(n, "id").unwrap_or(0), nid);
-                }
-            }
-            crate::tree::rebuild(db, tree_id).await?;
         }
+        for u in &stats.users_skipped {
+            detail.push(format!("tree role holder skipped, no such staff here: {}", u));
+        }
+        log.push(format!("{} trees ({})", list.len(), stats.summary()));
+    }
+    // File links exported by the Grails portal: the file is in files/fl_{id}_{name}.
+    // It is always copied under upload_dir/{module}/ - the path stored in the zip
+    // belongs to the other server (often a Windows drive) and is not trusted.
+    if let Some(list) = read_json(&dir.join("filelinklist.json")) {
+        let (mut done, mut missing) = (0, 0);
+        let target_dir = PathBuf::from(&st.cfg.upload_dir).join(module).join("filelinks");
+        for x in &list {
+            let slug = s(x, "slug");
+            let name = s(x, "name");
+            if slug.is_empty() {
+                continue;
+            }
+            let src = dir.join("files").join(format!("fl_{}_{}", s(x, "id"), name.replace(' ', "_")));
+            let mut d = vals(x, &["name", "slug", "allowedroles", "filegroup", "sortnum"]);
+            d.insert("module".into(), json!(module));
+            d.insert("last_updated".into(), json!(now_str()));
+            if src.is_file() {
+                std::fs::create_dir_all(&target_dir)?;
+                let fname = crate::files::sanitize_filename(&format!("{}_{}", slug, name));
+                let target = target_dir.join(if fname.is_empty() { slug.clone() } else { fname });
+                std::fs::copy(&src, &target)?;
+                d.insert("path".into(), json!(target.to_string_lossy().to_string()));
+                d.insert("size".into(), json!(std::fs::metadata(&target).map(|m| m.len() as i64).unwrap_or(0)));
+                done += 1;
+            } else {
+                missing += 1;
+                detail.push(format!("file link {}: {} is not in the zip - the link is created without a file", slug, src.strip_prefix(&dir).unwrap_or(&src).display()));
+            }
+            upsert(db, "file_link", "module=:m and slug=:s", &row! {"m"=>module,"s"=>slug}, &d).await?;
+        }
+        log.push(if missing > 0 { format!("{} file links ({} without their file)", done + missing, missing) } else { format!("{} file links", done) });
     }
     if with_roles {
         if let Some(list) = read_json(&dir.join("userroles.json")).or_else(|| read_json(&dir.join("userrolelist.json"))) {
@@ -528,35 +554,91 @@ fn zip_dir(dir: &Path) -> Result<Vec<u8>> {
     Ok(buf.into_inner())
 }
 
-/// Unpack an uploaded module zip into the module folder. Returns the module name.
-fn unzip_module(st: &St, bytes: &[u8]) -> Result<String> {
+/// The module name a Grails portal zip gets: its file name, minus `.zip` and
+/// the " (1)" / "-1" a browser adds to repeated downloads.
+fn module_from_filename(filename: &str) -> String {
+    let base = filename.rsplit(['/', '\\']).next().unwrap_or("");
+    let mut n = base.strip_suffix(".zip").or_else(|| base.strip_suffix(".ZIP")).unwrap_or(base).trim().to_string();
+    if let Some(i) = n.rfind(" (") {
+        if n.ends_with(')') && n[i + 2..n.len() - 1].chars().all(|c| c.is_ascii_digit()) {
+            n.truncate(i);
+        }
+    }
+    n.trim().replace(' ', "_")
+}
+
+/// Unpack an uploaded module zip into the module folder. Returns the module
+/// name and whether the zip came from the Grails portal. Two layouts are accepted:
+/// - this portal's: one folder named after the module, holding the definitions;
+/// - the Grails portal's: `pagelist.json`, `trackerlist.json` and `pages/` at the
+///   top of the zip, the module named after the zip file.
+/// The module folder is replaced as a whole, so page sources from an earlier
+/// export (which would win over the uploaded `.gsp` ones) do not linger.
+fn unzip_module(module_dir: &Path, filename: &str, bytes: &[u8]) -> Result<(String, bool)> {
     let mut za = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
-    let mut module = String::new();
+    let defs = ["pagelist.json", "trackerlist.json", "settinglist.json", "treelist.json", "schedulerlist.json", "endpointlist.json", "filelinklist.json"];
+    // (path parts, index) of every file worth keeping
+    let mut entries: Vec<(Vec<String>, usize)> = vec![];
     for n in 0..za.len() {
-        let mut f = za.by_index(n)?;
-        let Some(name) = f.enclosed_name() else { continue };
-        let parts: Vec<String> = name.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
-        if parts.len() < 2 || f.is_dir() {
+        let f = za.by_index(n)?;
+        if f.is_dir() {
             continue;
         }
-        if module.is_empty() {
-            module = parts[0].clone();
+        // zips made on Windows (as the Grails portal's often are) use "pages\x.gsp"
+        let raw = f.name().replace('\\', "/");
+        let parts: Vec<String> = raw.split('/').filter(|p| !p.is_empty() && *p != ".").map(String::from).collect();
+        if parts.is_empty() || parts.iter().any(|p| p == ".." || p.contains(':')) || raw.starts_with('/') {
+            continue;
         }
-        if parts[0] != module || !module.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Err(anyhow!("The zip must contain exactly one module folder with a simple name"));
+        // editor/OS clutter such as .claude/, .git/, __MACOSX/
+        if parts.iter().any(|p| p.starts_with('.') || p == "__MACOSX") {
+            continue;
         }
-        let target = PathBuf::from(&st.cfg.module_dir).join(name);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut data = vec![];
-        f.read_to_end(&mut data)?;
-        std::fs::write(target, data)?;
+        entries.push((parts, n));
     }
-    if module.is_empty() {
-        return Err(anyhow!("No module folder found in the zip"));
+    let at_root = entries.iter().any(|(p, _)| p.len() == 1 && defs.contains(&p[0].as_str()));
+    let (module, strip) = if at_root {
+        (module_from_filename(filename), 0)
+    } else {
+        let mut tops: Vec<&String> = entries.iter().filter(|(p, _)| p.len() >= 2).map(|(p, _)| &p[0]).collect();
+        tops.sort();
+        tops.dedup();
+        match tops.as_slice() {
+            [one] if entries.iter().any(|(p, _)| p.len() == 2 && &p[0] == *one && defs.contains(&p[1].as_str())) => ((*one).clone(), 1),
+            _ => return Err(anyhow!("This does not look like a module zip: no pagelist.json, trackerlist.json or other module list at its top, nor in a single module folder")),
+        }
+    };
+    if module.is_empty() || !module.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(anyhow!("'{}' is not a valid module name (letters, numbers and _ only) - rename the zip file to the module name", module));
     }
-    Ok(module)
+    let base = module_dir.to_path_buf();
+    std::fs::create_dir_all(&base)?;
+    let tmp = base.join(format!(".upload-{}-{}", module, std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let res = (|| -> Result<()> {
+        for (parts, n) in &entries {
+            if parts.len() <= strip {
+                continue;
+            }
+            let target = parts[strip..].iter().fold(tmp.clone(), |p, x| p.join(x));
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut data = vec![];
+            za.by_index(*n)?.read_to_end(&mut data)?;
+            std::fs::write(target, data)?;
+        }
+        let dest = base.join(&module);
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest)?;
+        }
+        std::fs::rename(&tmp, &dest)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    res.map(|_| (module, at_root))
 }
 
 async fn module_of(ctx: &Ctx, id: i64) -> Option<String> {
@@ -573,7 +655,8 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<i64>) -> Response {
                 return ctx.status(StatusCode::FORBIDDEN, "Only administrators can do that").await;
             }
             let mut names: Vec<String> = vec![];
-            for q in ["select distinct module from portal_page", "select distinct module from portal_tracker", "select distinct module from portal_setting", "select distinct module from user_role"] {
+            let pq = format!("select distinct module from {}", db::page_t());
+            for q in [pq.as_str(), "select distinct module from portal_tracker", "select distinct module from portal_setting", "select distinct module from user_role"] {
                 names.extend(ctx.db().rows(q, &db::no_params()).await.unwrap_or_default().iter().map(|r| s(r, "module")));
             }
             if let Ok(rd) = std::fs::read_dir(&ctx.st.cfg.module_dir) {
@@ -600,68 +683,33 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<i64>) -> Response {
                     ctx.flash("No file selected");
                     return ctx.redirect("/portalModule/upload").await;
                 };
-                let st = ctx.st.clone();
+                let module_dir = PathBuf::from(&ctx.st.cfg.module_dir);
+                let filename = up.filename.clone();
                 let bytes = up.read_all().await.unwrap_or_default();
-                let res = match tokio::task::spawn_blocking(move || unzip_module(&st, &bytes)).await {
-                    Ok(Ok(m)) => {
-                        let r = import(&ctx.st, &m, false).await;
-                        r.map(|(msg, detail)| (m, msg, detail))
+                let with_roles = ctx.params.contains_key("staff_on");
+                let res = match tokio::task::spawn_blocking(move || unzip_module(&module_dir, &filename, &bytes)).await {
+                    Ok(Ok((m, grails))) => {
+                        let r = import(&ctx.st, &m, with_roles).await;
+                        r.map(|(msg, detail)| (m, if grails { format!("Grails portal zip upload: {}", msg) } else { format!("zip upload: {}", msg) }, detail))
                     }
                     Ok(Err(e)) => Err(e),
                     Err(e) => Err(anyhow!("{}", e)),
                 };
                 match res {
                     Ok((m, msg, detail)) => {
-                        let _ = ctx.db().insert("portal_module_import_log", &row! {"module"=>m,"staffid"=>ctx.user.as_ref().map(|u| s(u, "staffid")),"staffname"=>ctx.user.as_ref().map(|u| s(u, "emp_name")),"remarks"=>format!("zip upload: {}", msg),"diff"=>detail,"date_created"=>now_str()}).await;
+                        let _ = ctx.db().insert("portal_module_import_log", &row! {"module"=>m,"staffid"=>ctx.user.as_ref().map(|u| s(u, "staffid")),"staffname"=>ctx.user.as_ref().map(|u| s(u, "emp_name")),"remarks"=>msg.clone(),"diff"=>detail,"date_created"=>now_str()}).await;
                         ctx.flash(&msg);
+                        return match crate::admin::module_url(ctx.db(), &m).await {
+                            Some(u) => ctx.redirect(&u).await,
+                            None => ctx.redirect("/portalModule/index").await,
+                        };
                     }
                     Err(e) => ctx.flash(&format!("Import failed: {}", e)),
                 }
-                return ctx.redirect("/portalModule/index").await;
+                return ctx.redirect("/portalModule/upload").await;
             }
-            let h = format!("<div class='container'><h1>Upload module zip</h1><p>The zip must contain one folder named after the module, with <code>pagelist.json</code>, <code>trackerlist.json</code> and a <code>pages</code> folder.</p><form method='post' enctype='multipart/form-data' action='/portalModule/upload'>{}<input type='file' name='file' accept='.zip' class='form-control mb-2' required/><button class='btn btn-primary'>Upload and import</button></form></div>", ctx.csrf_field());
+            let h = format!("<div class='container'><h1>Upload module zip</h1><p>Upload a module zip exported from this portal or from the Grails portal. Grails portal zips are recognised automatically: the module is named after the zip file, template pages are translated to MiniJinja, and Groovy scripts are kept as comments for porting by hand. The module's import log lists every page that needs a look. An existing module with the same name is overwritten.</p><form method='post' enctype='multipart/form-data' action='/portalModule/upload'>{}<input type='file' name='file' accept='.zip' class='form-control mb-2' required/><label class='d-block mb-2'><input type='checkbox' name='staff_on'/> Also import user roles</label><button class='btn btn-primary'>Upload and import</button></form></div>", ctx.csrf_field());
             ctx.html("Upload module", h).await
-        }
-        "g5list" | "g5import" => {
-            if !ctx.is_admin() || ctx.sess.contains_key("adminlink") {
-                return ctx.status(StatusCode::FORBIDDEN, "Only administrators can do that").await;
-            }
-            let base = PathBuf::from(&ctx.st.cfg.g5_module_dir);
-            if ctx.st.cfg.g5_module_dir.is_empty() || !base.is_dir() {
-                let h = "<div class='container'><h1>Import from the Grails portal</h1><p>Set <code>g5_module_dir</code> in <code>config.toml</code> to the Grails portal's <code>modulemigration</code> folder and restart. The folder is only read, never written.</p></div>".to_string();
-                return ctx.html("Import from Grails", h).await;
-            }
-            if act == "g5import" {
-                let name = ctx.p("name");
-                let dir = base.join(&name);
-                if ctx.method != "POST" || name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') || !dir.join("pagelist.json").is_file() && !dir.join("trackerlist.json").is_file() {
-                    return ctx.status(StatusCode::BAD_REQUEST, "No such module folder").await;
-                }
-                let to = match import_from(&ctx.st, &name, &dir, ctx.params.contains_key("staff_on")).await {
-                    Ok((msg, detail)) => {
-                        let _ = ctx.db().insert("portal_module_import_log", &row! {"module"=>name.clone(),"staffid"=>ctx.user.as_ref().map(|u| s(u, "staffid")),"staffname"=>ctx.user.as_ref().map(|u| s(u, "emp_name")),"remarks"=>format!("from Grails: {}", msg),"diff"=>detail,"date_created"=>now_str()}).await;
-                        ctx.flash(&msg);
-                        crate::admin::module_url(ctx.db(), &name).await.unwrap_or_else(|| "/portalModule/index".into())
-                    }
-                    Err(e) => {
-                        ctx.flash(&format!("Import failed: {}", e));
-                        "/portalModule/g5list".into()
-                    }
-                };
-                return ctx.redirect(&to).await;
-            }
-            let mut names: Vec<String> = std::fs::read_dir(&base).map(|rd| rd.flatten().filter(|e| e.path().join("pagelist.json").is_file() || e.path().join("trackerlist.json").is_file()).map(|e| e.file_name().to_string_lossy().to_string()).collect()).unwrap_or_default();
-            names.sort_by_key(|n| n.to_lowercase());
-            let have: Vec<String> = ctx.db().rows("select name from portal_module", &db::no_params()).await.unwrap_or_default().iter().map(|r| s(r, "name")).collect();
-            let csrf = ctx.csrf_field();
-            let mut h = format!("<div class='container-fluid'><h1>Import from the Grails portal</h1><p>Modules found in <code>{}</code> (read only). Importing creates or overwrites the module's trackers and pages here. Template pages are translated to MiniJinja; runable pages and preprocess scripts stay Groovy, commented out, for porting by hand. The import log lists every page that needs a look.</p><table class='table table-sm table-striped'><thead><tr><th>Module</th><th>Trackers</th><th>Pages</th><th>Here</th><th></th></tr></thead><tbody>", esc(&base.display().to_string()));
-            for n in names {
-                let count = |f: &str| read_json(&base.join(&n).join(f)).map(|l| l.len()).unwrap_or(0);
-                let here = if have.contains(&n) { match crate::admin::module_url(ctx.db(), &n).await { Some(u) => format!("<a href='{}'>imported</a>", u), None => String::new() } } else { String::new() };
-                h.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form method='post' action='/portalModule/g5import' style='margin:0' onsubmit=\"return confirm('Import module {} from the Grails portal? Its trackers and pages here are overwritten.')\">{}<input type='hidden' name='name' value='{}'/><label class='me-2'><input type='checkbox' name='staff_on'/> user roles</label><button class='btn btn-sm btn-primary'>Import</button></form></td></tr>", esc(&n), count("trackerlist.json"), count("pagelist.json"), here, esc(&n), csrf, esc(&n)));
-            }
-            h.push_str("</tbody></table></div>");
-            ctx.html("Import from Grails", h).await
         }
         "export" | "import" | "download" => {
             let Some(m) = (match id {
@@ -705,5 +753,85 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<i64>) -> Response {
             ctx.redirect(&back).await
         }
         _ => ctx.status(StatusCode::NOT_FOUND, "Unknown action").await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_zip(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut buf);
+            for (n, c) in files {
+                zw.start_file(*n, zip::write::SimpleFileOptions::default()).unwrap();
+                zw.write_all(c.as_bytes()).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rp-unzip-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn filename_to_module() {
+        assert_eq!(module_from_filename("akpk.zip"), "akpk");
+        assert_eq!(module_from_filename("C:\\fakepath\\akpk (2).zip"), "akpk");
+        assert_eq!(module_from_filename("My Module.zip"), "My_Module");
+    }
+
+    #[test]
+    fn grails_layout_named_after_file_and_replaces_old_folder() {
+        let base = tmpdir("g5");
+        std::fs::create_dir_all(base.join("akpk/pages")).unwrap();
+        std::fs::write(base.join("akpk/pages/content_home.html"), "stale").unwrap();
+        let z = make_zip(&[(".claude/settings.local.json", "{}"), ("pagelist.json", "[]"), ("trackerlist.json", "[]"), ("pages/content_home.gsp", "<g:if/>")]);
+        let (m, grails) = unzip_module(&base, "akpk (1).zip", &z).unwrap();
+        let w = make_zip(&[("pagelist.json", "[]"), ("pages\\content_x.gsp", "a"), ("..\\evil.txt", "b")]);
+        assert_eq!(unzip_module(&base, "win.zip", &w).unwrap().0, "win");
+        assert!(base.join("win/pages/content_x.gsp").is_file());
+        assert!(!base.join("evil.txt").exists());
+        assert_eq!((m.as_str(), grails), ("akpk", true));
+        assert!(base.join("akpk/pagelist.json").is_file());
+        assert!(base.join("akpk/pages/content_home.gsp").is_file());
+        assert!(!base.join("akpk/pages/content_home.html").exists());
+        assert!(!base.join("akpk/.claude").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn own_layout_uses_folder_name() {
+        let base = tmpdir("own");
+        let z = make_zip(&[("crm/pagelist.json", "[]"), ("crm/pages/content_a.html", "x")]);
+        assert_eq!(unzip_module(&base, "whatever.zip", &z).unwrap(), ("crm".to_string(), false));
+        assert!(base.join("crm/pages/content_a.html").is_file());
+        let bad = make_zip(&[("readme.txt", "x"), ("a/b.txt", "y")]);
+        assert!(unzip_module(&base, "x.zip", &bad).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn real_grails_zips() {
+        let dir = Path::new("/home/abdza/data/cimb/g5portal/modulemigration");
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let base = tmpdir("real");
+        let (mut ok, mut bad) = (0, vec![]);
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if !n.ends_with(".zip") { continue; }
+            match unzip_module(&base, &n, &std::fs::read(e.path()).unwrap()) {
+                Ok((m, true)) if std::fs::read_dir(base.join(&m)).map(|d| d.flatten().all(|e| !e.file_name().to_string_lossy().contains('\\'))).unwrap_or(false) => ok += 1,
+                other => bad.push(format!("{}: {:?}", n, other.map(|x| x.0))),
+            }
+        }
+        eprintln!("real grails zips: {} ok, failures: {:?}", ok, bad);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(bad.is_empty());
     }
 }

@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 pub async fn find_page(db: &Db, module: &str, slug: &str) -> Option<Row> {
     crate::cache::PAGES
         .get_or(format!("{}\u{1}{}", module, slug), async {
-            db.first("select * from portal_page where module=:m and slug=:s order by id limit 1", &row! {"m"=>module,"s"=>slug}).await.ok().flatten()
+            db.first(&format!("select * from {} where module=:m and slug=:s order by id limit 1", crate::db::page_t()), &row! {"m"=>module,"s"=>slug}).await.ok().flatten()
         })
         .await
 }
@@ -92,7 +92,7 @@ pub async fn datasources(sc: &Sc, page: &Row, vars: &Row) -> Row {
     let mut datas = Row::new();
     let pid = i(page, "id").unwrap_or(0);
     let srcs = crate::cache::PAGE_DATA
-        .get_or(pid.to_string(), async { sc.db().rows("select * from portal_page_data where page_id=:p order by id", &row! {"p"=>pid}).await.unwrap_or_default() })
+        .get_or(pid.to_string(), async { sc.db().rows(&format!("select * from {} where page_id=:p order by id", crate::db::page_data_t()), &row! {"p"=>pid}).await.unwrap_or_default() })
         .await;
     for ds in srcs {
         let name = s(&ds, "name");

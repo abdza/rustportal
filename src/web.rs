@@ -42,9 +42,26 @@ pub struct Config {
     pub module_dir: String,
     /// link on "Designed by ... Team" in the footer
     pub credits_url: String,
-    /// the Grails portal's `modulemigration` folder, for direct imports (read only)
-    pub g5_module_dir: String,
+    /// footer "Copyright <b>...</b>" and "Designed by ..." (default: the app name / "<app name> Team")
+    pub copyright: String,
+    pub team: String,
+    /// header logo and favicon (default: /static/images/logo.png and favicon.ico)
+    pub logo_url: String,
+    pub favicon_url: String,
+    /// folders searched first for /assets/x, before this portal's own static files -
+    /// e.g. a Grails portal's grails-app/assets/{images,javascripts,stylesheets,libs}
+    pub assets_dirs: Vec<String>,
     pub static_dir: String,
+    /// the tables pages and their data sources are kept in, so this portal can run
+    /// on a Grails portal's database with its own copy of the pages beside the other's
+    pub page_table: String,
+    pub page_data_table: String,
+    /// the database is a g6 Grails portal's (portal_user, portal_tree...): this
+    /// portal reaches those tables through views under its own names
+    pub g6_schema: bool,
+    /// run scheduled pages and send queued e-mail. Off when another portal on the
+    /// same database already does, or every job would run twice.
+    pub run_scheduler: bool,
     pub allow_registration: bool,
     pub session_hours: i64,
     pub app_name: String,
@@ -60,8 +77,16 @@ impl Default for Config {
             upload_dir: "uploads".into(),
             module_dir: "modulemigration".into(),
             credits_url: String::new(),
-            g5_module_dir: String::new(),
+            copyright: String::new(),
+            team: String::new(),
+            logo_url: String::new(),
+            favicon_url: String::new(),
+            assets_dirs: vec![],
             static_dir: "static".into(),
+            page_table: "portal_page".into(),
+            page_data_table: "portal_page_data".into(),
+            g6_schema: false,
+            run_scheduler: true,
             allow_registration: false,
             session_hours: 12,
             app_name: "Portal".into(),
@@ -730,7 +755,8 @@ impl Ctx {
     /// Content without the layout chrome (HTMX fragments, full pages).
     /// A page without the header, sidebar and footer (the Grails portal's "empty" layout).
     pub async fn empty_page(mut self, title: &str, body: String) -> Response {
-        let ctx = json!({"title": title, "content": body, "flash": self.take_flash(), "csrf": self.csrf(), "app_name": self.st.cfg.app_name});
+        let brand = branding(&self.st).await;
+        let ctx = json!({"title": title, "content": body, "flash": self.take_flash(), "csrf": self.csrf(), "app_name": brand["app_name"], "brand": brand});
         let mut env = minijinja::Environment::new();
         env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
         let _ = env.add_template("empty", include_str!("../templates/empty.html"));
@@ -753,8 +779,10 @@ impl Ctx {
         let db = self.st.db.clone();
         let megamenu = crate::tree::mega_menu(&db, "portal", "main_menu").await;
         let mut sidemenu = String::new();
-        if let Some(m) = &self.side_menu {
-            sidemenu = crate::tree::side_menu(&db, &format!("{}_menu", m)).await;
+        if let Some(m) = self.side_menu.clone() {
+            let module = self.module.clone().unwrap_or_default();
+            let module_admin = self.is_admin() || (!module.is_empty() && self.can_admin(&module).await);
+            sidemenu = crate::tree::side_menu(&db, &format!("{}_menu", m), module_admin).await;
         }
         let mut adminish = false;
         let mut dev = false;
@@ -779,15 +807,18 @@ impl Ctx {
                 "None".to_string()
             };
         }
+        // as the Grails portal: the module, then "_slug" when there is one
         let pageslug = match (&self.module, &self.slug) {
             (Some(m), Some(sl)) => format!("{}_{}", m, sl),
+            (Some(m), None) => m.clone(),
             _ => String::new(),
         };
+        let brand = branding(&self.st).await;
         let ctx = json!({
             "title": title, "content": body, "flash": flash, "csrf": csrf, "megamenu": megamenu, "sidemenu": sidemenu,
             "user": user_json, "adminish": adminish, "dev": dev, "superadmin": self.is_admin(), "role": role, "role_label": role_label,
-            "pageslug": pageslug, "credits_url": self.st.cfg.credits_url,
-            "switched": self.sess.contains_key("adminlink"), "app_name": self.st.cfg.app_name,
+            "pageslug": pageslug, "credits_url": brand["homepage"], "brand": brand,
+            "switched": self.sess.contains_key("adminlink"), "app_name": brand["app_name"],
             "allow_registration": self.st.cfg.allow_registration,
         });
         let mut env = minijinja::Environment::new();
@@ -798,4 +829,41 @@ impl Ctx {
             Err(e) => format!("<pre>layout error: {}</pre>", esc(&e.to_string())),
         }
     }
+}
+
+/// Header, footer and tab branding, as the g6 Grails portal resolves it: a value
+/// saved in the `branding` module's settings, else config.toml, else the default.
+pub async fn branding(st: &St) -> Value {
+    let stored = crate::cache::SETTINGS
+        .get_or("\u{1}branding".to_string(), async {
+            st.db.rows("select name, text from portal_setting where module='branding'", &db::no_params()).await.ok().map(|rows| {
+                let mut m = Row::new();
+                for r in rows {
+                    let v = s(&r, "text").trim().to_string();
+                    if !v.is_empty() {
+                        m.insert(s(&r, "name"), Value::String(v));
+                    }
+                }
+                m
+            })
+        })
+        .await
+        .unwrap_or_default();
+    let cfg = &st.cfg;
+    let pick = |key: &str, cfgval: &str, default: String| -> String {
+        let v = s(&stored, key);
+        if !v.is_empty() { v } else if !cfgval.is_empty() { cfgval.to_string() } else { default }
+    };
+    let app_name = pick("app_name", &cfg.app_name, "Portal".into());
+    let file = |slug_key: &str| { let sl = s(&stored, slug_key); if sl.is_empty() { String::new() } else { format!("/download/portal/{}", sl) } };
+    let logo = { let f = file("logo_slug"); if !f.is_empty() { f } else { pick("logo_url", &cfg.logo_url, "/static/images/logo.png".into()) } };
+    let favicon = { let f = file("favicon_slug"); if !f.is_empty() { f } else { pick("favicon_url", &cfg.favicon_url, "/static/images/favicon.ico".into()) } };
+    json!({
+        "app_name": app_name,
+        "copyright": pick("copyright", &cfg.copyright, app_name.clone()),
+        "team": pick("team", &cfg.team, format!("{} Team", app_name)),
+        "homepage": pick("homepage", &cfg.credits_url, String::new()),
+        "logo": logo,
+        "favicon": favicon,
+    })
 }
