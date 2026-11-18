@@ -487,7 +487,20 @@ async fn copy_pages(db: &db::Db, modules: &[String]) -> anyhow::Result<()> {
     let common = |a: Vec<String>, b: Vec<String>| a.into_iter().filter(|c| b.contains(c)).map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
     let pcols = common(cols("portal_page").await?, cols(pt).await?);
     let dcols = common(cols("portal_page_data").await?, cols(dt).await?);
+    // --refresh: bring copied pages back to the other portal's current version, except
+    // pages ported by hand (content starting with "{# rp-ported" or "// rp-ported")
+    let refresh = modules.iter().any(|m| m == "--refresh");
+    let modules: Vec<String> = modules.iter().filter(|m| *m != "--refresh").cloned().collect();
     let filter = if modules.is_empty() { String::new() } else { format!(" and module in {}", db::lit(&serde_json::json!(modules))) };
+    if refresh {
+        let sets: Vec<String> = pcols.split(", ").filter(|c| *c != "\"id\"").map(|c| format!("{c} = p.{c}")).collect();
+        let r = db.exec(&format!(
+            "update {pt} x set {s} from portal_page p where p.id = x.id and coalesce(x.content,'') not like '{{# rp-ported%' and coalesce(x.content,'') not like '// rp-ported%'{f}",
+            s = sets.join(", "), f = filter.replace(" module ", " p.module ")
+        ), &db::no_params()).await?;
+        let rd = db.exec(&format!("delete from {dt} d where d.page_id in (select x.id from {pt} x join portal_page p on p.id=x.id where coalesce(x.content,'') not like '{{# rp-ported%' and coalesce(x.content,'') not like '// rp-ported%'{f})", f = filter.replace(" module ", " p.module ")), &db::no_params()).await?;
+        println!("refreshed {} page(s) from the other portal ({} data source(s) to copy again)", r, rd);
+    }
     let n = db.exec(&format!("insert into {pt} ({c}) select {c} from portal_page p where not exists (select 1 from {pt} x where x.id=p.id){f}", c = pcols, f = filter), &db::no_params()).await?;
     let d = db.exec(&format!("insert into {dt} ({c}) select {c} from portal_page_data d where d.page_id in (select id from {pt}) and not exists (select 1 from {dt} x where x.id=d.id)", c = dcols), &db::no_params()).await?;
     println!("copied {} page(s) and {} data source(s) into {} / {}", n, d, pt, dt);

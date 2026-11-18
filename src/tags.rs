@@ -124,11 +124,11 @@ pub async fn display_field(sc: &Sc, t: &Tracker, f: &Row, value: &Value, datas: 
             let Ok(oid) = txt.parse::<i64>() else { return esc(&txt) };
             let Some(ot) = t.other_tracker(sc.db(), f).await else { return esc(&txt) };
             let ff = other_format(f);
-            let fname = if ff.is_empty() { ot.default_field().unwrap_or_else(|| "id".into()) } else { ff };
-            let label = match ot.get(sc.db(), oid).await {
-                Some(od) => { let l = s(&od, &fname); if l.is_empty() { txt.clone() } else { l } },
-                None => txt.clone(),
-            };
+            // as the Grails portals: the referenced record's field (blank when the tracker has
+            // no name/title field), and nothing at all when the record no longer exists
+            let fname = if ff.is_empty() { ot.default_field().unwrap_or_default() } else { ff };
+            let Some(od) = ot.get(sc.db(), oid).await else { return String::new() };
+            let label = if fname.is_empty() { String::new() } else { s(&od, &fname) };
             if nolink || b(f, "suppress_follow_link") {
                 esc(&label)
             } else {
@@ -136,14 +136,7 @@ pub async fn display_field(sc: &Sc, t: &Tracker, f: &Row, value: &Value, datas: 
             }
         }
         "HasMany" => String::new(),
-        "Drop Down" | "MultiSelect" => {
-            let opts = field_options(sc, f, datas).await;
-            let labels: Vec<String> = txt
-                .split(',')
-                .map(|v| opts.iter().find(|(k, _)| k == v.trim()).map(|(_, l)| l.clone()).unwrap_or_else(|| v.trim().to_string()))
-                .collect();
-            esc(&labels.join(", "))
-        }
+        // the Grails portals' displayField shows a choice field's stored value as it is
         "Text Area" => {
             if fd.trim() == "html" { txt } else { esc(&txt).replace('\n', "<br/>") }
         }
@@ -370,9 +363,9 @@ pub async fn tracker_list(sc: &Sc, t: &Tracker, opts: &Row) -> String {
             fields.push(f.clone());
         } else if n == "row_number" {
             fields.push(row! {"name"=>"row_number","label"=>"No.","field_type"=>"Row"});
-        } else if n == "record_status" || n == "id" {
-            fields.push(row! {"name"=>n.clone(),"label"=>if n == "id" { "ID" } else { "Status" },"field_type"=>"Text"});
         }
+        // anything else that is not one of the tracker's fields (e.g. record_status,
+        // id) is left out, as the Grails portals' trackerList does
     }
     let default_max = i(&t.row, "defaultlimit").filter(|x| *x > 0).unwrap_or(10);
     let max = i(&params, "max").filter(|x| *x > 0).unwrap_or(default_max).min(1000);
@@ -859,7 +852,8 @@ async fn has_many(sc: &Sc, t: &Tracker, f: &Row, id: i64, form: Option<&Trans>) 
     let tokens: Vec<String> = { let l = csv(&s(f, "field_format")); if l.is_empty() { csv(&s(&ot.row, "listfields")) } else { l } };
     let numbered = tokens.iter().any(|x| x == "#") || form.is_some();
     let cols: Vec<&Row> = tokens.iter().filter_map(|n| ot.field(n)).filter(|c| s(c, "field_type") != "HasMany").collect();
-    let view = tokens.iter().any(|x| x.eq_ignore_ascii_case("view"));
+    // g5 shows View only when field_format lists it; g6 always does
+    let view = crate::db::g6() || tokens.iter().any(|x| x.eq_ignore_ascii_case("view"));
     let acts: Vec<&Trans> = ot.transitions.iter().filter(|tr| tokens.iter().any(|x| x.eq_ignore_ascii_case(&tr.name))).collect();
     let order = { let d = s(&ot.row, "defaultsort"); if d.is_empty() { "id".to_string() } else { d } };
     let rows = ot.rows(sc.db(), Some(&row! {lname.clone()=>id}), Some(&order), None, Some(1000)).await.unwrap_or_default();

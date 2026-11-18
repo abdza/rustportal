@@ -287,7 +287,10 @@ pub async fn display(mut ctx: Ctx, module: &str, slug: &str, id: i64) -> Respons
     let sc = make_sc(&mut ctx);
     sc.set_cur(module, slug, Some(id), None);
     if !tags::can_view(&sc, &t, &datas).await {
-        return ctx.status(StatusCode::FORBIDDEN, "You are not authorized to view this record").await;
+        // as the Grails portals' trackerDisplay tag: say so, then go to the list
+        let to = t.url("list");
+        let h = format!("<script>alert('You are not authorised to view that record');window.location={};</script>", serde_json::to_string(&to).unwrap_or_default());
+        return ctx.html(&t.name, h).await;
     }
     let status = s(&datas, "record_status");
     let mut page = None;

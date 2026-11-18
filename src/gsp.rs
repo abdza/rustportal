@@ -20,6 +20,7 @@ pub fn looks_like_gsp(src: &str) -> bool {
 }
 
 pub fn translate(src: &str) -> Translated {
+    let src = &resolve_class_aliases(src);
     // pass 1 finds the variables that are changed inside a loop (they need a namespace)
     let mut a = Tr::new(HashSet::new());
     a.run(src);
@@ -33,6 +34,51 @@ pub fn translate(src: &str) -> Translated {
     let mut seen = HashSet::new();
     b.warn.retain(|w| seen.insert(w.clone()));
     Translated { text, warnings: b.warn }
+}
+
+/// `def TH = g6portal.PortalTracker` and then `TH.raw_rows(...)`: drop the alias
+/// line and write the class name where the alias was used, so the calls are
+/// recognised like any other.
+fn resolve_class_aliases(src: &str) -> String {
+    let mut aliases: Vec<(String, String)> = vec![];
+    let mut kept = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        let t = line.trim();
+        let alias = t.strip_prefix("def ").and_then(|r| r.split_once('=')).and_then(|(name, val)| {
+            let (name, val) = (name.trim(), val.trim().trim_end_matches(';').trim());
+            let class = val.strip_prefix("g6portal.").or_else(|| val.strip_prefix("g5portal."))?;
+            let ok = |x: &str| !x.is_empty() && x.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            (ok(name) && ok(class) && class.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)).then(|| (name.to_string(), class.to_string()))
+        });
+        match alias {
+            Some(a) => aliases.push(a),
+            None => kept.push_str(line),
+        }
+    }
+    if aliases.is_empty() {
+        return src.to_string();
+    }
+    let mut out = kept;
+    for (name, class) in aliases {
+        let mut res = String::with_capacity(out.len());
+        let pat = format!("{}.", name);
+        let bytes: Vec<char> = out.chars().collect();
+        let mut i = 0;
+        while i < bytes.len() {
+            let rest: String = bytes[i..(i + pat.len()).min(bytes.len())].iter().collect();
+            let before_ok = i == 0 || !(bytes[i - 1].is_alphanumeric() || bytes[i - 1] == '_' || bytes[i - 1] == '.');
+            if rest == pat && before_ok {
+                res.push_str(&class);
+                res.push('.');
+                i += pat.len();
+            } else {
+                res.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out = res;
+    }
+    out
 }
 
 /// Translate one Groovy expression (a page data source query) into a MiniJinja template producing the same text.
@@ -1202,7 +1248,7 @@ impl Tr {
                 return self.p(&x);
             }
         }
-        let path = path_of(callee).map(|p| p.trim_start_matches("g5portal.").to_string());
+        let path = path_of(callee).map(|p| p.trim_start_matches("g5portal.").trim_start_matches("g6portal.").to_string());
         let pos: Vec<&E> = a.iter().filter(|x| x.name.is_none()).map(|x| &x.val).collect();
         if let Some(p) = &path {
             let simple = |me: &mut Tr, f: &str| format!("{}({})", f, me.args(a));
@@ -1242,6 +1288,8 @@ impl Tr {
                     self.w("raw SQL query kept as written: check it for SQL Server syntax");
                     return simple(self, if p.ends_with("rows") { "sql_rows" } else { "sql_first" });
                 }
+                "sql.rows" | "sql.firstRow" => return simple(self, if p.ends_with("rows") { "sql_rows" } else { "sql_first" }),
+                "curuser.adminlist" | "session.curuser.adminlist" if pos.is_empty() => return "admin_modules()".to_string(),
                 "PortalTracker.findByModuleAndSlug" => return simple(self, "tracker_ref"),
                 "PortalSetting.namedefault" => return simple(self, "setting"),
                 "User.get" => return simple(self, "user"),
@@ -1335,7 +1383,7 @@ impl Tr {
             }
             E::Prop(r, n) => {
                 if let Some(p) = path_of(e) {
-                    match p.trim_start_matches("g5portal.") {
+                    match p.trim_start_matches("g5portal.").trim_start_matches("g6portal.") {
                         "request.contextPath" => return "\"\"".into(),
                         "session.userid" | "session.userId" => return "curuser.id".into(),
                         "session.curuser" => return "curuser".into(),

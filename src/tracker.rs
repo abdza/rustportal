@@ -758,6 +758,9 @@ impl Tracker {
             let rt = s(r, "role_type");
             if name == "Admin" && admin {
                 out.push(name);
+            } else if name == "Authenticated" && crate::db::g6() {
+                // g6 portals grant it to everyone logged in (g5 only does in module_roles)
+                out.push(name);
             } else if rt == "User Role" {
                 if names.contains(&name) || (!cur_role.is_empty() && cur_role == name.trim()) {
                     out.push(name);

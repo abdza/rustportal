@@ -66,6 +66,36 @@ fn rr(r: Result<Value>) -> RR {
         Err(e) => Err(e.to_string().into()),
     }
 }
+/// Query parameters as Groovy's Sql takes them: a map for `:name` placeholders,
+/// or a list for `?` ones (turned into `:_p1`, `:_p2`... outside quoted text).
+fn sql_params(q: &str, p: Value) -> (String, Row) {
+    let Value::Array(list) = p else { return (q.to_string(), obj(p)) };
+    let mut out = String::with_capacity(q.len() + 8);
+    let mut params = Row::new();
+    let (mut n, mut quote) = (0usize, None::<char>);
+    for c in q.chars() {
+        match quote {
+            Some(qc) => {
+                if c == qc {
+                    quote = None;
+                }
+                out.push(c);
+            }
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            None if c == '?' => {
+                n += 1;
+                out.push_str(&format!(":_p{}", n));
+                params.insert(format!("_p{}", n), list.get(n - 1).cloned().unwrap_or(Value::Null));
+            }
+            None => out.push(c),
+        }
+    }
+    (out, params)
+}
+
 fn obj(v: Value) -> Row {
     match v {
         Value::Object(o) => o,
@@ -559,11 +589,11 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     reg!("tracker_roles", |x, m: &str, sl: &str, d: Dynamic| api_tracker_roles(x, m, sl, d2j(&d)));
     // raw SQL
     reg!("sql_rows", |x, q: &str| async move { Ok(Value::Array(x.db().rows(q, &Row::new()).await?.into_iter().map(Value::Object).collect())) });
-    reg!("sql_rows", |x, q: &str, p: Dynamic| async move { Ok(Value::Array(x.db().rows(q, &obj(d2j(&p))).await?.into_iter().map(Value::Object).collect())) });
+    reg!("sql_rows", |x, q: &str, p: Dynamic| async move { let (q, p) = sql_params(q, d2j(&p)); Ok(Value::Array(x.db().rows(&q, &p).await?.into_iter().map(Value::Object).collect())) });
     reg!("sql_first", |x, q: &str| async move { Ok(x.db().first(q, &Row::new()).await?.map(Value::Object).unwrap_or(Value::Null)) });
-    reg!("sql_first", |x, q: &str, p: Dynamic| async move { Ok(x.db().first(q, &obj(d2j(&p))).await?.map(Value::Object).unwrap_or(Value::Null)) });
+    reg!("sql_first", |x, q: &str, p: Dynamic| async move { let (q, p) = sql_params(q, d2j(&p)); Ok(x.db().first(&q, &p).await?.map(Value::Object).unwrap_or(Value::Null)) });
     reg!("sql_exec", |x, q: &str| async move { Ok(json!(x.db().exec(q, &Row::new()).await? as i64)) });
-    reg!("sql_exec", |x, q: &str, p: Dynamic| async move { Ok(json!(x.db().exec(q, &obj(d2j(&p))).await? as i64)) });
+    reg!("sql_exec", |x, q: &str, p: Dynamic| async move { let (q, p) = sql_params(q, d2j(&p)); Ok(json!(x.db().exec(&q, &p).await? as i64)) });
     // settings, users, roles
     reg!("setting", |x, n: &str| api_setting(x, n, Value::Null));
     reg!("setting", |x, n: &str, d: Dynamic| api_setting(x, n, d2j(&d)));
@@ -858,12 +888,17 @@ impl Sc {
         func!("first_row", |x, a, kw| async move { Ok(j2m(&api_first(x, &arg(&a, 0), &arg(&a, 1), a.get(2).map(m2j).unwrap_or(Value::Null), &arg(&a, 3)).await?)) });
         func!("get_data", |x, a, kw| async move { Ok(j2m(&api_get(x, &arg(&a, 0), &arg(&a, 1), arg(&a, 2).parse().unwrap_or(0)).await?)) });
         func!("sql_rows", |x, a, kw| async move {
-            let p = a.get(1).map(m2j).map(obj).unwrap_or_default();
-            Ok(j2m(&Value::Array(x.db().rows(&arg(&a, 0), &p).await?.into_iter().map(Value::Object).collect())))
+            let (q, p) = sql_params(&arg(&a, 0), a.get(1).map(m2j).unwrap_or(Value::Null));
+            Ok(j2m(&Value::Array(x.db().rows(&q, &p).await?.into_iter().map(Value::Object).collect())))
         });
         func!("sql_first", |x, a, kw| async move {
-            let p = a.get(1).map(m2j).map(obj).unwrap_or_default();
-            Ok(j2m(&x.db().first(&arg(&a, 0), &p).await?.map(Value::Object).unwrap_or(Value::Null)))
+            let (q, p) = sql_params(&arg(&a, 0), a.get(1).map(m2j).unwrap_or(Value::Null));
+            Ok(j2m(&x.db().first(&q, &p).await?.map(Value::Object).unwrap_or(Value::Null)))
+        });
+        // the modules the current user administers (the Grails portals' curuser.adminlist())
+        func!("admin_modules", |x, a, kw| async move {
+            let l = match &x.user { Some(u) => web::admin_list(x.db(), u).await, None => vec![] };
+            Ok(j2m(&json!(l)))
         });
         func!("setting", |x, a, kw| async move { Ok(j2m(&api_setting(x, &arg(&a, 0), a.get(1).map(m2j).unwrap_or(Value::Null)).await?)) });
         func!("user", |x, a, kw| async move { Ok(j2m(&api_user(x, arg(&a, 0).parse().unwrap_or(0)).await?)) });
@@ -884,7 +919,12 @@ impl Sc {
                 func!($name, |x, a, $kw| async move {
                     let cur = x.cur.lock().unwrap().clone();
                     let (m, sl) = if a.len() >= 2 { (arg(&a, 0), arg(&a, 1)) } else { cur.clone().map(|c| (c.0, c.1)).unwrap_or_default() };
-                    let $t = tracker_of(x, &m, &sl).await?;
+                    // no tracker (e.g. a tracker template opened as a plain page): the
+                    // Grails tags render nothing then, rather than failing the page
+                    let $t = match tracker_of(x, &m, &sl).await {
+                        Ok(t) => t,
+                        Err(_) => return Ok(MV::from_safe_string(String::new())),
+                    };
                     let $id: Option<i64> = $kw.get::<Option<i64>>("id").ok().flatten().or_else(|| a.get(2).and_then(|v| v.to_string().parse().ok())).or_else(|| cur.as_ref().and_then(|c| c.2));
                     let $tr: Option<String> = $kw.get::<Option<String>>("transition").ok().flatten().or_else(|| cur.as_ref().and_then(|c| c.3.clone()));
                     let _ = (&$id, &$tr);
@@ -1085,5 +1125,18 @@ mod tests {
             let got: Vec<i64> = super::java_shuffle((0..n).map(rhai::Dynamic::from).collect(), seed).into_iter().map(|d| d.as_int().unwrap()).collect();
             assert_eq!(got, want, "seed {} n {}", seed, n);
         }
+    }
+}
+
+#[cfg(test)]
+mod sql_params_tests {
+    #[test]
+    fn positional_placeholders() {
+        let (q, p) = super::sql_params("select * from t where a = ? and b = '?' and c = ?", serde_json::json!([1, "x"]));
+        assert_eq!(q, "select * from t where a = :_p1 and b = '?' and c = :_p2");
+        assert_eq!(p.get("_p1"), Some(&serde_json::json!(1)));
+        assert_eq!(p.get("_p2"), Some(&serde_json::json!("x")));
+        let (q2, p2) = super::sql_params("select :a", serde_json::json!({"a": 5}));
+        assert_eq!((q2.as_str(), p2.get("a")), ("select :a", Some(&serde_json::json!(5))));
     }
 }
