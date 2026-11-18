@@ -58,10 +58,37 @@
         f.appendChild(i);
       }
     }, true);
+    // and so does every same-origin request a script makes, not only jQuery's
+    // (full pages such as phone screens post with htmx, fetch or XMLHttpRequest)
+    (function () {
+      var same = function (u) { try { return new URL(u, location.href).origin === location.origin; } catch (e) { return true; } };
+      if (window.fetch) {
+        var f0 = window.fetch;
+        window.fetch = function (input, init) {
+          init = init || {};
+          var url = typeof input === "string" ? input : (input && input.url) || "";
+          var method = (init.method || (input && input.method) || "GET").toUpperCase();
+          if (method !== "GET" && method !== "HEAD" && same(url)) {
+            var h = new Headers(init.headers || (typeof input !== "string" && input.headers) || {});
+            if (!h.has("X-CSRF-Token")) h.set("X-CSRF-Token", CSRF_TOKEN);
+            init.headers = h;
+          }
+          return f0.call(this, input, init);
+        };
+      }
+      var open0 = XMLHttpRequest.prototype.open, send0 = XMLHttpRequest.prototype.send, set0 = XMLHttpRequest.prototype.setRequestHeader;
+      XMLHttpRequest.prototype.open = function (m, u) { this.__m = String(m).toUpperCase(); this.__u = u; this.__tok = false; return open0.apply(this, arguments); };
+      // jQuery and htmx set the header themselves; setting it twice would join the values
+      XMLHttpRequest.prototype.setRequestHeader = function (k, v) { if (String(k).toLowerCase() === "x-csrf-token") this.__tok = true; return set0.apply(this, arguments); };
+      XMLHttpRequest.prototype.send = function () {
+        if (!this.__tok && this.__m && this.__m !== "GET" && this.__m !== "HEAD" && same(this.__u)) { try { set0.call(this, "X-CSRF-Token", CSRF_TOKEN); } catch (e) {} }
+        return send0.apply(this, arguments);
+      };
+    })();
   </script>
 </head>
 
-<body>
+<body hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'>
   {% if flash %}<script>alert({{ flash|tojson }});</script>{% endif %}
 {{ content|safe }}
   <script>window.tinymce = window.tinymce || { init: function () {} };</script>
