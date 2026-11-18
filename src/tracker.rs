@@ -644,6 +644,9 @@ impl Tracker {
         let mut p = row! {"id"=>record_id,"statusUpdateDesc"=>description};
         if let Some(st) = status {
             p.insert("record_status".into(), json!(st));
+        } else if crate::db::g6() {
+            // a g6 portal's savetrail without a status writes none
+            p.insert("__no_status".into(), json!(true));
         }
         self.update_trail(sc, &p, user_id, None).await
     }
@@ -700,7 +703,7 @@ impl Tracker {
         }
         let rec = row! {
             "attachment_id"=>attachment, "description"=>desc, "record_id"=>rid, "update_date"=>now_str(), "updater_id"=>user_id,
-            "status"=>params.get("record_status").map(vs).filter(|x| !x.is_empty()).or_else(|| data.as_ref().map(|d| s(d, "record_status"))),
+            "status"=>if b(params, "__no_status") { None } else { params.get("record_status").map(vs).filter(|x| !x.is_empty()).or_else(|| data.as_ref().map(|d| s(d, "record_status"))) },
             "allowedroles"=>visible.join(","),
         };
         match db.insert(&self.trail_table(), &rec).await {

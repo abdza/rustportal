@@ -58,6 +58,8 @@ Variables: `params`, `curuser` (`id`, `name`, `staffid`, `email`, `is_admin`, ..
     send_email(#{to, cc, subject, body})   run_page(module, slug [, vars])   render_page(module, slug [, vars])
     read_excel(file_id [, sheet])   save_upload(field, module)   file_info(id)
     upload_info(field)   save_upload_as(field, #{dir, filename, module, slug, tracker_id, tracker_data_id})
+    tree_ensure(module, name)   tree_add(parent, name [, slug [, data]])   tree_children(node)   tree_find_node(tree_id, name)
+    tree_delete_node(id)   tree_clear(tree_id)   tree_count(tree_id)
     now()  today()  date_add(date, days)  date_format(date, fmt)  days_between(a, b)  format_number(v, decimals)
     now_ms()  epoch_ms(datetime)  uuid()  random_int(n)  shuffle(list)  shuffle_seeded(list, seed)
     session_get(key)  session_set(key, value)   request_base()   upload_text(field)   csrf_token()  csrf_field()

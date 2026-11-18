@@ -417,6 +417,9 @@ pub async fn runpage(mut ctx: Ctx, module: &str, slug: &str, args: Vec<String>) 
     }
     ctx.params.insert("module".into(), json!(module));
     ctx.params.insert("slug".into(), json!(slug));
+    if has_side_menu(&page) {
+        ctx.side_menu = Some(s(&page, "side_menu"));
+    }
     if s(&page, "render") == "XLSX" && crate::db::g6() {
         return xlsx_async(ctx, page, args).await;
     }

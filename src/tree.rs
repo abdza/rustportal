@@ -3,7 +3,7 @@
 use crate::db::{i, s, Db, Row};
 use crate::row;
 use crate::web::esc;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// URL for a menu node. The slug is `page:module:slug[:arg1..]`,
 /// `tracker:module:slug`, `run:module:slug`, `file:module:slug` or `link:url`.
@@ -332,4 +332,64 @@ fn import_nodes<'a>(db: &'a Db, tree_id: i64, parent: Option<i64>, inodes: &'a [
         }
         Ok(())
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tree editing for page scripts (menu-setup pages build their sidebars this way).
+
+/// Delete a node with everything under it, its role holders, and a tree's root
+/// pointer to any of them; then renumber the tree.
+pub async fn delete_node_deep(db: &Db, tree_id: i64, id: i64) -> anyhow::Result<()> {
+    let all = db.rows("select id, parent_id from tree_node where tree_id=:t", &row! {"t"=>tree_id}).await?;
+    let mut gone = vec![id];
+    let mut ix = 0;
+    while ix < gone.len() {
+        let p = gone[ix];
+        gone.extend(all.iter().filter(|n| i(n, "parent_id") == Some(p)).filter_map(|n| i(n, "id")));
+        ix += 1;
+    }
+    let list = crate::db::lit(&json!(gone));
+    db.exec(&format!("update iap_user set roletargetid=null where roletargetid in (select id from tree_node_user where node_id in {})", list), &crate::db::no_params()).await?;
+    db.exec(&format!("delete from tree_node_user where node_id in {}", list), &crate::db::no_params()).await?;
+    db.exec(&format!("update tree set root_id=null where root_id in {}", list), &crate::db::no_params()).await?;
+    db.exec(&format!("delete from tree_node where id in {}", list), &crate::db::no_params()).await?;
+    rebuild(db, tree_id).await?;
+    crate::cache::MENUS.clear();
+    Ok(())
+}
+
+/// The tree (module, name), created with a root node of the same name when
+/// missing. Returns the tree row (with root_id) and whether it was created.
+pub async fn ensure_tree(db: &Db, module: &str, name: &str) -> anyhow::Result<(Row, bool)> {
+    let mut created = false;
+    let tid = match db.first("select id from tree where module=:m and name=:n", &row! {"m"=>module,"n"=>name}).await? {
+        Some(t) => i(&t, "id").unwrap_or(0),
+        None => {
+            created = true;
+            db.insert("tree", &row! {"module"=>module,"name"=>name}).await?
+        }
+    };
+    let t = db.first("select * from tree where id=:t", &row! {"t"=>tid}).await?.unwrap_or_default();
+    let root_ok = match i(&t, "root_id") {
+        Some(r) => db.first("select id from tree_node where id=:r", &row! {"r"=>r}).await?.is_some(),
+        None => false,
+    };
+    if !root_ok {
+        let rid = db.insert("tree_node", &row! {"tree_id"=>tid,"name"=>name}).await?;
+        db.exec("update tree set root_id=:r where id=:t", &row! {"r"=>rid,"t"=>tid}).await?;
+        rebuild(db, tid).await?;
+    }
+    let t = db.first("select * from tree where id=:t", &row! {"t"=>tid}).await?.unwrap_or_default();
+    crate::cache::MENUS.clear();
+    Ok((t, created))
+}
+
+/// Add a node as the last child of `parent`; returns its id.
+pub async fn add_node(db: &Db, parent: i64, name: &str, slug: Option<&str>, data: Option<&str>) -> anyhow::Result<i64> {
+    let p = db.first("select id, tree_id from tree_node where id=:p", &row! {"p"=>parent}).await?.ok_or_else(|| anyhow::anyhow!("tree node {} not found", parent))?;
+    let tid = i(&p, "tree_id").unwrap_or(0);
+    let id = db.insert("tree_node", &row! {"tree_id"=>tid,"parent_id"=>parent,"name"=>name,"slug"=>slug,"data"=>data}).await?;
+    rebuild(db, tid).await?;
+    crate::cache::MENUS.clear();
+    Ok(id)
 }

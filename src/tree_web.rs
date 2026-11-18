@@ -554,20 +554,7 @@ async fn delete(mut ctx: Ctx, id: i64) -> Response {
     }
     let tid = i(&tree, "id").unwrap_or(0);
     let db = ctx.db().clone();
-    let all = db.rows("select id, parent_id from tree_node where tree_id=:t", &row! {"t"=>tid}).await.unwrap_or_default();
-    let mut gone = vec![id];
-    let mut ix = 0;
-    while ix < gone.len() {
-        let p = gone[ix];
-        gone.extend(all.iter().filter(|n| i(n, "parent_id") == Some(p)).filter_map(|n| i(n, "id")));
-        ix += 1;
-    }
-    let list = db::lit(&json!(gone));
-    let _ = db.exec(&format!("update iap_user set roletargetid=null where roletargetid in (select id from tree_node_user where node_id in {})", list), &db::no_params()).await;
-    let _ = db.exec(&format!("delete from tree_node_user where node_id in {}", list), &db::no_params()).await;
-    let _ = db.exec(&format!("update tree set root_id=null where root_id in {}", list), &db::no_params()).await;
-    let _ = db.exec(&format!("delete from tree_node where id in {}", list), &db::no_params()).await;
-    let _ = rebuild(&db, tid).await;
+    let _ = crate::tree::delete_node_deep(&db, tid, id).await;
     crate::cache::MENUS.clear();
     ctx.flash(&format!("PortalTreeNode {} deleted", id));
     let tree = tree_of(&ctx, tid).await.unwrap_or(tree);

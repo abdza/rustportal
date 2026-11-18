@@ -346,6 +346,10 @@ pub async fn g6_views(db: &Db) -> Result<()> {
         }
         db.ddl(&format!("create view {} as {}", name, sql)).await?;
         db.ddl(&format!("alter view {} alter column id set default nextval('hibernate_sequence')", name)).await?;
+        if name.starts_with("tree") {
+            // Hibernate's optimistic-lock column is NOT NULL there, with no default
+            db.ddl(&format!("alter view {} alter column version set default 0", name)).await?;
+        }
         if !extra.is_empty() {
             db.ddl(extra).await?;
         }

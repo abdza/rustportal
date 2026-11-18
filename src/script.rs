@@ -645,6 +645,44 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     reg!("read_excel", |x, id: i64| api_read_excel(x, id, 0));
     reg!("read_excel", |x, id: i64, sheet: i64| api_read_excel(x, id, sheet.max(0) as usize));
     reg!("save_upload", |x, field: &str, module: &str| api_save_upload(x, field, module));
+    // trees (menus): tree_ensure(module, name) -> #{id, root_id, created}, tree_add(parent, name [, slug [, data]]) -> id,
+    // tree_children(node) (in order), tree_find_node(tree_id, name), tree_delete_node(id), tree_clear(tree_id), tree_count(tree_id)
+    reg!("tree_ensure", |x, m: &str, n: &str| async move {
+        let (t, created) = crate::tree::ensure_tree(x.db(), m, n).await?;
+        Ok(json!({"id": t.get("id"), "root_id": t.get("root_id"), "name": t.get("name"), "module": t.get("module"), "created": created}))
+    });
+    reg!("tree_add", |x, parent: i64, n: &str| async move { Ok(json!(crate::tree::add_node(x.db(), parent, n, None, None).await?)) });
+    reg!("tree_add", |x, parent: i64, n: &str, slug: Dynamic| async move {
+        let sl = if slug.is_unit() { None } else { Some(slug.to_string()) };
+        Ok(json!(crate::tree::add_node(x.db(), parent, n, sl.as_deref(), None).await?))
+    });
+    reg!("tree_add", |x, parent: i64, n: &str, slug: Dynamic, data: Dynamic| async move {
+        let sl = if slug.is_unit() { None } else { Some(slug.to_string()) };
+        let da = if data.is_unit() { None } else { Some(data.to_string()) };
+        Ok(json!(crate::tree::add_node(x.db(), parent, n, sl.as_deref(), da.as_deref()).await?))
+    });
+    reg!("tree_children", |x, node: i64| async move {
+        Ok(Value::Array(x.db().rows("select * from tree_node where parent_id=:p order by lft, id", &row! {"p"=>node}).await?.into_iter().map(Value::Object).collect()))
+    });
+    reg!("tree_find_node", |x, tid: i64, n: &str| async move {
+        Ok(x.db().first("select * from tree_node where tree_id=:t and name=:n order by lft limit 1", &row! {"t"=>tid,"n"=>n}).await?.map(Value::Object).unwrap_or(Value::Null))
+    });
+    reg!("tree_delete_node", |x, id: i64| async move {
+        if let Some(n) = x.db().first("select tree_id from tree_node where id=:i", &row! {"i"=>id}).await? {
+            crate::tree::delete_node_deep(x.db(), i(&n, "tree_id").unwrap_or(0), id).await?;
+        }
+        Ok(Value::Null)
+    });
+    reg!("tree_clear", |x, tid: i64| async move {
+        let t = x.db().first("select root_id from tree where id=:t", &row! {"t"=>tid}).await?.unwrap_or_default();
+        if let Some(root) = i(&t, "root_id") {
+            for c in x.db().rows("select id from tree_node where parent_id=:p", &row! {"p"=>root}).await? {
+                crate::tree::delete_node_deep(x.db(), tid, i(&c, "id").unwrap_or(0)).await?;
+            }
+        }
+        Ok(Value::Null)
+    });
+    reg!("tree_count", |x, tid: i64| async move { Ok(json!(x.db().count("select count(*) from tree_node where tree_id=:t", &row! {"t"=>tid}).await?)) });
     reg!("save_upload_as", |x, field: &str, opts: Dynamic| api_save_upload_as(x, field, obj(d2j(&opts))));
     {
         let x = inner.clone();
