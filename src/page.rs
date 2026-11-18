@@ -262,8 +262,9 @@ pub fn build_xlsx(result: &Value) -> Result<(String, Vec<u8>)> {
         let keys: Vec<String> = so.get("keys").and_then(|v| v.as_array()).map(|a| a.iter().map(vs).collect()).unwrap_or_else(|| header.iter().map(vs).collect());
         let mut r = 0u32;
         if !header.is_empty() {
+            let plain = so.get("bold_header") == Some(&Value::Bool(false));
             for (c, h) in header.iter().enumerate() {
-                let _ = ws.write_string_with_format(0, c as u16, vs(h), &bold);
+                let _ = if plain { ws.write_string(0, c as u16, vs(h)) } else { ws.write_string_with_format(0, c as u16, vs(h), &bold) };
             }
             r = 1;
         }
@@ -416,6 +417,9 @@ pub async fn runpage(mut ctx: Ctx, module: &str, slug: &str, args: Vec<String>) 
     }
     ctx.params.insert("module".into(), json!(module));
     ctx.params.insert("slug".into(), json!(slug));
+    if s(&page, "render") == "XLSX" && crate::db::g6() {
+        return xlsx_async(ctx, page, args).await;
+    }
     let sc = make_sc(&mut ctx);
     let vars = row! {"args"=>args.clone(),"request"=>json!({"method": ctx.method, "path": ctx.path, "ip": ctx.ip})};
     let datas = datasources(&sc, &page, &vars).await;
@@ -482,3 +486,133 @@ pub async fn runpage(mut ctx: Ctx, module: &str, slug: &str, args: Vec<String>) 
     let title = s(&page, "title");
     page_response(ctx, &page, &title, body).await
 }
+
+/// A g6 portal builds a runable page's spreadsheet in the background: the first
+/// request answers with a "Generating Excel" page that polls
+/// ?async_token=..&async_status=1 and then downloads ?async_token=..
+async fn xlsx_async(mut ctx: Ctx, page: Row, args: Vec<String>) -> Response {
+    use crate::web::ExcelJob;
+    let token = ctx.p("async_token");
+    if !token.is_empty() {
+        if ctx.params.contains_key("async_status") {
+            let v = match ctx.st.excel_jobs.lock().unwrap().get(&token) {
+                None => json!({"ready": false, "error": "Job not found or expired"}),
+                Some(j) => match &j.error {
+                    Some(e) => json!({"ready": false, "error": e}),
+                    None => json!({"ready": j.done}),
+                },
+            };
+            return ctx.json(v).await;
+        }
+        let job = ctx.st.excel_jobs.lock().unwrap().remove(&token);
+        return match job {
+            Some(ExcelJob { done: true, file: Some(path), filename, .. }) => ctx.file_stream("application/octet-stream", Some(&format!("{}.xlsx", filename)), &path, true).await,
+            Some(ExcelJob { error: Some(e), .. }) => ctx.status(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &format!("Export failed: {}", e)).await,
+            _ => ctx.status(axum::http::StatusCode::NOT_FOUND, "Export not ready or expired").await,
+        };
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    ctx.st.excel_jobs.lock().unwrap().insert(token.clone(), ExcelJob { done: false, file: None, error: None, filename: s(&page, "slug") });
+    let sc = make_sc(&mut ctx);
+    let vars = row! {"args"=>args,"request"=>json!({"method": ctx.method, "path": ctx.path, "ip": ctx.ip})};
+    let st = ctx.st.clone();
+    let uid = ctx.uid();
+    let tk = token.clone();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let start = web::now_str();
+        let dir = format!("{}/tmp", st.cfg.upload_dir);
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let path = format!("{}/{}.xlsx", dir, tk);
+        let datas = datasources(&sc, &page, &vars).await;
+        let mut vars = vars;
+        vars.insert("datas".into(), Value::Object(datas));
+        let built = sc.eval(&s(&page, "content"), &vars).and_then(|r| build_xlsx(&r));
+        let (file, name, error) = match built {
+            Ok((name, bytes)) => match tokio::fs::write(&path, bytes).await {
+                Ok(_) => (Some(path), Some(name), None),
+                Err(e) => (None, None, Some(e.to_string())),
+            },
+            Err(e) => (None, None, Some(e.to_string())),
+        };
+        let _ = st
+            .db
+            .insert(
+                "portal_background_trail",
+                &row! {"name"=>"portalPage.xlsx","details"=>format!("{}:{}", s(&page, "module"), s(&page, "slug")),"user_id"=>uid,"start_date"=>start,
+                "duration_ms"=>started.elapsed().as_millis() as i64,"success"=>error.is_none(),"error"=>error.clone()},
+            )
+            .await;
+        if let Some(j) = st.excel_jobs.lock().unwrap().get_mut(&tk) {
+            j.done = true;
+            j.file = file;
+            j.error = error;
+            if let Some(n) = name {
+                j.filename = n;
+            }
+        }
+    });
+    ctx.raw_html(XLSX_WAIT_PAGE.replace("{token}", &token)).await
+}
+
+/// The page g6 shows while a runable page's spreadsheet is built.
+const XLSX_WAIT_PAGE: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Generating Excel...</title>
+<style>
+body{font-family:Arial,sans-serif;text-align:center;padding:60px 20px;background:#f5f5f5;}
+.box{background:#fff;border-radius:8px;padding:40px;display:inline-block;box-shadow:0 2px 8px rgba(0,0,0,.1);min-width:320px;}
+h2{color:#333;margin-bottom:10px;}
+#status{color:#666;margin:16px 0;}
+.spinner{display:inline-block;width:40px;height:40px;border:4px solid #ddd;border-top-color:#0078d4;border-radius:50%;animation:spin .8s linear infinite;margin-bottom:16px;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.error{color:#c00;}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="spinner" id="spinner"></div>
+  <h2>Generating Excel Report</h2>
+  <p id="status">Please wait while your report is being prepared&hellip;</p>
+</div>
+<script>
+var token = '{token}';
+var baseUrl = window.location.href.split('?')[0];
+var checkUrl = baseUrl + '?async_token=' + token + '&async_status=1';
+var downloadUrl = baseUrl + '?async_token=' + token;
+function check() {
+    fetch(checkUrl, {credentials:'same-origin'})
+        .then(function(r){return r.json();})
+        .then(function(data){
+            if(data.ready){
+                document.getElementById('status').textContent='Report ready! Downloading\u2026';
+                document.getElementById('spinner').style.display='none';
+                var a=document.createElement('a');
+                a.href=downloadUrl;
+                a.download='';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                document.getElementById('status').textContent='Download complete.';
+                setTimeout(function(){
+                    if(document.referrer && document.referrer !== window.location.href){
+                        window.location.href=document.referrer;
+                    } else {
+                        window.history.back();
+                    }
+                },1500);
+            } else if(data.error){
+                document.getElementById('spinner').style.display='none';
+                document.getElementById('status').innerHTML='<span class="error">Error: '+data.error+'</span>';
+            } else {
+                setTimeout(check,2000);
+            }
+        })
+        .catch(function(){setTimeout(check,2000);});
+}
+setTimeout(check,2000);
+</script>
+</body>
+</html>"#;

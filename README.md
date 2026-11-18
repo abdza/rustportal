@@ -57,6 +57,7 @@ Variables: `params`, `curuser` (`id`, `name`, `staffid`, `email`, `is_admin`, ..
     module_roles(module)   has_role(module, role)   tracker_roles(module, slug [, datas])
     send_email(#{to, cc, subject, body})   run_page(module, slug [, vars])   render_page(module, slug [, vars])
     read_excel(file_id [, sheet])   save_upload(field, module)   file_info(id)
+    upload_info(field)   save_upload_as(field, #{dir, filename, module, slug, tracker_id, tracker_data_id})
     now()  today()  date_add(date, days)  date_format(date, fmt)  days_between(a, b)  format_number(v, decimals)
     now_ms()  epoch_ms(datetime)  uuid()  random_int(n)  shuffle(list)  shuffle_seeded(list, seed)
     session_get(key)  session_set(key, value)   request_base()   upload_text(field)   csrf_token()  csrf_field()
@@ -73,7 +74,7 @@ qparams is a small query DSL: `#{status: "Open"}`, `"%like%"`, `">5"`, `"<=2026-
 A runable page returns a map: `flash`, `redirect_slug` / `redirect_module` /
 `redirect_params`, `redirect_url`, or `content`. With render `JSON` the result is
 sent as JSON; with `XLSX` return `#{ filename, header: [...], rows: [...] }`
-(or `sheets: [...]`; a sheet may also have `widths`, `freeze: false`, cells written
+(or `sheets: [...]`; a sheet may also have `widths`, `freeze: false`, `bold_header: false`, cells written
 as `#{v, bold: true}` or `#{v, date: true}`, and `charts: [#{title, series, first_row, last_row,
 cat_col, val_col, horizontal, row, col, height_rows}]` for native bar charts over its cells);
 with `File` return a file id or `#{ content, filename }`.

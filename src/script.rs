@@ -542,6 +542,32 @@ async fn api_save_upload(inner: &Arc<Inner>, field: &str, module: &str) -> Resul
     }
 }
 
+/// save_upload_as(field, #{dir, filename, module, slug, tracker_id, tracker_data_id}):
+/// write the upload to <upload_dir>/<dir>/<filename> exactly (as a Grails page
+/// would place it) and register a FileLink with the given fields. Returns its id.
+async fn api_save_upload_as(inner: &Arc<Inner>, field: &str, o: Row) -> Result<Value> {
+    let Some(up) = inner.files.lock().unwrap().remove(field) else { return Ok(Value::Null) };
+    crate::files::validate_upload(&up)?;
+    let dir = s(&o, "dir");
+    let filename = s(&o, "filename");
+    let safe = |p: &str| !p.is_empty() && !p.starts_with('/') && p.split('/').all(|c| !c.is_empty() && c != "." && c != "..");
+    if !safe(&dir) || !safe(&filename) || filename.contains('/') {
+        return Err(anyhow!("save_upload_as: dir and filename must be plain relative names"));
+    }
+    let folder = std::path::Path::new(&inner.st.cfg.upload_dir).join(&dir);
+    tokio::fs::create_dir_all(&folder).await?;
+    let target = folder.join(&filename);
+    up.save_to(&target).await?;
+    let mut row = row! {"name"=>if o.contains_key("name") { s(&o, "name") } else { filename.clone() },
+        "path"=>target.to_string_lossy().to_string(),"module"=>s(&o, "module"),"slug"=>s(&o, "slug"),"size"=>up.size as i64,"last_updated"=>web::now_str()};
+    for k in ["tracker_id", "tracker_data_id", "tracker_slug", "allowedroles"] {
+        if let Some(v) = o.get(k).filter(|v| !v.is_null()) {
+            row.insert(k.into(), v.clone());
+        }
+    }
+    Ok(json!(inner.db().insert("file_link", &row).await?))
+}
+
 fn build_engine(inner: &Arc<Inner>) -> Engine {
     let mut e = Engine::new();
     e.set_max_expr_depths(256, 128);
@@ -619,6 +645,16 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     reg!("read_excel", |x, id: i64| api_read_excel(x, id, 0));
     reg!("read_excel", |x, id: i64, sheet: i64| api_read_excel(x, id, sheet.max(0) as usize));
     reg!("save_upload", |x, field: &str, module: &str| api_save_upload(x, field, module));
+    reg!("save_upload_as", |x, field: &str, opts: Dynamic| api_save_upload_as(x, field, obj(d2j(&opts))));
+    {
+        let x = inner.clone();
+        e.register_fn("upload_info", move |field: &str| -> Dynamic {
+            match x.files.lock().unwrap().get(field) {
+                Some(up) => j2d(&json!({"filename": up.filename, "size": up.size, "content_type": up.content_type})),
+                None => Dynamic::UNIT,
+            }
+        });
+    }
     // an uploaded file's text (UTF-8, at most 2 MB), without storing it: #{filename, size, text}
     reg!("upload_text", |x, field: &str| async move {
         let info = x.files.lock().unwrap().get(field).map(|u| (u.filename.clone(), u.size, u.temp.clone(), u.bytes.clone()));
