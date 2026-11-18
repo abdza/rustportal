@@ -521,6 +521,9 @@ async fn translate_pages(db: &db::Db, modules: &[String]) -> anyhow::Result<()> 
             let id = i(p, "id").unwrap_or(0);
             let slug = s(p, "slug");
             let content = s(p, "content");
+            if content.starts_with("{# rp-ported") || content.starts_with("// rp-ported") {
+                continue; // ported by hand: leave its content and preprocess alone
+            }
             let mut upd = db::Row::new();
             if db::b(p, "runable") {
                 if !content.starts_with("// NOT PORTED") && !content.trim().is_empty() {

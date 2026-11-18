@@ -115,6 +115,17 @@ Grails portal on the same database. Tracker definitions refer to pages by id
 their ids; on such a database new tables take ids from `hibernate_sequence`, so
 pages added on either side never collide.
 
+For a g6 Grails portal also set `g6_schema = true` (its `portal_user` and
+`portal_tree*` tables are reached through views under this portal's names),
+`run_scheduler = false` when the Grails portal already runs the schedules, and
+`content_security_policy` to the policy the Grails portal sends, so pages that
+load outside fonts or images look the same on both.
+
+The Grails portal keeps users, roles, settings, trackers and trees in
+Hibernate's second-level cache, so a change made here only shows there once its
+cache entry expires. Keep that cache short (g6ikram's `ehcache.xml` expires
+entries after 60 seconds, as this portal's own cache does).
+
 ## Importing Grails/GSP modules
 
 Upload the Grails portal's module zip with Module -> Import Zip, the same as a

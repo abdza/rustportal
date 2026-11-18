@@ -142,10 +142,11 @@ fn decode(row: &PgRow) -> Row {
             },
             "DATE" => row.try_get::<Option<NaiveDate>, _>(i).ok().flatten()
                 .map(|d| Value::String(d.format("%Y-%m-%d").to_string())).unwrap_or(Value::Null),
+            // fractions of a second are kept when there are any (as java.sql.Timestamp shows them)
             "TIMESTAMP" => row.try_get::<Option<NaiveDateTime>, _>(i).ok().flatten()
-                .map(|d| Value::String(d.format("%Y-%m-%d %H:%M:%S").to_string())).unwrap_or(Value::Null),
+                .map(|d| Value::String(ts_text(d))).unwrap_or(Value::Null),
             "TIMESTAMPTZ" => row.try_get::<Option<DateTime<Utc>>, _>(i).ok().flatten()
-                .map(|d| Value::String(d.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())).unwrap_or(Value::Null),
+                .map(|d| Value::String(ts_text(d.with_timezone(&Local).naive_local()))).unwrap_or(Value::Null),
             "TIME" => row.try_get::<Option<NaiveTime>, _>(i).ok().flatten()
                 .map(|d| Value::String(d.format("%H:%M:%S").to_string())).unwrap_or(Value::Null),
             "JSON" | "JSONB" => row.try_get::<Option<Value>, _>(i).ok().flatten().unwrap_or(Value::Null),
@@ -391,4 +392,13 @@ pub fn set_g6(on: bool) {
 /// Running on a g6 Grails portal's database (see `entity::g6_views`).
 pub fn g6() -> bool {
     G6.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A timestamp as text: seconds, plus the fraction of a second when there is one
+/// (".5", ".544"), trailing zeros dropped as java.sql.Timestamp does.
+pub fn ts_text(d: chrono::NaiveDateTime) -> String {
+    let base = d.format("%Y-%m-%d %H:%M:%S").to_string();
+    let frac = d.format("%.f").to_string();
+    let frac = frac.trim_end_matches('0');
+    if frac.len() > 1 { format!("{}{}", base, frac) } else { base }
 }

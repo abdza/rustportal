@@ -1120,11 +1120,10 @@ impl Tracker {
                     continue;
                 }
             }
-            if has(f, "field_default") {
-                if !defaults.contains(&fname) {
-                    defaults.push(fname.clone());
-                }
-                continue;
+            if has(f, "field_default") && !defaults.contains(&fname) {
+                // the default wins when it gives a value; otherwise the posted value
+                // stays, as in the Grails portals
+                defaults.push(fname.clone());
             }
             let ft = s(f, "field_type");
             let raw = params.get(&key).cloned().unwrap_or(Value::Null);
@@ -1193,7 +1192,12 @@ impl Tracker {
         for name in defaults {
             let Some(f) = self.field(&name) else { continue };
             let vars = row! {"datas"=>Value::Object(cur.clone())};
-            match sc.eval(&s(f, "field_default"), &vars) {
+            let code = s(f, "field_default");
+            let result = match groovy_default(&code) {
+                GroovyDefault::Value(v) => Ok(v),
+                GroovyDefault::Code(c) => sc.eval(&c, &vars),
+            };
+            match result {
                 Ok(v) => {
                     if crate::script::truthy(&v) || v == json!(0) || v == json!(false) {
                         let cv = coerce(f, &v);
@@ -1255,4 +1259,49 @@ pub fn other_format(f: &Row) -> String {
     let opt = s(f, "field_options");
     let t: Vec<&str> = opt.split(':').collect();
     if t.len() > 2 { t[2].trim().to_string() } else { String::new() }
+}
+
+pub enum GroovyDefault {
+    Value(Value),
+    Code(String),
+}
+
+/// A field default written for a Grails portal, as a value or as Rhai code:
+/// a quoted string, `new SimpleDateFormat(p).format(new Date())`, and
+/// `session.curuser.userID` (the Grails session's user) are turned into what
+/// Rhai or this portal understand; anything else is run as written.
+pub fn groovy_default(code: &str) -> GroovyDefault {
+    use std::sync::OnceLock;
+    static DATE: OnceLock<regex::Regex> = OnceLock::new();
+    static STR: OnceLock<regex::Regex> = OnceLock::new();
+    let c = code.trim();
+    let date = DATE.get_or_init(|| {
+        regex::Regex::new(r#"^new\s+(?:java\.text\.)?SimpleDateFormat\(\s*(?:'([^']*)'|"([^"]*)")\s*\)\.format\(\s*new\s+(?:java\.util\.)?Date\(\s*\)\s*\)$"#).unwrap()
+    });
+    if let Some(m) = date.captures(c) {
+        let pat = m.get(1).or(m.get(2)).map(|x| x.as_str()).unwrap_or("");
+        return GroovyDefault::Value(Value::String(crate::groovy::java_date(&crate::web::now_str(), pat)));
+    }
+    let lit = STR.get_or_init(|| regex::Regex::new(r#"^'((?:[^'\\]|\\.)*)'$"#).unwrap());
+    if let Some(m) = lit.captures(c) {
+        return GroovyDefault::Value(Value::String(m[1].replace("\\'", "'")));
+    }
+    let mut r = c.replace("session?.curuser?.", "curuser?.").replace("session.curuser.", "curuser.");
+    r = r.replace("curuser?.userID", "curuser?.staffid").replace("curuser.userID", "curuser.staffid");
+    GroovyDefault::Code(r)
+}
+
+#[cfg(test)]
+mod default_tests {
+    use super::*;
+    #[test]
+    fn groovy_defaults() {
+        match groovy_default("new java.text.SimpleDateFormat('yyyy-MM-dd HH:mm:ss').format(new java.util.Date())") {
+            GroovyDefault::Value(Value::String(v)) => assert!(regex::Regex::new(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$").unwrap().is_match(&v), "{}", v),
+            _ => panic!("date"),
+        }
+        assert!(matches!(groovy_default("'#1a237e'"), GroovyDefault::Value(Value::String(v)) if v == "#1a237e"));
+        assert!(matches!(groovy_default("session?.curuser?.userID"), GroovyDefault::Code(c) if c == "curuser?.staffid"));
+        assert!(matches!(groovy_default("params.event_id_default"), GroovyDefault::Code(c) if c == "params.event_id_default"));
+    }
 }

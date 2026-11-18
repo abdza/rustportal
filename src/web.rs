@@ -62,6 +62,10 @@ pub struct Config {
     /// run scheduled pages and send queued e-mail. Off when another portal on the
     /// same database already does, or every job would run twice.
     pub run_scheduler: bool,
+    /// Content-Security-Policy header sent with every page (none when unset).
+    /// A g6 portal sends one that keeps pages to their own site's scripts,
+    /// styles, images and fonts; set the same here so pages look the same.
+    pub content_security_policy: Option<String>,
     pub allow_registration: bool,
     pub session_hours: i64,
     pub app_name: String,
@@ -87,6 +91,7 @@ impl Default for Config {
             page_data_table: "portal_page_data".into(),
             g6_schema: false,
             run_scheduler: true,
+            content_security_policy: None,
             allow_registration: false,
             session_hours: 12,
             app_name: "Portal".into(),
@@ -407,7 +412,11 @@ impl FromRequest<St> for Ctx {
         let ctx = Ctx { st: st.clone(), sid, sess, sess_orig, user, params, files, method, path, query, headers, ip, body, start, side_menu: None, module: None, slug: None };
         if ctx.method == "POST" && !is_svc {
             let sent = {
-                let p = s(&ctx.params, "csrf_token");
+                let mut p = s(&ctx.params, "csrf_token");
+                if p.is_empty() {
+                    // a Grails page posting with its synchronizer token field
+                    p = s(&ctx.params, "SYNCHRONIZER_TOKEN");
+                }
                 if p.is_empty() {
                     ctx.headers.get("x-csrf-token").and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
                 } else {
@@ -654,6 +663,9 @@ impl Ctx {
         }
         resp.headers_mut().insert("x-frame-options", HeaderValue::from_static("SAMEORIGIN"));
         resp.headers_mut().insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+        if let Some(v) = self.st.cfg.content_security_policy.as_deref().and_then(|c| HeaderValue::from_str(c).ok()) {
+            resp.headers_mut().insert("content-security-policy", v);
+        }
         // audit trail, written in the background
         if !self.path.starts_with("/static/") {
             let segs: Vec<&str> = self.path.split('/').filter(|x| !x.is_empty()).collect();

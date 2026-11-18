@@ -14,6 +14,9 @@ module_dir = "modulemigration"
 # run scheduled pages and send queued e-mail; turn off when the other portal on the
 # same database already does, or every job runs twice
 # run_scheduler = true
+# Content-Security-Policy header for every page; unset sends none. To match a g6
+# portal, which keeps pages to their own site's resources, use its policy:
+# content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; frame-ancestors 'self'"
 # folders searched before this portal's own static files for /assets/x
 # (e.g. a Grails portal's grails-app/assets/images, javascripts, stylesheets, libs)
 # assets_dirs = []

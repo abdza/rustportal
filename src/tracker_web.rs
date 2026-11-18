@@ -443,11 +443,13 @@ pub async fn transition_post(mut ctx: Ctx, module: &str, slug: &str, tname: &str
         return ctx.redirect("/").await;
     };
     let edit = t.expand_groups(&csv(&s(&tr.row, "editfields")));
-    // the status to move to always comes from the transition, never from the browser
-    ctx.params.remove("next_status");
+    // the status to move to always comes from the transition, never from the browser.
+    // A g6 portal moves the status only when the form posts next_status (its own
+    // forms do): a page posting without it leaves a new record in sys_draft.
+    let posted_status = ctx.params.remove("next_status").is_some();
     let mut params = ctx.params.clone();
     if let Some(ns) = tr.next {
-        if !b(&tr.row, "same_status") {
+        if !b(&tr.row, "same_status") && (posted_status || !crate::db::g6()) {
             params.insert("next_status".into(), json!(ns));
         }
     }

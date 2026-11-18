@@ -2216,14 +2216,22 @@ impl Tr {
                 let url = self.url_of(attrs);
                 self.out.push_str(&url);
             }
-            "g:form" => {
+            "g:form" | "g:uploadForm" => {
                 let url = self.url_of(attrs);
                 let method = get("method").unwrap_or_else(|| "post".into());
-                let rest = self.html_attrs(attrs, &["controller", "action", "id", "params", "url", "uri", "method", "useToken", "resource"]);
+                let rest = self.html_attrs(attrs, &["controller", "action", "id", "params", "url", "uri", "method", "useToken", "resource", "enctype"]);
                 let fid = get("name").filter(|_| get("id").is_none()).map(|x| format!(" id=\"{}\"", self.attr_text(&x))).unwrap_or_default();
-                self.out.push_str(&format!("<form action=\"{}\" method=\"{}\"{}{}>", url, method.to_lowercase(), fid, rest));
+                let enc = if name == "g:uploadForm" { " enctype=\"multipart/form-data\"" } else { "" };
+                self.out.push_str(&format!("<form action=\"{}\" method=\"{}\"{}{}{}>", url, method.to_lowercase(), fid, rest, enc));
                 if !method.eq_ignore_ascii_case("get") {
                     self.out.push_str("{{ csrf_field() }}");
+                }
+                // Grails' synchronizer token: pages read these fields to post with fetch()
+                if get("useToken").is_some_and(|v| v == "true") {
+                    self.out.push_str(concat!(
+                        "<input type=\"hidden\" name=\"SYNCHRONIZER_TOKEN\" value=\"{{ csrf_token() }}\" id=\"SYNCHRONIZER_TOKEN\" />",
+                        "<input type=\"hidden\" name=\"SYNCHRONIZER_URI\" value=\"{{ request_path() }}\" id=\"SYNCHRONIZER_URI\" />"
+                    ));
                 }
                 if selfclose {
                     self.out.push_str("</form>");
