@@ -209,7 +209,7 @@ pub async fn display(mut ctx: Ctx, module: &str, slug: &str, args: Vec<String>) 
         Ok((title, body)) => match s(&page, "render").as_str() {
             "XML" => ctx.text("text/xml", body).await,
             "JSON" => ctx.text("application/json", body).await,
-            "HTML" => ctx.raw_html(body).await,
+            "HTML" => ctx.raw_html_with_token(body).await,
             _ => page_response(ctx, &page, &title, body).await,
         },
         Err(e) => {
@@ -346,11 +346,24 @@ pub async fn result_redirect(db: &Db, default_module: &str, result: &Value) -> O
     }
     let slug = o.get("redirect_slug").map(vs).filter(|x| !x.is_empty())?;
     let module = o.get("redirect_module").map(vs).filter(|x| !x.is_empty()).unwrap_or_else(|| default_module.to_string());
-    let q = o.get("redirect_params").and_then(|v| v.as_object()).map(|p| web::qs(p, &[])).unwrap_or_default();
+    let mut rp = o.get("redirect_params").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    // arg1, arg2, arg3 go in the path, as Grails' URL mappings put them
+    let mut path_args = String::new();
+    for k in ["arg1", "arg2", "arg3"] {
+        match rp.get(k).map(vs).filter(|x| !x.is_empty()) {
+            Some(a) => {
+                path_args.push('/');
+                path_args.push_str(&web::enc(&a));
+                rp.remove(k);
+            }
+            None => break,
+        }
+    }
+    let q = web::qs(&rp, &[]);
     let q = if q.is_empty() { String::new() } else { format!("?{}", q) };
     Some(match find_page(db, &module, &slug).await {
-        Some(p) if b(&p, "runable") => format!("/run/{}/{}{}", module, slug, q),
-        Some(_) => format!("/view/{}/{}{}", module, slug, q),
+        Some(p) if b(&p, "runable") => format!("/run/{}/{}{}{}", module, slug, path_args, q),
+        Some(_) => format!("/view/{}/{}{}{}", module, slug, path_args, q),
         None => {
             if crate::tracker::Tracker::load(db, &module, &slug).await.is_some() {
                 format!("/{}/{}/list{}", module, slug, q)
@@ -424,7 +437,7 @@ pub async fn runpage(mut ctx: Ctx, module: &str, slug: &str, args: Vec<String>) 
     match s(&page, "render").as_str() {
         "JSON" => return ctx.json(result).await,
         "XML" => return ctx.text("text/xml", vs(&result)).await,
-        "HTML" => return ctx.raw_html(result.get("content").map(vs).unwrap_or_else(|| vs(&result))).await,
+        "HTML" => return ctx.raw_html_with_token(result.get("content").map(vs).unwrap_or_else(|| vs(&result))).await,
         "XLSX" => {
             return match build_xlsx(&result) {
                 Ok((name, bytes)) => ctx.bytes("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", Some(&format!("{}.xlsx", name)), bytes, false).await,

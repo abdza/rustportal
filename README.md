@@ -59,7 +59,7 @@ Variables: `params`, `curuser` (`id`, `name`, `staffid`, `email`, `is_admin`, ..
     read_excel(file_id [, sheet])   save_upload(field, module)   file_info(id)
     now()  today()  date_add(date, days)  date_format(date, fmt)  days_between(a, b)  format_number(v, decimals)
     now_ms()  epoch_ms(datetime)  uuid()  random_int(n)  shuffle(list)  shuffle_seeded(list, seed)
-    session_get(key)  session_set(key, value)   request_base()   upload_text(field)
+    session_get(key)  session_set(key, value)   request_base()   upload_text(field)   csrf_token()  csrf_field()
     regex_match(p, s)  regex_replace(p, s, rep)  regex_captures(p, s)  json_parse(s)  json_string(v)  json_pretty(v)
     markdown_to_html(md)
 

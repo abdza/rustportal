@@ -780,6 +780,14 @@ impl Ctx {
         self.finish(resp).await
     }
 
+    /// Raw HTML a page script wrote itself (a Grails page's own <html>...): it carries
+    /// no layout, so the session token for its forms and fetch/XHR posts is added here.
+    pub async fn raw_html_with_token(mut self, body: String) -> Response {
+        let tok = self.csrf();
+        let body = inject_csrf(&body, &tok);
+        self.raw_html(body).await
+    }
+
     pub async fn raw_html(self, body: String) -> Response {
         let resp = axum::response::Html(body).into_response();
         self.finish(resp).await
@@ -878,4 +886,84 @@ pub async fn branding(st: &St) -> Value {
         "logo": logo,
         "favicon": favicon,
     })
+}
+
+/// The script that gives every POST form, fetch() and XMLHttpRequest of a page the
+/// session token (the same as the layouts carry).
+pub fn csrf_script(token: &str) -> String {
+    format!(r#"<script>
+    var CSRF_TOKEN = {tok};
+    document.addEventListener("submit", function (ev) {{
+      var f = ev.target;
+      if (f && f.tagName === "FORM" && (f.method || "").toLowerCase() === "post" && !f.querySelector("input[name=csrf_token]")) {{
+        var i = document.createElement("input");
+        i.type = "hidden"; i.name = "csrf_token"; i.value = CSRF_TOKEN;
+        f.appendChild(i);
+      }}
+    }}, true);
+    (function () {{
+      var same = function (u) {{ try {{ return new URL(u, location.href).origin === location.origin; }} catch (e) {{ return true; }} }};
+      if (window.fetch) {{
+        var f0 = window.fetch;
+        window.fetch = function (input, init) {{
+          init = init || {{}};
+          var url = typeof input === "string" ? input : (input && input.url) || "";
+          var method = (init.method || (input && input.method) || "GET").toUpperCase();
+          if (method !== "GET" && method !== "HEAD" && same(url)) {{
+            var h = new Headers(init.headers || (typeof input !== "string" && input.headers) || {{}});
+            if (!h.has("X-CSRF-Token")) h.set("X-CSRF-Token", CSRF_TOKEN);
+            init.headers = h;
+          }}
+          return f0.call(this, input, init);
+        }};
+      }}
+      var open0 = XMLHttpRequest.prototype.open, send0 = XMLHttpRequest.prototype.send, set0 = XMLHttpRequest.prototype.setRequestHeader;
+      XMLHttpRequest.prototype.open = function (m, u) {{ this.__m = String(m).toUpperCase(); this.__u = u; this.__tok = false; return open0.apply(this, arguments); }};
+      XMLHttpRequest.prototype.setRequestHeader = function (k, v) {{ if (String(k).toLowerCase() === "x-csrf-token") this.__tok = true; return set0.apply(this, arguments); }};
+      XMLHttpRequest.prototype.send = function () {{
+        if (!this.__tok && this.__m && this.__m !== "GET" && this.__m !== "HEAD" && same(this.__u)) {{ try {{ set0.call(this, "X-CSRF-Token", CSRF_TOKEN); }} catch (e) {{}} }}
+        return send0.apply(this, arguments);
+      }};
+    }})();
+  </script>"#, tok = serde_json::to_string(token).unwrap_or_default())
+}
+
+/// Put the token script into a page: after <head ...>, else after <body ...>, else at
+/// the end when the page has a form or script. Anything else (JSON, plain text)
+/// is left as it is.
+pub fn inject_csrf(html: &str, token: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let after_tag = |tag: &str| -> Option<usize> {
+        let mut from = 0;
+        while let Some(p) = lower[from..].find(tag) {
+            let at = from + p;
+            let next = lower.as_bytes().get(at + tag.len()).copied();
+            if matches!(next, Some(b'>') | Some(b' ') | Some(b'\n') | Some(b'\t') | Some(b'\r')) {
+                return lower[at..].find('>').map(|e| at + e + 1);
+            }
+            from = at + tag.len();
+        }
+        None
+    };
+    let script = csrf_script(token);
+    if let Some(i) = after_tag("<head").or_else(|| after_tag("<body")) {
+        return format!("{}{}{}", &html[..i], script, &html[i..]);
+    }
+    if lower.contains("<form") || lower.contains("<script") {
+        return format!("{}{}", html, script);
+    }
+    html.to_string()
+}
+
+#[cfg(test)]
+mod csrf_tests {
+    use super::*;
+    #[test]
+    fn injects_where_it_fits() {
+        assert!(inject_csrf("<!DOCTYPE html><html><head><title>x</title></head></html>", "t").starts_with("<!DOCTYPE html><html><head><script>"));
+        assert!(inject_csrf("<html><body class='a'>hi</body></html>", "t").starts_with("<html><body class='a'><script>"));
+        assert!(!inject_csrf("<header>x</header><body>", "t").starts_with("<header><script>"));
+        assert_eq!(inject_csrf("{\"status\":\"Voting\"}", "t"), "{\"status\":\"Voting\"}");
+        assert!(inject_csrf("<div><form method=post></form></div>", "t").ends_with("</script>"));
+    }
 }

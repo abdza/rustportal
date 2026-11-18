@@ -677,6 +677,11 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     {
         let x = inner.clone();
         e.register_fn("request_base", move || x.base.lock().unwrap().clone());
+        // the session's form token, for forms a script writes out itself
+        let x = inner.clone();
+        e.register_fn("csrf_token", move || x.csrf.clone());
+        let x = inner.clone();
+        e.register_fn("csrf_field", move || format!("<input type='hidden' name='csrf_token' value='{}'/>", x.csrf));
     }
     // plain helpers
     e.register_fn("uuid", || uuid::Uuid::new_v4().to_string());
