@@ -55,6 +55,7 @@ Variables: `params`, `curuser` (`id`, `name`, `staffid`, `email`, `is_admin`, ..
     sql_rows(sql [, params])   sql_first(...)   sql_exec(...)          // :name placeholders
     setting(name [, default])   user(id)   user_by_staffid(s)   users_with_role(module, role)
     module_roles(module)   has_role(module, role)   tracker_roles(module, slug [, datas])
+    page_allowed(module, slug)   may the user open that page (() = no such page)
     send_email(#{to, cc, subject, body})   run_page(module, slug [, vars])   render_page(module, slug [, vars])
     read_excel(file_id [, sheet])   save_upload(field, module)   file_info(id)
     delete_file(id)   upload_info(field)   save_upload_as(field, #{dir, filename, module, slug, tracker_id, tracker_data_id})
@@ -131,6 +132,8 @@ In g6 mode a tracker role rule is read as the Grails portal's GSP template: its
 `g6portal.PortalSetting.namedefault(...)` and `array2sql(...)`) are evaluated, and
 a rule that fails grants nothing. List and display values print as stored, HTML
 included, unless the field has `encode_exception` set, as the Grails portal does.
+A page's allowed roles do not let a superuser (`is_admin`) in by themselves there:
+as in the Grails portal, only through the module roles `enablesuperuser` grants.
 
 The Grails portal keeps users, roles, settings, trackers and trees in
 Hibernate's second-level cache, so a change made here only shows there once its

@@ -626,6 +626,15 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     reg!("user", |x, id: i64| api_user(x, id));
     reg!("user_by_staffid", |x, sid: &str| api_user_staff(x, sid));
     reg!("users_with_role", |x, m: &str, r: &str| api_users_with_role(x, m, r));
+    // may the current user open page module/slug (its allowedroles, as the router checks
+    // them)? () when there is no such page
+    reg!("page_allowed", |x, m: &str, sl: &str| async move {
+        let p = x.db().first(&format!("select module, allowedroles from {} where module=:m and slug=:s", crate::db::page_t()), &row! {"m"=>m, "s"=>sl}).await?;
+        Ok(match p {
+            Some(p) => json!(crate::page::user_may_run(x.db(), x.user.as_ref(), &p).await),
+            None => Value::Null,
+        })
+    });
     reg!("module_roles", |x, m: &str| api_module_roles(x, m));
     reg!("has_role", |x, m: &str, r: &str| async move { Ok(json!(api_module_roles(x, m).await?.as_array().map(|a| a.iter().any(|v| vs(v) == r)).unwrap_or(false))) });
     reg!("user_module_roles", |x, uid: i64, m: &str| async move {

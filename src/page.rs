@@ -64,23 +64,29 @@ pub fn keep_session(ctx: &mut Ctx, sc: &Sc) {
 
 /// Role check for a page (`allowedroles` is a comma separated list; `All` or empty = anyone).
 pub async fn run_allowed(ctx: &Ctx, page: &Row) -> bool {
+    user_may_run(ctx.db(), ctx.user.as_ref(), page).await
+}
+
+/// run_allowed for a given user (None = not logged in).
+pub async fn user_may_run(db: &Db, user: Option<&Row>, page: &Row) -> bool {
     let roles = db::csv(&s(page, "allowedroles"));
     if roles.is_empty() || roles.iter().any(|r| r == "All") {
         return true;
     }
-    let Some(u) = &ctx.user else { return false };
-    if b(u, "is_admin") {
+    let Some(u) = user else { return false };
+    // a g6 portal lets a superuser in only through module_roles (enablesuperuser on)
+    if b(u, "is_admin") && !db::g6() {
         return true;
     }
     let module = s(page, "module");
-    if web::developer_list(ctx.db(), u).await.contains(&module) {
+    if web::developer_list(db, u).await.contains(&module) {
         return true;
     }
-    let mine = web::module_roles(ctx.db(), u, &module).await;
+    let mine = web::module_roles(db, u, &module).await;
     if roles.iter().any(|r| mine.contains(r)) {
         return true;
     }
-    match web::current_role(ctx.db(), u).await {
+    match web::current_role(db, u).await {
         Some(r) => roles.contains(&s(&r, "role")),
         None => false,
     }
