@@ -64,7 +64,7 @@ Variables: `params`, `curuser` (`id`, `name`, `staffid`, `email`, `is_admin`, ..
     now_ms()  epoch_ms(datetime)  uuid()  random_int(n)  shuffle(list)  shuffle_seeded(list, seed)
     session_get(key)  session_set(key, value)   request_base()   upload_text(field)   csrf_token()  csrf_field()
     regex_match(p, s)  regex_replace(p, s, rep)  regex_captures(p, s)  json_parse(s)  json_string(v)  json_pretty(v)
-    markdown_to_html(md)
+    markdown_to_html(md)   nfd(text)   levenshtein(a, b)
 
 `shuffle_seeded` gives the same order as Java's `Collections.shuffle(list, new Random(seed))`,
 so pages ported from a Java/Groovy portal keep orders shuffled there. `session_*` cannot touch the portal's

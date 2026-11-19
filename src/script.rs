@@ -770,6 +770,23 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     }
     // plain helpers
     e.register_fn("uuid", || uuid::Uuid::new_v4().to_string());
+    // Unicode NFD (java.text.Normalizer.Form.NFD): accents become separate marks
+    e.register_fn("nfd", |x: &str| -> String { unicode_normalization::UnicodeNormalization::nfd(x).collect() });
+    // edit distance between two strings, counted in characters
+    e.register_fn("levenshtein", |a: &str, b: &str| -> i64 {
+        let a: Vec<char> = a.chars().collect();
+        let b: Vec<char> = b.chars().collect();
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        for i in 1..=a.len() {
+            let mut cur = vec![i];
+            for j in 1..=b.len() {
+                let v = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + if a[i - 1] == b[j - 1] { 0 } else { 1 });
+                cur.push(v);
+            }
+            prev = cur;
+        }
+        prev[b.len()] as i64
+    });
     // a random whole number from 0 up to (not including) n
     e.register_fn("random_int", |n: i64| -> i64 { if n <= 0 { 0 } else { (uuid::Uuid::new_v4().as_u128() % n as u128) as i64 } });
     e.register_fn("now", || web::now_str());
