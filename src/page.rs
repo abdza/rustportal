@@ -442,6 +442,8 @@ pub async fn runpage(mut ctx: Ctx, module: &str, slug: &str, args: Vec<String>) 
         ctx.flash(&f);
     }
     match s(&page, "render").as_str() {
+        // a g6 portal sends a JSON page's result as text/html (render(text: x as JSON, contentType: "text/html"))
+        "JSON" if crate::db::g6() => return ctx.text("text/html;charset=utf-8", serde_json::to_string(&result).unwrap_or_default()).await,
         "JSON" => return ctx.json(result).await,
         "XML" => return ctx.text("text/xml", vs(&result)).await,
         "HTML" => return ctx.raw_html_with_token(result.get("content").map(vs).unwrap_or_else(|| vs(&result))).await,

@@ -717,6 +717,12 @@ impl Ctx {
         self.finish(resp).await
     }
 
+    /// A plain-text answer with a status code (as Grails' render(status:, text:)).
+    pub async fn text_status(self, code: StatusCode, body: &str) -> Response {
+        let resp = (code, [(header::CONTENT_TYPE, "text/plain;charset=utf-8".to_string())], body.to_string()).into_response();
+        self.finish(resp).await
+    }
+
     pub async fn text(self, ctype: &str, body: String) -> Response {
         let resp = ([(header::CONTENT_TYPE, ctype.to_string())], body).into_response();
         self.finish(resp).await

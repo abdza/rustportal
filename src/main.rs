@@ -164,7 +164,11 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
         ("portalModule", "update_module_list" | "export" | "import" | "download" | "upload") => return module::action(ctx, action, id).await,
         ("fileLink", "get") => return files::get(ctx, id.unwrap_or(0)).await,
         ("fileLink", "download") => {
-            let (m, sl) = ({ let m = ctx.p("module"); if m.is_empty() { "portal".to_string() } else { m } }, ctx.p("slug"));
+            // ?id=N (as Grails pages link files), else ?slug=..[&module=..]
+            if let Some(fid) = id.or_else(|| ctx.p("id").parse::<i64>().ok()) {
+                return files::get(ctx, fid).await;
+            }
+            let (m, sl) = (ctx.p("module"), ctx.p("slug"));
             return files::download(ctx, &m, &sl).await;
         }
         ("fileLink", "upload") => {

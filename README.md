@@ -57,7 +57,7 @@ Variables: `params`, `curuser` (`id`, `name`, `staffid`, `email`, `is_admin`, ..
     module_roles(module)   has_role(module, role)   tracker_roles(module, slug [, datas])
     send_email(#{to, cc, subject, body})   run_page(module, slug [, vars])   render_page(module, slug [, vars])
     read_excel(file_id [, sheet])   save_upload(field, module)   file_info(id)
-    upload_info(field)   save_upload_as(field, #{dir, filename, module, slug, tracker_id, tracker_data_id})
+    delete_file(id)   upload_info(field)   save_upload_as(field, #{dir, filename, module, slug, tracker_id, tracker_data_id})
     tree_ensure(module, name)   tree_add(parent, name [, slug [, data]])   tree_children(node)   tree_find_node(tree_id, name)
     tree_delete_node(id)   tree_clear(tree_id)   tree_count(tree_id)
     now()  today()  date_add(date, days)  date_format(date, fmt)  days_between(a, b)  format_number(v, decimals)

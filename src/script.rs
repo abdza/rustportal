@@ -683,6 +683,17 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
         Ok(Value::Null)
     });
     reg!("tree_count", |x, tid: i64| async move { Ok(json!(x.db().count("select count(*) from tree_node where tree_id=:t", &row! {"t"=>tid}).await?)) });
+    // delete_file(id): remove a stored file, its FileLink, and its folder when that is left empty
+    reg!("delete_file", |x, id: i64| async move {
+        if let Some(f) = x.db().get("file_link", id).await? {
+            let path = s(&f, "path");
+            crate::files::delete_file_link(x.db(), id).await;
+            if let Some(dir) = std::path::Path::new(&path).parent() {
+                let _ = tokio::fs::remove_dir(dir).await; // only succeeds when empty
+            }
+        }
+        Ok(Value::Null)
+    });
     reg!("save_upload_as", |x, field: &str, opts: Dynamic| api_save_upload_as(x, field, obj(d2j(&opts))));
     {
         let x = inner.clone();

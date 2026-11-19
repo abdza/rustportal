@@ -66,6 +66,9 @@ pub async fn delete_file_link(db: &Db, id: i64) {
 }
 
 async fn allowed(ctx: &Ctx, f: &Row) -> bool {
+    if db::g6() {
+        return allowed_g6(ctx, f).await;
+    }
     let roles = db::csv(&s(f, "allowedroles"));
     if roles.is_empty() || roles.iter().any(|r| r == "All") {
         return true;
@@ -81,6 +84,9 @@ async fn allowed(ctx: &Ctx, f: &Row) -> bool {
 
 async fn serve(ctx: Ctx, f: Row) -> Response {
     if !allowed(&ctx, &f).await {
+        if db::g6() {
+            return ctx.text_status(axum::http::StatusCode::UNAUTHORIZED, "Authentication required").await;
+        }
         if ctx.user.is_none() {
             return ctx.need_login().await;
         }
@@ -103,7 +109,16 @@ async fn serve(ctx: Ctx, f: Row) -> Response {
 
 /// /download/{module}/{slug} and /download/{slug}
 pub async fn download(ctx: Ctx, module: &str, slug: &str) -> Response {
-    match ctx.db().first("select * from file_link where module=:m and slug=:s order by id desc limit 1", &row! {"m"=>module,"s"=>slug}).await {
+    // a slug may carry a made-up extension (clip.mp4); without a module, the Grails
+    // portal finds the slug in any module, and so does this one in g6 mode
+    let slug = if db::g6() { slug.split('.').next().unwrap_or("") } else { slug };
+    let found = if module.is_empty() && db::g6() {
+        ctx.db().first("select * from file_link where slug=:s order by id desc limit 1", &row! {"s"=>slug}).await
+    } else {
+        let m = if module.is_empty() { "portal" } else { module };
+        ctx.db().first("select * from file_link where module=:m and slug=:s order by id desc limit 1", &row! {"m"=>m,"s"=>slug}).await
+    };
+    match found {
         Ok(Some(f)) => serve(ctx, f).await,
         _ => ctx.status(axum::http::StatusCode::NOT_FOUND, "File not found").await,
     }
@@ -249,4 +264,69 @@ pub async fn browse(mut ctx: Ctx, id: i64) -> Response {
     ));
     let _ = Value::Null;
     ctx.html("File Manager", h).await
+}
+
+/// A g6 portal's FileLink.readable: an unrestricted file is public only in the
+/// download_module_whitelist modules (default: portal); otherwise it is for portal
+/// admins, the module's admins and whoever holds a role on the file's tracker
+/// record. Listed roles: All, Authenticated, a module role or the current role.
+async fn allowed_g6(ctx: &Ctx, f: &Row) -> bool {
+    let db = ctx.db();
+    let module = s(f, "module");
+    let roles = db::csv(&s(f, "allowedroles"));
+    let user = ctx.user.clone();
+    let legacy = matches!(web::setting_str(db, "portal.legacy_filegroup_access").await.as_deref(), Some("true") | Some("1") | Some("on"));
+    if legacy && !s(f, "filegroup").is_empty() && s(f, "tracker_slug").is_empty() {
+        if let Some(u) = &user {
+            if roles.is_empty() || (!module.is_empty() && web::module_roles(db, u, &module).await.iter().any(|r| r == "Admin")) {
+                return true;
+            }
+        }
+    }
+    if roles.is_empty() {
+        let whitelist = match web::setting_str(db, "download_module_whitelist").await {
+            Some(w) => db::csv(&w.replace(['[', ']', '\'', '"'], "")),
+            None => vec!["portal".to_string()],
+        };
+        if whitelist.iter().any(|m| m == &module) {
+            return true;
+        }
+        let Some(u) = &user else { return false };
+        if db::b(u, "is_admin") || (!module.is_empty() && web::admin_list(db, u).await.iter().any(|m| m == &module)) {
+            return true;
+        }
+        // a role on the record the file belongs to (or, when its tracker is unknown,
+        // on any tracker of the module)
+        let sc = crate::script::Sc::new(ctx.st.clone(), user.clone(), ctx.params.clone(), String::new(), ctx.path.clone());
+        let data_id = db::i(f, "tracker_data_id");
+        let tslug = s(f, "tracker_slug");
+        if !tslug.is_empty() {
+            if let Some(t) = crate::tracker::Tracker::load(db, &module, &tslug).await {
+                let datas = match data_id { Some(id) => t.get(db, id).await, None => None };
+                return !t.user_roles(&sc, datas.as_ref()).await.is_empty();
+            }
+        }
+        for row in db.rows("select slug from portal_tracker where module=:m", &crate::row! {"m"=>module.clone()}).await.unwrap_or_default() {
+            if let Some(t) = crate::tracker::Tracker::load(db, &module, &s(&row, "slug")).await {
+                let datas = match data_id { Some(id) if tslug.is_empty() => t.get(db, id).await, _ => None };
+                if !t.user_roles(&sc, datas.as_ref()).await.is_empty() {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    if roles.iter().any(|r| r == "All") {
+        return true;
+    }
+    let Some(u) = &user else { return false };
+    if roles.iter().any(|r| r == "Authenticated") {
+        return true;
+    }
+    let mine = web::module_roles(db, u, &module).await;
+    if roles.iter().any(|r| mine.contains(r)) {
+        return true;
+    }
+    let cur = web::current_role(db, u).await.map(|r| s(&r, "role")).unwrap_or_default();
+    !cur.is_empty() && roles.iter().any(|r| *r == cur)
 }
