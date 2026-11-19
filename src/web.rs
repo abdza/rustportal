@@ -779,7 +779,7 @@ impl Ctx {
     /// A page without the header, sidebar and footer (the Grails portal's "empty" layout).
     pub async fn empty_page(mut self, title: &str, body: String) -> Response {
         let brand = branding(&self.st).await;
-        let ctx = json!({"title": title, "content": body, "flash": self.take_flash(), "csrf": self.csrf(), "app_name": brand["app_name"], "brand": brand});
+        let ctx = json!({"title": title, "content": body, "flash": self.take_flash(), "csrf": self.csrf(), "app_name": brand["app_name"], "brand": brand, "main_css": main_css(&self.st.cfg)});
         let mut env = minijinja::Environment::new();
         env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
         let _ = env.add_template("empty", include_str!("../templates/empty.html"));
@@ -846,7 +846,7 @@ impl Ctx {
         };
         let brand = branding(&self.st).await;
         let ctx = json!({
-            "title": title, "content": body, "flash": flash, "csrf": csrf, "megamenu": megamenu, "sidemenu": sidemenu,
+            "title": title, "content": body, "flash": flash, "csrf": csrf, "megamenu": megamenu, "sidemenu": sidemenu, "main_css": main_css(&self.st.cfg),
             "user": user_json, "adminish": adminish, "dev": dev, "superadmin": self.is_admin(), "role": role, "role_label": role_label,
             "pageslug": pageslug, "credits_url": brand["homepage"], "brand": brand,
             "switched": self.sess.contains_key("adminlink"), "app_name": brand["app_name"],
@@ -977,4 +977,10 @@ mod csrf_tests {
         assert_eq!(inject_csrf("{\"status\":\"Voting\"}", "t"), "{\"status\":\"Voting\"}");
         assert!(inject_csrf("<div><form method=post></form></div>", "t").ends_with("</script>"));
     }
+}
+
+/// The main stylesheet: a g6 portal's own main.css (from its asset folders) when
+/// sharing its database, so forms and lists are styled as there.
+fn main_css(cfg: &Config) -> &'static str {
+    if cfg.g6_schema && cfg.assets_dirs.iter().any(|d| std::path::Path::new(d).join("main.css").exists()) { "/assets/main.css" } else { "/static/css/main.css" }
 }

@@ -462,7 +462,7 @@ pub async fn field_errors(sc: &Sc, t: &Tracker, f: &Row, datas: &Row) -> Vec<(St
     let mut out = vec![];
     for c in checks {
         let failed: Option<String> = match s(&c, "error_type").as_str() {
-            "Not Empty" => if val.trim().is_empty() { Some(format!("{} cannot be empty", label)) } else { None },
+            "Not Empty" => if val.trim().is_empty() { Some(if crate::db::g6() { format!("{} cannot be empty", label) } else { format!("{} cannot be empty", label) }) } else { None },
             "Unique" => {
                 if val.trim().is_empty() {
                     None
@@ -470,7 +470,7 @@ pub async fn field_errors(sc: &Sc, t: &Tracker, f: &Row, datas: &Row) -> Vec<(St
                     let q = format!("select count(*) from {} where {}::text = :v and id != :id and coalesce(record_status,'')!='sys_draft'", qcol(&t.data_table()), qcol(&name));
                     let q = if t.tracker_type == "DataStore" { q.replace(" and coalesce(record_status,'')!='sys_draft'", "") } else { q };
                     let n = sc.db().count(&q, &row! {"v"=>val.clone(),"id"=>i(datas, "id").unwrap_or(0)}).await.unwrap_or(0);
-                    if n > 0 { Some(format!("{} must be unique", label)) } else { None }
+                    if n > 0 { Some(if crate::db::g6() { format!("{} already exists", label) } else { format!("{} must be unique", label) }) } else { None }
                 }
             }
             "Format" => {
@@ -479,14 +479,14 @@ pub async fn field_errors(sc: &Sc, t: &Tracker, f: &Row, datas: &Row) -> Vec<(St
                     None
                 } else {
                     match regex::Regex::new(&format!("^(?:{})$", pat)) {
-                        Ok(re) if !re.is_match(&val) => Some(format!("{} is not in the right format", label)),
+                        Ok(re) if !re.is_match(&val) => Some(if crate::db::g6() { format!("{} need to be in the form of {}", label, pat) } else { format!("{} is not in the right format", label) }),
                         _ => None,
                     }
                 }
             }
             "E-mail" => {
                 let re = regex::Regex::new(r"^[^@\s]+@[^@\s]+\.[^@\s]+$").unwrap();
-                if !val.is_empty() && !re.is_match(val.trim()) { Some(format!("{} must be a valid e-mail address", label)) } else { None }
+                if !val.is_empty() && !re.is_match(val.trim()) { Some(if crate::db::g6() { format!("{} need to be a proper e-mail address", label) } else { format!("{} must be a valid e-mail address", label) }) } else { None }
             }
             "Custom" => {
                 let code = s(&c, "error_function");
@@ -507,14 +507,22 @@ pub async fn field_errors(sc: &Sc, t: &Tracker, f: &Row, datas: &Row) -> Vec<(St
         };
         if let Some(default_msg) = failed {
             let custom = s(&c, "error_msg");
+            let custom_empty = custom.trim().is_empty();
             let msg = if custom.trim().is_empty() || s(&c, "error_type") == "Custom" && custom.trim().is_empty() {
                 default_msg
             } else {
-                match sc.eval(&custom, &row! {"datas"=>Value::Object(datas.clone()),"field"=>Value::Object(f.clone()),"value"=>val.clone()}) {
+                // a Grails portal's message is a Groovy expression, usually a quoted string
+                let evaluated = match crate::tracker::groovy_default(&custom) {
+                    crate::tracker::GroovyDefault::Value(v) => Ok(v),
+                    crate::tracker::GroovyDefault::Code(code) => sc.eval(&code, &row! {"datas"=>Value::Object(datas.clone()),"field"=>Value::Object(f.clone()),"value"=>val.clone()}),
+                };
+                match evaluated {
                     Ok(v) if !vs(&v).is_empty() => vs(&v),
                     _ => custom,
                 }
             };
+            // a g6 portal ends each message with a space (they are joined with "; ")
+            let msg = if crate::db::g6() && !(s(&c, "error_type") == "Format" && custom_empty) { format!("{} ", msg) } else { msg };
             out.push((msg, !b(&c, "allow_submission")));
         }
     }
@@ -565,7 +573,8 @@ fn field_html<'a>(sc: &'a Sc, t: &'a Tracker, tr: &'a Trans, f: &'a Row, datas: 
     Box::pin(async move {
         let p = &sc.inner.params;
         let name = s(f, "name").trim().to_string();
-        let n = esc(&name);
+        // the 'slug' field is posted as indata_slug ('slug' is the URL's tracker slug)
+        let n = if name == "slug" { "indata_slug".to_string() } else { esc(&name) };
         let ft = s(f, "field_type");
         let label = s(f, "label");
         let tip = if has(f, "field_tooltip") { format!(" title='{}'", esc(&s(f, "field_tooltip"))) } else { String::new() };
@@ -589,7 +598,21 @@ fn field_html<'a>(sc: &'a Sc, t: &'a Tracker, tr: &'a Trans, f: &'a Row, datas: 
             value = p.get(&name).cloned().unwrap_or(Value::Null);
         }
         if has(f, "field_default") {
-            return String::new(); // worked out on the server when the form is saved
+            if !crate::db::g6() {
+                return String::new(); // worked out on the server when the form is saved
+            }
+            // a g6 portal evaluates the default here: a value goes in a hidden field,
+            // nothing means the ordinary input is shown
+            let vars = crate::row! {"datas"=>Value::Object(datas.clone())};
+            let dv = match crate::tracker::groovy_default(&s(f, "field_default")) {
+                crate::tracker::GroovyDefault::Value(v) => Some(v),
+                crate::tracker::GroovyDefault::Code(c) => sc.eval(&c, &vars).ok(),
+            };
+            match dv {
+                Some(Value::Null) => {}
+                Some(v) => return format!("<input type=\"hidden\" name=\"{n}\" value=\"{}\" id=\"{n}\" />", esc(&vs(&v))),
+                None => return format!("<input type=\"hidden\" name=\"{n}\" value=\"-1\" id=\"{n}\" />"),
+            }
         }
         if b(f, "params_override") && has(p, &name) {
             return format!("<input type=\"hidden\" name=\"{n}\" value=\"{}\" id=\"{n}\" />", esc(&s(p, &name)));
@@ -598,23 +621,40 @@ fn field_html<'a>(sc: &'a Sc, t: &'a Tracker, tr: &'a Trans, f: &'a Row, datas: 
             return format!("<input type=\"hidden\" name=\"{n}\" value=\"{}\" id=\"{n}\" />", esc(&vs(&value)));
         }
         let v = vs(&value);
-        let req = if required.contains(&name) { " required" } else { "" };
+        // a g6 portal checks required fields with its own scripts, not the browser's
+        let req = if required.contains(&name) && !crate::db::g6() { " required" } else { "" };
         let ph = if has(f, "field_placeholder") { format!(" placeholder='{}'", esc(&s(f, "field_placeholder"))) } else { String::new() };
-        let hs = if has(f, "hyperscript") { format!(" _=\"{}\"", esc(&s(f, "hyperscript"))) } else { String::new() };
+        let hs = if !has(f, "hyperscript") {
+            String::new()
+        } else if crate::db::g6() {
+            // a g6 portal evaluates the column as Groovy and puts the result in the tag
+            // as raw attributes (a triple-quoted string literal holding oninput="...")
+            format!(" {}", groovy_literal(&s(f, "hyperscript")))
+        } else {
+            format!(" _=\"{}\"", esc(&s(f, "hyperscript")))
+        };
         let mut classes = s(f, "classes");
         if ft == "MultiSelect" {
             classes.push_str(" multidiv");
         }
         let child_link = ft == "BelongsTo" && has(p, &name);
-        let mut o = format!("<div class='group fieldcontain {}' id='{n}_div'  style='z-index:{}'  >", esc(&classes), zindex);
-        if !child_link && !b(f, "hide_heading") {
+        // a g6 portal names the wrapper after the field itself (slug_div, not indata_slug_div)
+        let div_id = if crate::db::g6() { esc(&name) } else { n.clone() };
+        let mut o = format!("<div class='group fieldcontain {}' id='{}_div'  style='z-index:{}'  >", esc(&classes), div_id, zindex);
+        let g6 = crate::db::g6();
+        if !child_link && !b(f, "hide_heading") && g6 {
+            // a g6 portal's form: the label alone (no description, no tooltip)
+            o.push_str(&format!("<label for='{}'>{}</label>", esc(&name), esc(&label)));
+        } else if !child_link && !b(f, "hide_heading") {
             if has(f, "field_description") {
                 o.push_str(&format!("<div class='field-label-col'><label for='{n}'{}>{}</label><small class='field-description text-muted'>{}</small></div>", tip, esc(&label), esc(&s(f, "field_description"))));
             } else {
                 o.push_str(&format!("<label for='{n}'{}>{}</label>", tip, esc(&label)));
             }
         }
-        o.push_str("<div class='field-input-col'>");
+        if !g6 {
+            o.push_str("<div class='field-input-col'>");
+        }
         let select = |opts: Vec<(String, String)>, cur: &str, empty: Option<&str>| -> String {
             let mut x = format!("<select name=\"{n}\" id=\"{n}\"{}{} >", req, hs);
             if let Some(e) = empty {
@@ -639,9 +679,15 @@ fn field_html<'a>(sc: &'a Sc, t: &'a Tracker, tr: &'a Trans, f: &'a Row, datas: 
             }
             "Date" => {
                 let d = if v.starts_with("1900-01-01") { String::new() } else { v.chars().take(10).collect() };
+                // a g6 portal prints an empty date as value='null'
+                let d = if d.is_empty() && crate::db::g6() { "null".to_string() } else { d };
                 format!("<input type='date' id='{n}' name='{n}' value='{}'{}{} />", esc(&d), req, hs)
             }
-            "DateTime" => format!("<input type='datetime-local' id='{n}' name='{n}' value='{}'{}{} />", esc(&v.replace(' ', "T").chars().take(16).collect::<String>()), req, hs),
+            "DateTime" => {
+                let d: String = v.replace(' ', "T").chars().take(16).collect();
+                let d = if d.is_empty() && crate::db::g6() { "null".to_string() } else { d };
+                format!("<input type='datetime-local' id='{n}' name='{n}' value='{}'{}{} />", esc(&d), req, hs)
+            }
             "Checkbox" if has(f, "field_options") => {
                 let cur = csv(&v);
                 let mut x = String::new();
@@ -690,7 +736,20 @@ fn field_html<'a>(sc: &'a Sc, t: &'a Tracker, tr: &'a Trans, f: &'a Row, datas: 
                     let ff = other_format(f);
                     let fname = if ff.is_empty() { ot.default_field().unwrap_or_else(|| "id".into()) } else { ff };
                     let total = ot.count(sc.db(), None).await.unwrap_or(0);
-                    if total > 300 {
+                    if crate::db::g6() {
+                        // a g6 portal lists every row of the other tracker, in table order; past
+                        // its select2 threshold (default 10) with "Please select" and a search box
+                        let threshold = web::setting_str(sc.db(), "select2_threshold").await.and_then(|x| x.trim().parse::<usize>().ok()).unwrap_or(10);
+                        let q = format!("select id, {} as label from {}", qcol(&fname), qcol(&ot.data_table()));
+                        let rows = sc.db().rows(&q, &crate::db::no_params()).await.unwrap_or_default();
+                        let opts = rows.iter().map(|r| (s(r, "id"), s(r, "label"))).collect::<Vec<_>>();
+                        let many = opts.len() > threshold;
+                        let mut x = select(opts, &v, if many { Some("Please select") } else { None });
+                        if many {
+                            x.push_str(&format!("<script>$(function(){{ $('#{n}').select2({{ dropdownParent: $('#{n}_div') }}); }});</script>"));
+                        }
+                        x
+                    } else if total > 300 {
                         // too many to list: search as you type
                         let mut opt = String::from("<option value=\"\">Please select</option>");
                         if let Ok(oid) = v.parse::<i64>() {
@@ -728,13 +787,28 @@ fn field_html<'a>(sc: &'a Sc, t: &'a Tracker, tr: &'a Trans, f: &'a Row, datas: 
         o.push_str(&input);
         // error checks: re-run on the server as the user types (HTMX)
         let has_checks = sc.db().count("select count(*) from portal_tracker_error where field_id=:f", &row! {"f"=>i(f, "id")}).await.unwrap_or(0) > 0;
-        if has_checks {
-            let trig = if matches!(ft.as_str(), "Date" | "DateTime" | "Drop Down" | "File") { format!("change from:#{n}") } else { format!("change from:#{n}, keyup from:#{n} changed delay:500ms") };
-            o.push_str(&format!(" &nbsp;<span id='{n}_error' hx-trigger='{}' hx-post='/portalTrackerField/onchange?hx_field_id={}' hx-include='closest form' hx-swap='innerHTML' hx-target='this' ></span>", trig, i(f, "id").unwrap_or(0)));
+        if g6 {
+            // the current messages are shown straight away; the span replaces itself as
+            // the user types
+            let hx = if has_checks {
+                let trig = if matches!(ft.as_str(), "Date" | "DateTime" | "Drop Down" | "File") { format!("change from:#{n}") } else { format!("change from:#{n}, keyup from:#{n} changed delay:500ms") };
+                format!("hx-trigger='{}' hx-post='/portalTrackerField/onchange?hx_field_id={}' hx-swap='outerHTML' hx-target='this' ", trig, i(f, "id").unwrap_or(0))
+            } else {
+                String::new()
+            };
+            let errs = if has_checks { field_errors(sc, t, f, datas).await } else { vec![] };
+            let fatal = errs.iter().any(|(_, x)| *x);
+            o.push_str(&format!(" &nbsp;<span {} {}>{}</span>", hx, if fatal { " class='text-danger fatal_error' " } else { "" }, esc(&errs.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>().join("; "))));
+            o.push_str("</div>");
         } else {
-            o.push_str(" &nbsp;<span ></span>");
+            if has_checks {
+                let trig = if matches!(ft.as_str(), "Date" | "DateTime" | "Drop Down" | "File") { format!("change from:#{n}") } else { format!("change from:#{n}, keyup from:#{n} changed delay:500ms") };
+                o.push_str(&format!(" &nbsp;<span id='{n}_error' hx-trigger='{}' hx-post='/portalTrackerField/onchange?hx_field_id={}' hx-include='closest form' hx-swap='innerHTML' hx-target='this' ></span>", trig, i(f, "id").unwrap_or(0)));
+            } else {
+                o.push_str(" &nbsp;<span ></span>");
+            }
+            o.push_str("</div></div>");
         }
-        o.push_str("</div></div>");
         o
     })
 }
@@ -768,8 +842,8 @@ pub async fn tracker_form(sc: &Sc, t: &Tracker, tr: &Trans, id: Option<i64>, opt
     };
     let fid = format!("{}_form", t.slug);
     let mut o = format!(
-        "<form action=\"{}\" method=\"post\" name=\"{fid}\" class=\"trackerform\" enctype=\"multipart/form-data\" id=\"{fid}\" ><input type='hidden' name='csrf_token' value='{}'/>",
-        action, esc(&sc.inner.csrf)
+        "<form action=\"{}\" method=\"post\" name=\"{fid}\"{tfclass} enctype=\"multipart/form-data\" id=\"{fid}\" ><input type='hidden' name='csrf_token' value='{}'/>",
+        action, esc(&sc.inner.csrf), tfclass = if crate::db::g6() { "" } else { " class=\"trackerform\"" }
     );
     for k in ["backtolist", "backto", "backtoid", "backtransition"] {
         if has(p, k) && !(k != "backtolist" && csv(&s(&tr.row, "editfields")).iter().any(|n| t.field(n).map(|f| s(f, "field_type") == "BelongsTo" && has(p, n)).unwrap_or(false))) {
@@ -1052,4 +1126,16 @@ pub async fn tracker_updates(sc: &Sc, t: &Tracker, id: i64) -> String {
     }
     o.push_str("</table>");
     o
+}
+
+/// The text of a Groovy string literal (triple or single quoted, either quote);
+/// other text is returned as it is.
+pub fn groovy_literal(code: &str) -> String {
+    let c = code.trim();
+    for q in ["\x27\x27\x27", "\"\"\"", "\x27", "\""] {
+        if c.len() >= 2 * q.len() && c.starts_with(q) && c.ends_with(q) {
+            return c[q.len()..c.len() - q.len()].to_string();
+        }
+    }
+    c.to_string()
 }

@@ -458,7 +458,8 @@ pub async fn transition_post(mut ctx: Ctx, module: &str, slug: &str, tname: &str
     if !deleting {
         let mut merged = datas.clone().unwrap_or_default();
         for n in &edit {
-            if let Some(v) = params.get(n) {
+            let key = if n == "slug" { "indata_slug" } else { n.as_str() };
+            if let Some(v) = params.get(key) {
                 merged.insert(n.clone(), v.clone());
             }
         }
@@ -789,7 +790,25 @@ pub async fn dropdownlist(mut ctx: Ctx) -> Response {
 pub async fn onchange(mut ctx: Ctx) -> Response {
     let Some((t, f)) = field_and_tracker(&ctx).await else { return ctx.raw_html(String::new()).await };
     let sc = make_sc(&mut ctx);
-    let errs = tags::field_errors(&sc, &t, &f, &ctx.params).await;
+    let mut datas = ctx.params.clone();
+    if let Some(v) = datas.get("indata_slug").cloned() {
+        datas.insert("slug".into(), v); // the slug field is posted as indata_slug
+    }
+    let errs = tags::field_errors(&sc, &t, &f, &datas).await;
+    if db::g6() {
+        // a g6 portal answers with the whole span, which replaces the old one
+        let name = s(&f, "name");
+        let n = if name == "slug" { "indata_slug".to_string() } else { name.clone() };
+        let ft = s(&f, "field_type");
+        let trig = if matches!(ft.as_str(), "Date" | "DateTime" | "Drop Down" | "File") { format!("change from:#{n}") } else { format!("change from:#{n},keyup from:#{n} changed delay:500ms") };
+        let mut hx = format!("hx-trigger='{}' hx-post='/portalTrackerField/onchange?hx_field_id={}' hx-swap='outerHTML' hx-target='this' ", trig, i(&f, "id").unwrap_or(0));
+        if !s(&f, "hyperscript").trim().is_empty() {
+            hx.push_str(&tags::groovy_literal(&s(&f, "hyperscript")));
+        }
+        let fatal = errs.iter().any(|(_, x)| *x);
+        let msgs = errs.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>().join("; ");
+        return ctx.raw_html(format!(" <span class='text-danger {}' {} _='on load update_submit()'>{}</span>", if fatal { "fatal_error" } else { "" }, hx, crate::web::esc(&msgs))).await;
+    }
     ctx.raw_html(tags::errors_html(&errs)).await
 }
 

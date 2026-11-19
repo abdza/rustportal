@@ -68,6 +68,13 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
         ("portalTreeNode", _) => return tree_web::node_action(ctx, action, id).await,
         ("portalTree", "create_root" | "exporttree" | "importtreeform" | "importtree") => return tree_web::tree_action(ctx, action, id).await,
         ("user", "api_list") => return tree_web::user_api_list(ctx).await,
+        // Grails pages also link a transition as /portalTracker/transition?module=..&slug=..&transition=..[&id=..]
+        ("portalTracker", "transition" | "transition_submit") => {
+            let (m, sl, tr) = (ctx.p("module"), ctx.p("slug"), ctx.p("transition"));
+            let rid = id.or_else(|| ctx.p("id").parse::<i64>().ok());
+            let post = ctx.method == "POST";
+            return if post { tracker_web::transition_post(ctx, &m, &sl, &tr, rid).await } else { tracker_web::transition_get(ctx, &m, &sl, &tr, rid).await };
+        }
         ("portalTracker", "list" | "create_data" | "display_data") => {
             let (m, sl) = (ctx.p("module"), ctx.p("slug"));
             return match action {
