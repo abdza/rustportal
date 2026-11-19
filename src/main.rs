@@ -474,8 +474,16 @@ async fn serve_asset(dirs: &[std::path::PathBuf], rel: &str) -> axum::response::
     if safe {
         for d in dirs {
             let f = d.join(rel);
-            if let Ok(data) = tokio::fs::read(&f).await {
+            if let Ok(mut data) = tokio::fs::read(&f).await {
                 let mime = mime_guess::from_path(&f).first_or_octet_stream().to_string();
+                if rel.ends_with(".css") {
+                    // as Grails' asset pipeline does: url(../images/x.png) in a stylesheet
+                    // points at the asset folders, i.e. /assets/x.png
+                    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+                    let re = RE.get_or_init(|| regex::Regex::new(r#"url\(\s*(['"]?)\.\./(?:images|stylesheets|javascripts|libs)/"#).unwrap());
+                    let text = String::from_utf8_lossy(&data).to_string();
+                    data = re.replace_all(&text, "url(${1}/assets/").into_owned().into_bytes();
+                }
                 return ([(axum::http::header::CONTENT_TYPE, mime), (axum::http::header::CACHE_CONTROL, "public, max-age=3600".to_string())], data).into_response();
             }
         }

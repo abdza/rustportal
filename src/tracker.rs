@@ -794,6 +794,9 @@ impl Tracker {
         if rule.trim().is_empty() {
             return String::new();
         }
+        if crate::db::g6() && rule.contains("${") {
+            return self.eval_role_gstring(sc, role, &rule, datas).await;
+        }
         let vars = row! {"datas"=>datas.cloned().map(Value::Object).unwrap_or(Value::Null)};
         match sc.render(&rule, &vars, false) {
             Ok(x) => x,
@@ -802,6 +805,51 @@ impl Tracker {
                 String::new()
             }
         }
+    }
+
+    /// A g6 portal's role rule is a GSP template: text with ${groovy} pieces, given
+    /// curuser, datas and the session (whose 'profile' is the user's member record).
+    /// Each piece is translated to Rhai; null prints as "null", and any error makes the
+    /// whole rule empty, as the Grails portal does.
+    async fn eval_role_gstring(&self, sc: &Sc, role: &Row, rule: &str, datas: Option<&Row>) -> String {
+        let mut vars = row! {"datas"=>datas.cloned().map(Value::Object).unwrap_or(Value::Null)};
+        if rule.contains("profile") {
+            vars.insert("session_profile".into(), user_profile(sc).await);
+        }
+        let mut out = String::new();
+        let mut rest = rule;
+        while let Some(start) = rest.find("${") {
+            out.push_str(&rest[..start]);
+            let body = &rest[start + 2..];
+            let mut depth = 1;
+            let mut end = None;
+            for (i, c) in body.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else { break };
+            let code = groovy_rule_expr(&body[..end]);
+            match sc.eval(&code, &vars) {
+                Ok(Value::Null) => out.push_str("null"),
+                Ok(v) => out.push_str(&vs(&v)),
+                Err(e) => {
+                    web::log_error(sc.db(), "trackerRole", "evalrole", &format!("role {}: {}", s(role, "name"), e), Some(&self.module), Some(&self.slug), None).await;
+                    return String::new();
+                }
+            }
+            rest = &body[end + 1..];
+        }
+        out.push_str(rest);
+        out
     }
 
     /// SQL conditions selecting the records a user can see through Data Compare roles.
@@ -1306,5 +1354,48 @@ mod default_tests {
         assert!(matches!(groovy_default("'#1a237e'"), GroovyDefault::Value(Value::String(v)) if v == "#1a237e"));
         assert!(matches!(groovy_default("session?.curuser?.userID"), GroovyDefault::Code(c) if c == "curuser?.staffid"));
         assert!(matches!(groovy_default("params.event_id_default"), GroovyDefault::Code(c) if c == "params.event_id_default"));
+    }
+}
+
+/// A Groovy expression from a role rule, as Rhai: g6portal helpers become this
+/// portal's functions, ?: becomes ??, and session['profile'] the member record.
+pub fn groovy_rule_expr(code: &str) -> String {
+    let mut c = code.trim().to_string();
+    for (a, b) in [
+        ("g6portal.PortalSetting.namedefault(", "setting("),
+        ("g6portal.PortalTracker.array2sql(", "array2sql("),
+        ("session['profile']", "session_profile"),
+        ("session[\"profile\"]", "session_profile"),
+        ("?:", "??"),
+    ] {
+        c = c.replace(a, b);
+    }
+    static IDX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = IDX.get_or_init(|| regex::Regex::new(r#"\?\[\s*'([A-Za-z_][A-Za-z0-9_]*)'\s*\]"#).unwrap());
+    c = re.replace_all(&c, "?.$1").into_owned();
+    c.replace('\'', "\"")
+}
+
+/// The signed-in user's member record (config user_profile, e.g. "ahli.ahli": the row
+/// of that tracker whose id is the user's profile_id), as a g6 portal keeps in its session.
+pub async fn user_profile(sc: &Sc) -> Value {
+    let Some(u) = &sc.inner.user else { return Value::Null };
+    let Some(pid) = i(u, "profile_id").filter(|x| *x != 0) else { return Value::Null };
+    let spec = sc.inner.st.cfg.user_profile.clone().unwrap_or_default();
+    let Some((m, sl)) = spec.split_once('.') else { return Value::Null };
+    match Tracker::load(sc.db(), m, sl).await {
+        Some(t) => t.get(sc.db(), pid).await.map(Value::Object).unwrap_or(Value::Null),
+        None => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+    #[test]
+    fn rule_exprs() {
+        assert_eq!(groovy_rule_expr("curuser?.profile_id ?: 0"), "curuser?.profile_id ?? 0");
+        assert_eq!(groovy_rule_expr("g6portal.PortalTracker.array2sql(g6portal.PortalSetting.namedefault('marhalah')[session['profile']?['prkt']])"),
+                   "array2sql(setting(\"marhalah\")[session_profile?.prkt])");
     }
 }

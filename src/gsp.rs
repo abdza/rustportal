@@ -2345,6 +2345,10 @@ impl Tr {
                 }
                 self.out.push_str(&format!("{{{{ tracker_display({}) }}}}", a));
             }
+            "g:trackerTransitions" => {
+                let a = self.tracker_args(attrs, true, false);
+                self.out.push_str(&format!("{{{{ tracker_transitions({}) }}}}", a));
+            }
             "g:trackerUpdates" => {
                 let a = self.tracker_args(attrs, true, false);
                 self.out.push_str(&format!("{{{{ tracker_updates({}) }}}}", a));

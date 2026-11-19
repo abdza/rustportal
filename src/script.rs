@@ -770,6 +770,9 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     }
     // plain helpers
     e.register_fn("uuid", || uuid::Uuid::new_v4().to_string());
+    // Groovy list helpers used by g6 role rules: [a, b].join(sep) and array2sql -> ('a','b')
+    e.register_fn("join", |a: rhai::Array, sep: &str| -> String { a.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(sep) });
+    e.register_fn("array2sql", |a: rhai::Array| -> String { format!("('{}')", a.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("','")) });
     // Unicode NFD (java.text.Normalizer.Form.NFD): accents become separate marks
     e.register_fn("nfd", |x: &str| -> String { unicode_normalization::UnicodeNormalization::nfd(x).collect() });
     // edit distance between two strings, counted in characters
@@ -970,6 +973,23 @@ impl Sc {
         if !ctx.contains_key("curuser") {
             ctx.insert("curuser".into(), alias_user(self.inner.user.clone().map(Value::Object).unwrap_or(Value::Null)));
         }
+        if crate::db::g6() && !ctx.contains_key("session") && tpl.contains("session") {
+            // a g6 page reads its session directly; 'profile' is the member record the
+            // Grails portal puts there at login (config user_profile)
+            let mut sess = self.inner.sess.lock().unwrap().clone();
+            if tpl.contains("profile") && !sess.contains_key("profile") {
+                let p = match self.cache_get("session_profile") {
+                    Some(p) => p,
+                    None => {
+                        let p = self.inner.block(crate::tracker::user_profile(self));
+                        self.cache_put("session_profile", p.clone());
+                        p
+                    }
+                };
+                sess.insert("profile".into(), p);
+            }
+            ctx.insert("session".into(), Value::Object(sess));
+        }
         tokio::task::block_in_place(|| env.render_str(tpl, Value::Object(ctx)).map_err(|e| anyhow!("{:#}", e)))
     }
 
@@ -1046,6 +1066,7 @@ impl Sc {
         tag!("tracker_display", |sc, t, id, tr, kw| crate::tags::tracker_display(&sc, &t, id.unwrap_or(0), &kw_row(&kw)).await);
         tag!("tracker_updates", |sc, t, id, tr, kw| crate::tags::tracker_updates(&sc, &t, id.unwrap_or(0)).await);
         tag!("transition_buttons", |sc, t, id, tr, kw| crate::tags::transition_buttons(&sc, &t, id.unwrap_or(0)).await);
+        tag!("tracker_transitions", |sc, t, id, tr, kw| crate::tags::tracker_transitions(&sc, &t, id.unwrap_or(0)).await);
         tag!("tracker_nav", |sc, t, id, tr, kw| crate::tags::tracker_nav(&sc, &t, true).await);
         tag!("tracker_form", |sc, t, id, tr, kw| {
             let name = tr.unwrap_or_else(|| "New".into());

@@ -21,6 +21,9 @@ module_dir = "modulemigration"
 # Content-Security-Policy header for every page; unset sends none. To match a g6
 # portal, which keeps pages to their own site's resources, use its policy:
 # content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; frame-ancestors 'self'"
+# g6 portals: the tracker ("module.slug") holding each user's member record
+# (portal_user.profile_id), which pages and role rules see as session['profile']
+# user_profile = "ahli.ahli"
 # folders searched before this portal's own static files for /assets/x
 # (e.g. a Grails portal's grails-app/assets/images, javascripts, stylesheets, libs)
 # assets_dirs = []

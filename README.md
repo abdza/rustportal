@@ -87,7 +87,7 @@ Module screen's export and import from the command line (`CONFIG=path` for anoth
 ### Template functions (MiniJinja)
 
     {{ tracker_nav() }} {{ tracker_filter() }} {{ tracker_list() }}          {# current tracker, or (module, slug) #}
-    {{ tracker_display() }} {{ tracker_updates() }} {{ transition_buttons() }}
+    {{ tracker_display() }} {{ tracker_updates() }} {{ transition_buttons() }} {{ tracker_transitions() }}
     {{ tracker_info() }} {{ tracker_form() }}                                {# transition=, id= #}
     {{ display_field(module, slug, field, value, datas) }}
     rows(), first_row(), get_data(), sql_rows(), sql_first(), setting(), user(), user_name(id),
@@ -122,7 +122,15 @@ For a g6 Grails portal also set `g6_schema = true` (its `portal_user` and
 `portal_tree*` tables are reached through views under this portal's names),
 `run_scheduler = false` when the Grails portal already runs the schedules, and
 `content_security_policy` to the policy the Grails portal sends, so pages that
-load outside fonts or images look the same on both.
+load outside fonts or images look the same on both, and `user_profile` to its
+`server.user_profile` (e.g. `"ahli.ahli"`): the tracker holding each user's member
+record. That record is `session['profile']` in pages and role rules.
+
+In g6 mode a tracker role rule is read as the Grails portal's GSP template: its
+`${...}` pieces (with `curuser`, `datas`, `session['profile']`,
+`g6portal.PortalSetting.namedefault(...)` and `array2sql(...)`) are evaluated, and
+a rule that fails grants nothing. List and display values print as stored, HTML
+included, unless the field has `encode_exception` set, as the Grails portal does.
 
 The Grails portal keeps users, roles, settings, trackers and trees in
 Hibernate's second-level cache, so a change made here only shows there once its

@@ -137,6 +137,11 @@ pub async fn display_field(sc: &Sc, t: &Tracker, f: &Row, value: &Value, datas: 
         }
         "HasMany" => String::new(),
         // the Grails portals' displayField shows a choice field's stored value as it is
+        // a g6 portal's fieldval prints the stored text as it is (HTML and all), unless the
+        // field is marked encode_exception: then escaped, with line breaks kept
+        _ if crate::db::g6() && ft != "File" => {
+            if b(f, "encode_exception") { esc(&txt).replace('\n', "<br/>") } else { txt }
+        }
         "Text Area" => {
             if fd.trim() == "html" { txt } else { esc(&txt).replace('\n', "<br/>") }
         }
@@ -916,6 +921,16 @@ pub async fn transition_buttons(sc: &Sc, t: &Tracker, id: i64) -> String {
         ));
     }
     o
+}
+
+/// The Grails portals' trackerTransitions tag: someone who may not see the record is sent
+/// back to the list; otherwise the record's transition buttons, then a non-breaking space.
+pub async fn tracker_transitions(sc: &Sc, t: &Tracker, id: i64) -> String {
+    let Some(datas) = t.get(sc.db(), id).await else { return String::new() };
+    if !can_view(sc, t, &datas).await {
+        return format!("<script>alert('You are not authorised to view that record');window.location='{}';</script>", t.url("list"));
+    }
+    format!("{}&nbsp;", transition_buttons(sc, t, id).await)
 }
 
 /// The records of another tracker that belong to this one (a HasMany field).

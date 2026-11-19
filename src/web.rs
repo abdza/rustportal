@@ -70,6 +70,9 @@ pub struct Config {
     /// A g6 portal sends one that keeps pages to their own site's scripts,
     /// styles, images and fonts; set the same here so pages look the same.
     pub content_security_policy: Option<String>,
+    /// a g6 portal's server.user_profile ("module.slug"): the tracker holding each
+    /// user's member record (portal_user.profile_id), used by role rules
+    pub user_profile: Option<String>,
     pub allow_registration: bool,
     pub session_hours: i64,
     pub app_name: String,
@@ -97,6 +100,7 @@ impl Default for Config {
             g6_schema: false,
             run_scheduler: true,
             content_security_policy: None,
+            user_profile: None,
             allow_registration: false,
             session_hours: 12,
             app_name: "Portal".into(),
@@ -504,6 +508,8 @@ fn datum(v: &str, datum_type: &str) -> Value {
     match datum_type {
         "Integer" => v.trim().parse::<i64>().map(Value::from).unwrap_or(Value::String(v.to_string())),
         "Float" => v.trim().parse::<f64>().map(Value::from).unwrap_or(Value::String(v.to_string())),
+        // as Groovy's tokenize(':'): "00:01:02" -> ["00", "01", "02"], empty pieces dropped
+        "Array" => Value::Array(v.split(':').filter(|x| !x.is_empty()).map(|x| Value::String(x.to_string())).collect()),
         _ => Value::String(v.to_string()),
     }
 }
