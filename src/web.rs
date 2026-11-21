@@ -23,12 +23,21 @@ pub struct MailCfg {
     pub username: String,
     pub password: String,
     pub from: String,
+    pub starttls: bool,
     pub disabled: bool,
 }
 impl Default for MailCfg {
     fn default() -> Self {
-        MailCfg { host: "127.0.0.1".into(), port: 1025, username: String::new(), password: String::new(), from: "portal@localhost".into(), disabled: false }
+        MailCfg { host: "127.0.0.1".into(), port: 1025, username: String::new(), password: String::new(), from: "portal@localhost".into(), starttls: false, disabled: false }
     }
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct GoogleOAuthCfg {
+    pub client_id: String,
+    pub client_secret: String,
+    pub callback_url: String,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -66,6 +75,8 @@ pub struct Config {
     /// run scheduled pages and send queued e-mail. Off when another portal on the
     /// same database already does, or every job would run twice.
     pub run_scheduler: bool,
+    /// run Telegram bot poller, outbox sender, and email mirroring. Defaults to run_scheduler.
+    pub run_telegram: Option<bool>,
     /// Content-Security-Policy header sent with every page (none when unset).
     /// A g6 portal sends one that keeps pages to their own site's scripts,
     /// styles, images and fonts; set the same here so pages look the same.
@@ -77,6 +88,7 @@ pub struct Config {
     pub session_hours: i64,
     pub app_name: String,
     pub mail: MailCfg,
+    pub google_oauth: GoogleOAuthCfg,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -99,12 +111,14 @@ impl Default for Config {
             page_data_table: "portal_page_data".into(),
             g6_schema: false,
             run_scheduler: true,
+            run_telegram: None,
             content_security_policy: None,
             user_profile: None,
             allow_registration: false,
             session_hours: 12,
             app_name: "Portal".into(),
             mail: MailCfg::default(),
+            google_oauth: GoogleOAuthCfg::default(),
         }
     }
 }
@@ -487,7 +501,11 @@ pub async fn setting(db: &Db, name: &str) -> Option<Value> {
     let r = crate::cache::SETTINGS
         .get_or(name.to_string(), async {
             let r = match name.split_once('.') {
-                Some((m, n)) => db.first("select * from portal_setting where module=:m and name=:n order by id limit 1", &row! {"m"=>m,"n"=>n}).await,
+                Some((m, n)) => match db.first("select * from portal_setting where module=:m and name=:n order by id limit 1", &row! {"m"=>m,"n"=>n}).await {
+                    Ok(Some(row)) => Ok(Some(row)),
+                    Ok(None) => db.first("select * from portal_setting where name=:n order by id limit 1", &row! {"n"=>name}).await,
+                    Err(e) => Err(e),
+                },
                 None => db.first("select * from portal_setting where name=:n order by id limit 1", &row! {"n"=>name}).await,
             };
             r.ok().flatten()
@@ -826,12 +844,38 @@ impl Ctx {
         let mut user_json = Value::Null;
         let mut role = String::new();
         let mut role_label = String::new();
+        let mut tree_roles: Vec<Value> = vec![];
+        let mut chosen_role_id: i64 = 0;
         if let Some(u) = &self.user {
             let al = admin_list(&db, u).await;
             let dl = developer_list(&db, u).await;
             adminish = b(u, "is_admin") || !al.is_empty() || !dl.is_empty();
             dev = b(u, "is_admin") || !dl.is_empty();
             user_json = Value::Object(u.clone());
+            chosen_role_id = i(u, "roletargetid").unwrap_or(0);
+            if let Some(uid) = i(u, "id") {
+                let rows = db
+                    .rows(
+                        "select tnu.id, tnu.role, n.name as node_name from tree_node_user tnu left join tree_node n on n.id=tnu.node_id where tnu.user_id=:u order by tnu.id",
+                        &row! {"u"=>uid},
+                    )
+                    .await
+                    .unwrap_or_default();
+                for r in rows {
+                    let lbl = {
+                        let nn = s(&r, "node_name");
+                        let rl = s(&r, "role");
+                        if nn.is_empty() { rl } else { format!("{} - {}", nn, rl) }
+                    };
+                    let short = if lbl.chars().count() > 33 {
+                        let c: Vec<char> = lbl.chars().collect();
+                        format!("{}...{}", c[..13].iter().collect::<String>(), c[c.len() - 12..].iter().collect::<String>())
+                    } else {
+                        lbl
+                    };
+                    tree_roles.push(json!({"id": i(&r, "id").unwrap_or(0), "label": short}));
+                }
+            }
             role = current_role(&db, u).await.map(|r| s(&r, "role")).unwrap_or_default();
             // what the Grails portal shows under the user's name
             role_label = if b(u, "is_admin") {
@@ -854,9 +898,11 @@ impl Ctx {
         let ctx = json!({
             "title": title, "content": body, "flash": flash, "csrf": csrf, "megamenu": megamenu, "sidemenu": sidemenu, "main_css": main_css(&self.st.cfg),
             "user": user_json, "adminish": adminish, "dev": dev, "superadmin": self.is_admin(), "role": role, "role_label": role_label,
+            "tree_roles": tree_roles, "chosen_role_id": chosen_role_id, "request_path": self.path,
             "pageslug": pageslug, "credits_url": brand["homepage"], "brand": brand,
             "switched": self.sess.contains_key("adminlink"), "app_name": brand["app_name"],
             "allow_registration": self.st.cfg.allow_registration,
+            "google_oauth_enabled": !self.st.cfg.google_oauth.client_id.is_empty(),
         });
         let mut env = minijinja::Environment::new();
         env.set_auto_escape_callback(|_| minijinja::AutoEscape::Html);
@@ -892,17 +938,44 @@ pub async fn branding(st: &St) -> Value {
         if !v.is_empty() { v } else if !cfgval.is_empty() { cfgval.to_string() } else { default }
     };
     let app_name = pick("app_name", &cfg.app_name, "Portal".into());
-    let file = |slug_key: &str| { let sl = s(&stored, slug_key); if sl.is_empty() { String::new() } else { format!("/download/portal/{}", sl) } };
-    let logo = { let f = file("logo_slug"); if !f.is_empty() { f } else { pick("logo_url", &cfg.logo_url, "/static/images/logo.png".into()) } };
-    let favicon = { let f = file("favicon_slug"); if !f.is_empty() { f } else { pick("favicon_url", &cfg.favicon_url, "/static/images/favicon.ico".into()) } };
-    json!({
-        "app_name": app_name,
-        "copyright": pick("copyright", &cfg.copyright, app_name.clone()),
-        "team": pick("team", &cfg.team, format!("{} Team", app_name)),
-        "homepage": pick("homepage", &cfg.credits_url, String::new()),
-        "logo": logo,
-        "favicon": favicon,
-    })
+    let logo_slug = s(&stored, "logo_slug");
+    let favicon_slug = s(&stored, "favicon_slug");
+    let logo_url_cfg = pick("logo_url", &cfg.logo_url, String::new());
+    let logo = if !logo_slug.is_empty() {
+        format!("/download/portal/{}", logo_slug)
+    } else if !logo_url_cfg.is_empty() {
+        logo_url_cfg.clone()
+    } else {
+        "/static/images/logo.png".into()
+    };
+    let favicon = if !favicon_slug.is_empty() {
+        format!("/download/portal/{}", favicon_slug)
+    } else {
+        pick("favicon_url", &cfg.favicon_url, "/static/images/favicon.ico".into())
+    };
+    let mut out = Row::new();
+    out.insert("app_name".into(), json!(app_name));
+    out.insert("copyright".into(), json!(pick("copyright", &cfg.copyright, app_name.clone())));
+    out.insert("team".into(), json!(pick("team", &cfg.team, format!("{} Team", app_name))));
+    out.insert("homepage".into(), json!(pick("homepage", &cfg.credits_url, String::new())));
+    out.insert("logo_slug".into(), json!(logo_slug));
+    out.insert("logo_url".into(), json!(logo_url_cfg));
+    out.insert("favicon_slug".into(), json!(favicon_slug));
+    out.insert("logo".into(), json!(logo));
+    out.insert("favicon".into(), json!(favicon));
+    for (key, fallback, _, _) in crate::branding::COLOR_DEFAULTS {
+        let stored_val = s(&stored, &format!("color_{}", key));
+        let col = if crate::branding::valid_color(&stored_val) { stored_val.to_ascii_lowercase() } else { (*fallback).to_string() };
+        out.insert((*key).into(), json!(col));
+    }
+    let prim = s(&out, "primary");
+    out.insert("primary_tint".into(), json!(crate::branding::tint(&prim)));
+    let out_val = Value::Object(out.clone());
+    let css_vars = crate::branding::css_variables(&out_val);
+    let style_tag = if css_vars.is_empty() { String::new() } else { format!("<style>{}</style>", css_vars) };
+    out.insert("css_vars".into(), json!(css_vars));
+    out.insert("style_tag".into(), json!(style_tag));
+    Value::Object(out)
 }
 
 /// The script that gives every POST form, fetch() and XMLHttpRequest of a page the

@@ -419,6 +419,32 @@ pub async fn send_tracker_email(sc: &Sc, t: &Tracker, email: &Row, datas: &Row) 
     }
 }
 
+/// GET /{module}/{slug}/{transition}/{id}/direct: execute an immediate_submission transition directly.
+pub async fn transition_direct(mut ctx: Ctx, module: &str, slug: &str, tname: &str, id: Option<i64>) -> Response {
+    let Some(t) = load(&mut ctx, module, slug).await else {
+        ctx.flash("Tracker Not Found");
+        return ctx.redirect("/").await;
+    };
+    let datas = match id {
+        Some(rid) => t.get(ctx.db(), rid).await,
+        None => None,
+    };
+    let sc = make_sc(&mut ctx);
+    let Some(tr) = t.resolve(&sc, tname, datas.as_ref()).await else {
+        ctx.flash("You are not authorized to do that");
+        return ctx.redirect("/").await;
+    };
+    if !b(&tr.row, "immediate_submission") {
+        ctx.flash("You are not authorized to do that");
+        return ctx.redirect("/").await;
+    }
+    if let Some(ns) = tr.next {
+        ctx.params.insert("next_status".into(), json!(ns));
+    }
+    ctx.params.insert("submit".into(), json!("true"));
+    transition_post(ctx, module, slug, tname, id).await
+}
+
 pub async fn transition_post(mut ctx: Ctx, module: &str, slug: &str, tname: &str, id: Option<i64>) -> Response {
     let Some(t) = load(&mut ctx, module, slug).await else {
         ctx.flash("Tracker Not Found");

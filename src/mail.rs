@@ -29,7 +29,13 @@ async fn deliver(st: &St, e: &Row) -> Result<()> {
         b = b.cc(c);
     }
     let msg = b.header(ContentType::TEXT_HTML).body(s(e, "body"))?;
-    let mut tb = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.host).port(cfg.port);
+    let mut tb = if cfg.starttls || cfg.port == 587 {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.host)?.port(cfg.port)
+    } else if cfg.port == 465 {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(&cfg.host)?.port(cfg.port)
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&cfg.host).port(cfg.port)
+    };
     if !cfg.username.is_empty() {
         tb = tb.credentials(lettre::transport::smtp::authentication::Credentials::new(cfg.username.clone(), cfg.password.clone()));
     }
@@ -62,6 +68,16 @@ pub async fn send(st: &St, to: &str, cc: &str, subject: &str, body: &str, module
         .await?;
     if let Err(e) = send_queued(st, id).await {
         eprintln!("[mail] delivery of #{} failed: {}", id, e);
+    }
+    // Mirror to linked Telegram accounts asynchronously (never blocks or fails email send)
+    if st.cfg.run_telegram.unwrap_or(st.cfg.run_scheduler) {
+        let db = st.db.clone();
+        let all_rcpts = if cc.trim().is_empty() { to.to_string() } else { format!("{},{}", to, cc) };
+        let subj = subject.to_string();
+        let html = body.to_string();
+        tokio::spawn(async move {
+            crate::telegram::notify_emails(&db, &all_rcpts, &subj, &html).await;
+        });
     }
     Ok(id)
 }

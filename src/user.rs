@@ -122,8 +122,11 @@ pub async fn login(mut ctx: Ctx) -> Response {
         return ctx.redirect("/setup").await;
     }
     // the Grails portal's login page, on its "empty" layout
+    let brand = web::branding(&ctx.st).await;
     let reg = if ctx.st.cfg.allow_registration { "\n                    <div class=\"col-12\">\n                      <p class=\"small mb-0\">Don't have account? <a href=\"/user/register\">Create an account</a></p>\n                    </div>" } else { "" };
-    let app = esc(&ctx.st.cfg.app_name);
+    let google = if !ctx.st.cfg.google_oauth.client_id.is_empty() { "\n                    <div class=\"col-12\">\n                      <a href=\"/auth/google\" class=\"btn btn-primary w-100\">Sign in with Google</a>\n                    </div>" } else { "" };
+    let app = esc(brand["app_name"].as_str().unwrap_or(&ctx.st.cfg.app_name));
+    let logo = esc(brand["logo"].as_str().unwrap_or("/static/images/logo.png"));
     let csrf = ctx.csrf_field();
     let page = format!(r#"
     <div id="content" role="main">
@@ -134,7 +137,7 @@ pub async fn login(mut ctx: Ctx) -> Response {
 
               <div class="d-flex justify-content-center py-4">
                 <a href="/" class="logo d-flex align-items-center w-auto">
-                  <img src="/static/images/logo.png" alt="{app}"/>
+                  <img src="{logo}" alt="{app}"/>
                   <span class="d-none d-lg-block">{app}</span>
                 </a>
               </div><!-- End Logo -->
@@ -167,7 +170,7 @@ pub async fn login(mut ctx: Ctx) -> Response {
 
                     <div class="col-12">
                       <button class="btn btn-primary w-100" type="submit">Login</button>
-                    </div>{reg}
+                    </div>{reg}{google}
                   </form>
 
                 </div>
@@ -296,6 +299,17 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<String>) -> Response {
                 ctx.flash("Admin restored");
             }
             ctx.redirect("/user/index").await
+        }
+        "changerole" => {
+            if let Some(target_id) = ctx.pi("chosenrole") {
+                if let Ok(Some(tnu)) = ctx.db().first("select id, role from tree_node_user where id=:id and user_id=:u limit 1", &row! {"id"=>target_id,"u"=>uid}).await {
+                    let _ = ctx.db().update("iap_user", uid, &row! {"role"=>s(&tnu, "role"),"roletargetid"=>target_id}).await;
+                    crate::cache::USERS.clear();
+                }
+            }
+            let back = ctx.p("frompage");
+            let to = if back.starts_with('/') && !back.starts_with("//") { back } else { "/".to_string() };
+            ctx.redirect(&to).await
         }
         _ => ctx.status(StatusCode::NOT_FOUND, "Unknown action").await,
     }

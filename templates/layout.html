@@ -28,6 +28,7 @@
   <link href="{{ main_css or '/static/css/main.css' }}" rel="stylesheet">
   <link href="/static/css/mobile.css" rel="stylesheet">
   <link href="/static/css/portal.css" rel="stylesheet">
+  {{ brand.style_tag|safe }}
 
   {# jQuery first: page templates use $ in inline scripts #}
   <!-- Vendor JS Files (same set as the Grails portal; in the head because page
@@ -104,7 +105,7 @@
 
     <div class="search-bar">
       <form class="search-form d-flex align-items-center" method="get" action="/portalSearch/index">
-        <input type="text" name="q" placeholder="Search" title="Enter search keyword">
+        <input type="text" name="query" placeholder="Search" title="Enter search keyword">
         <button type="submit" title="Search"><i class="bi bi-search"></i></button>
       </form>
     </div><!-- End Search Bar -->
@@ -145,7 +146,20 @@
           {% if user %}
             <li class="dropdown-header">
               <h6>{{ user.emp_name }}</h6>
+              {% if tree_roles|length > 1 %}
+              <form name="roleselect" action="/user/changerole" method="post">
+                <input type="hidden" name="csrf_token" value="{{ csrf }}">
+                <input type="hidden" name="frompage" value="{{ request_path }}">
+                <label for="chosenrole">Role &#58; </label>
+                <select name="chosenrole" id="chosenrole" onchange="this.form.submit()">
+                  {% for r in tree_roles %}
+                  <option value="{{ r.id }}"{% if chosen_role_id == r.id %} selected{% endif %}>{{ r.label }}</option>
+                  {% endfor %}
+                </select>
+              </form>
+              {% else %}
               <label>Role &#58; {{ role_label }}</label>
+              {% endif %}
             </li>
             <li>
               <hr class="dropdown-divider">
@@ -220,6 +234,11 @@
                 {% if allow_registration %}
                 <div class="col-12">
                   <p class="small mb-0">Don't have account? <a href="/user/register">Create an account</a></p>
+                </div>
+                {% endif %}
+                {% if google_oauth_enabled %}
+                <div class="col-12">
+                  <a href="/auth/google" class="btn btn-primary w-100">Sign in with Google</a>
                 </div>
                 {% endif %}
               </form>
@@ -318,6 +337,13 @@
         </li>
 
     {% if superadmin %}
+        <li class="nav-item">
+          <a href="/branding/index" class='nav-link collapsed'>
+            <i class="bi bi-palette"></i>
+            <span>Branding</span>
+          </a>
+        </li>
+
         <li class="nav-item">
           <a href="/portalEndpoint/index" class='nav-link collapsed'>
             <i class="bi bi-hdd-network"></i>

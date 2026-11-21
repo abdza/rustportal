@@ -4,6 +4,7 @@
 #[macro_use]
 mod db;
 mod audit;
+mod branding;
 mod cache;
 mod admin;
 mod endpoint;
@@ -14,10 +15,12 @@ mod gsp;
 mod xlsxstream;
 mod mail;
 mod module;
+mod oauth;
 mod page;
 mod scheduler;
 mod script;
 mod tags;
+mod telegram;
 mod tracker;
 mod tracker_web;
 mod tree;
@@ -55,9 +58,12 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
     let id = idtxt.as_deref().and_then(|x| x.parse::<i64>().ok()).or_else(|| ctx.pi("id"));
     let st = ctx.st.clone();
     match (c, action) {
-        ("user", "login" | "authenticate" | "logout" | "register" | "my_profile" | "my_profile_save" | "change_password" | "update_password" | "switchuser" | "restoreadmin") => {
+        ("user", "login" | "authenticate" | "logout" | "register" | "my_profile" | "my_profile_save" | "change_password" | "update_password" | "switchuser" | "restoreadmin" | "changerole") => {
             return user::action(ctx, action, idtxt).await
         }
+        ("branding", _) => return branding::action(ctx, action).await,
+        ("googleOAuth", "initiate") => return oauth::initiate(ctx).await,
+        ("googleOAuth", "callback") => return oauth::callback(ctx).await,
         ("portalPage", "home") => return page::display(ctx, "portal", "home", vec![]).await,
         ("portalPage", "display") | ("portalPage", "runpage") => {
             let m = { let m = ctx.p("module"); if m.is_empty() { "portal".to_string() } else { m } };
@@ -245,7 +251,7 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
     }
 }
 
-const SPECIAL: &[&str] = &["portalSearch", "accessReview"];
+const SPECIAL: &[&str] = &["portalSearch", "accessReview", "branding", "googleOAuth"];
 
 async fn dispatch(State(_st): State<St>, ctx: Ctx) -> Response {
     let sg = segs(&ctx);
@@ -255,6 +261,8 @@ async fn dispatch(State(_st): State<St>, ctx: Ctx) -> Response {
         [] => page::display(ctx, "portal", "home", vec![]).await,
         ["login"] => user::login(ctx).await,
         ["setup"] => user::setup(ctx).await,
+        ["auth", "google"] => oauth::initiate(ctx).await,
+        ["auth", "google", "callback"] => oauth::callback(ctx).await,
         ["favicon.ico"] => ctx.redirect("/static/images/favicon.ico").await,
         ["view", m, sl, rest @ ..] => page::display(ctx, m, sl, rest.iter().map(|x| x.to_string()).collect()).await,
         ["run", sl] => page::runpage(ctx, "portal", sl, vec![]).await,
@@ -281,6 +289,10 @@ async fn dispatch(State(_st): State<St>, ctx: Ctx) -> Response {
             Ok(id) => tracker_web::update_record(ctx, m, sl, id).await,
             Err(_) => ctx.status(axum::http::StatusCode::NOT_FOUND, "Page not found").await,
         },
+        [m, sl, tr, id, "direct"] if !post => match id.parse::<i64>() {
+            Ok(rid) => tracker_web::transition_direct(ctx, m, sl, tr, Some(rid)).await,
+            Err(_) => ctx.status(axum::http::StatusCode::NOT_FOUND, "Page not found").await,
+        },
         [m, sl, tr] | [m, sl, tr, ..] if p.len() <= 5 => {
             let id = match p.get(3) {
                 Some(x) => match x.parse::<i64>() {
@@ -304,13 +316,15 @@ async fn main() -> anyhow::Result<()> {
     let translate_modules: Option<Vec<String>> = if argv.get(1).map(|x| x.as_str()) == Some("translate-pages") { Some(argv[2..].to_vec()) } else { None };
     // `copy-pages [module...]`: copy the other portal's pages into this portal's page tables
     let copy_modules: Option<Vec<String>> = if argv.get(1).map(|x| x.as_str()) == Some("copy-pages") { Some(argv[2..].to_vec()) } else { None };
+    // `check-pages [module...]`: compile-check every Rhai script, preprocess, and MiniJinja template in page_table
+    let check_modules: Option<Vec<String>> = if argv.get(1).map(|x| x.as_str()) == Some("check-pages") { Some(argv[2..].to_vec()) } else { None };
     // `module-export <module>` / `module-import <module> [dir]`: the Module screen's
     // export and import, from the command line (config.toml, or CONFIG=path)
     let module_cmd: Option<Vec<String>> = match argv.get(1).map(|x| x.as_str()) {
         Some("module-export") | Some("module-import") => Some(argv[1..].to_vec()),
         _ => None,
     };
-    let cfg_path = if translate_modules.is_some() || module_cmd.is_some() || copy_modules.is_some() {
+    let cfg_path = if translate_modules.is_some() || module_cmd.is_some() || copy_modules.is_some() || check_modules.is_some() {
         std::env::var("CONFIG").unwrap_or_else(|_| "config.toml".to_string())
     } else {
         std::env::args().nth(1).unwrap_or_else(|| "config.toml".to_string())
@@ -340,6 +354,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(mods) = copy_modules {
         return copy_pages(&database, &mods).await;
     }
+    if let Some(mods) = check_modules {
+        return check_pages(&database, &mods).await;
+    }
     std::fs::create_dir_all(&cfg.upload_dir)?;
     std::fs::create_dir_all(&cfg.module_dir)?;
     user::ensure_setup_token(&database).await;
@@ -358,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let st_for_shutdown = st.clone();
     scheduler::spawn(st.clone(), cfg.run_scheduler);
+    telegram::spawn(st.clone(), cfg.run_telegram.unwrap_or(cfg.run_scheduler));
     audit::start(st.db.clone()).await;
     let app = Router::new()
         .nest_service("/static", tower_http::services::ServeDir::new(&cfg.static_dir))
@@ -585,6 +603,58 @@ async fn translate_pages(db: &db::Db, modules: &[String]) -> anyhow::Result<()> 
             }
         }
         println!("{}: {} pages, {} templates translated ({} with warnings), {} Groovy scripts commented out", m, pages.len(), tr, warned, stub);
+    }
+    Ok(())
+}
+
+/// `rustportal check-pages [module...]`: compile-check all Rhai scripts, preprocessors, and MiniJinja templates.
+async fn check_pages(db: &db::Db, modules: &[String]) -> anyhow::Result<()> {
+    let filter = if modules.is_empty() { String::new() } else { format!(" where module in {}", db::lit(&serde_json::json!(modules))) };
+    let pages = db.rows(&format!("select id, module, slug, runable, content, preprocess from {}{} order by module, slug", db::page_t(), filter), &db::no_params()).await?;
+    let mut rhai_eng = rhai::Engine::new();
+    rhai_eng.set_max_expr_depths(256, 128);
+    let (mut ok, mut err_n, mut unported) = (0usize, 0usize, 0usize);
+    for p in &pages {
+        let m = s(p, "module");
+        let sl = s(p, "slug");
+        let content = s(p, "content");
+        let pp = s(p, "preprocess");
+        let mut page_bad = false;
+        if content.to_ascii_uppercase().contains("NOT PORTED") || content.contains("GSP-TODO") {
+            println!("UNPORTED content {}/{}", m, sl);
+            unported += 1;
+            page_bad = true;
+        } else if db::b(p, "runable") && !content.starts_with("{# rp-ported") {
+            if !content.trim().is_empty() {
+                if let Err(e) = rhai_eng.compile(&content) {
+                    println!("RHAI-ERR content {}/{}: {}", m, sl, e);
+                    err_n += 1;
+                    page_bad = true;
+                }
+            }
+        } else if let Err(e) = minijinja::Environment::new().template_from_str(&content) {
+            println!("TPL-ERR content {}/{}: {:#}", m, sl, e);
+            err_n += 1;
+            page_bad = true;
+        }
+        if !pp.trim().is_empty() {
+            if pp.to_ascii_uppercase().contains("NOT PORTED") {
+                println!("UNPORTED preprocess {}/{}", m, sl);
+                unported += 1;
+                page_bad = true;
+            } else if let Err(e) = rhai_eng.compile(&pp) {
+                println!("RHAI-ERR preprocess {}/{}: {}", m, sl, e);
+                err_n += 1;
+                page_bad = true;
+            }
+        }
+        if !page_bad {
+            ok += 1;
+        }
+    }
+    println!("Checked {} pages: {} clean, {} compile errors, {} unported markers", pages.len(), ok, err_n, unported);
+    if err_n > 0 {
+        anyhow::bail!("{} compile error(s)", err_n);
     }
     Ok(())
 }

@@ -22,12 +22,12 @@ chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 rust_xlsxwriter = { version = "0.79", features = ["constant_memory"] }
 calamine = "0.26"
-lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "hostname"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "hostname"] }
 zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
 regex = "1"
 unicode-normalization = "0.1"
 base64 = "0.22"
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 mime_guess = "2"
 toml = "0.8"
 urlencoding = "2"

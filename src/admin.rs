@@ -661,7 +661,117 @@ async fn ref_options(ctx: &Ctx, e: &Entity, target: &Entity, r: &Row) -> (Vec<(i
     (rows.iter().map(|x| (i(x, "id").unwrap_or(0), if x.contains_key("module") && !s(x, "module").is_empty() { format!("{}: {}", s(x, "module"), s(x, "d")) } else { s(x, "d") })).collect(), false)
 }
 
+fn is_vim_setting(val: Option<&str>) -> bool {
+    matches!(val.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("vim" | "vi"))
+}
+
+/// Matches the Grails portal's `PortalSetting.namedefault(curuser.userID + '_editor', 'normal') == 'vim'`.
+async fn use_vim_editor(ctx: &Ctx) -> bool {
+    let staffid = ctx.user.as_ref().map(|u| s(u, "staffid")).unwrap_or_default();
+    if staffid.is_empty() {
+        return false;
+    }
+    let v = web::setting_str(ctx.db(), &format!("{}_editor", staffid)).await;
+    is_vim_setting(v.as_deref())
+}
+
+fn page_ace_js(vim_mode: bool) -> String {
+    let vim_script = if vim_mode {
+        "\n<script src=\"/static/libs/ace_editor/js/keybinding-vim.js\"></script>"
+    } else {
+        ""
+    };
+    format!(
+        r#"<link href="/static/libs/ace_editor/css/theme/github.css" rel="stylesheet"/>
+<script src="/static/libs/ace_editor/js/ace.js"></script>
+<script src="/static/libs/ace_editor/js/theme-github.js"></script>
+<script src="/static/libs/ace_editor/js/mode-html.js"></script>
+<script src="/static/libs/ace_editor/js/mode-rust.js"></script>{vim_script}
+<script>
+$(function(){{
+  if (typeof ace === 'undefined') {{
+    $('textarea.ace-source').show();
+    $('.ace-outer').hide();
+    return;
+  }}
+  ace.config.set('basePath', '/static/libs/ace_editor/js');
+  var vimMode = {vim};
+  var editors = {{}};
+  function syncAll() {{
+    Object.keys(editors).forEach(function(k){{
+      var ta = document.getElementById(k);
+      if (ta) ta.value = editors[k].getValue();
+    }});
+  }}
+  function triggerSubmit(preferId) {{
+    syncAll();
+    var btn = document.getElementById(preferId) || document.getElementById('savebutton');
+    if (btn) btn.click();
+  }}
+  function updateContentMode() {{
+    var ed = editors.content;
+    if (!ed) return;
+    var modeName = $('#runable').prop('checked') ? 'ace/mode/rust' : 'ace/mode/html';
+    ed.session.setMode(modeName);
+  }}
+  $('textarea.ace-source').each(function(){{
+    var ta = this;
+    var field = ta.getAttribute('data-ace-field');
+    var ed = ace.edit(field + 'div');
+    ed.setTheme('ace/theme/github');
+    ed.session.setValue(ta.value, -1);
+    ed.session.on('change', function(){{ ta.value = ed.getValue(); }});
+    if (vimMode) {{
+      ed.setKeyboardHandler('ace/keyboard/vim');
+    }}
+    ed.commands.addCommand({{
+      name: 'Toggle Fullscreen',
+      bindKey: 'F11',
+      exec: function(editor) {{
+        $('body').toggleClass('fullScreen');
+        $('#' + field + 'div.ace_editor').toggleClass('fullScreen');
+        editor.setAutoScrollEditorIntoView(true);
+        editor.resize();
+      }}
+    }});
+    ed.commands.addCommand({{
+      name: 'Save Page',
+      bindKey: {{ win: 'Ctrl-S', mac: 'Command-S' }},
+      exec: function() {{ triggerSubmit('updatebutton'); }}
+    }});
+    var outer = document.getElementById('outer' + field);
+    if (outer && typeof ResizeObserver !== 'undefined') {{
+      new ResizeObserver(function(){{ ed.resize(); }}).observe(outer);
+    }}
+    editors[field] = ed;
+  }});
+  if (editors.preprocess) {{
+    editors.preprocess.session.setMode('ace/mode/rust');
+  }}
+  updateContentMode();
+  $('#runable').on('change', updateContentMode);
+  $('.content form').on('submit', syncAll);
+  if (vimMode) {{
+    ace.config.loadModule('ace/keyboard/vim', function(module) {{
+      var VimApi = (module && module.CodeMirror && module.CodeMirror.Vim) || (module && module.Vim);
+      if (!VimApi) return;
+      VimApi.defineEx('write', 'w', function() {{
+        triggerSubmit('updatebutton');
+      }});
+      VimApi.defineEx('wq', 'wq', function() {{
+        triggerSubmit('savebutton');
+      }});
+    }});
+  }}
+}});
+</script>"#,
+        vim_script = vim_script,
+        vim = if vim_mode { "true" } else { "false" }
+    )
+}
+
 async fn form(ctx: &mut Ctx, e: &Entity, r: &Row, id: Option<i64>) -> String {
+    let is_page = e.name == "portalPage";
     let action = match id {
         Some(x) => format!("/{}/update/{}", e.name, x),
         None => format!("/{}/save", e.name),
@@ -698,6 +808,10 @@ async fn form(ctx: &mut Ctx, e: &Entity, r: &Row, id: Option<i64>) -> String {
             K::Str => format!("<input type=\"text\" name=\"{n}\" value=\"{}\" id=\"{n}\" />", esc(&t)),
             K::Password => format!("<input type=\"password\" name=\"{n}\" value=\"\" id=\"{n}\" autocomplete=\"new-password\" placeholder=\"{}\" />", if id.is_some() { "leave blank to keep the current password" } else { "" }),
             K::Text => format!("<textarea name=\"{n}\" id=\"{n}\" >{}</textarea>", esc(&t)),
+            K::Code if is_page && matches!(n, "content" | "preprocess") => format!(
+                "<div id=\"outer{n}\" class=\"ace-outer ace-outer-{n}\"><div id=\"{n}div\" class=\"ace-box\"></div></div><textarea name=\"{n}\" id=\"{n}\" class=\"code-edit ace-source\" data-ace-field=\"{n}\" style=\"display:none\">\n{}</textarea>",
+                esc(&t)
+            ),
             K::Code => format!("<textarea name=\"{n}\" id=\"{n}\" class=\"code-edit\" rows=\"{}\" spellcheck=\"false\" >{}</textarea>", if n == "content" { 24 } else { 6 }, esc(&t)),
             K::Bool => format!("<input type=\"hidden\" name=\"_{n}\" /><input type=\"checkbox\" name=\"{n}\"{} id=\"{n}\" />", if v == json!(true) { " checked=\"checked\"" } else { "" }),
             K::Int => format!("<input type=\"number\" name=\"{n}\" value=\"{}\" id=\"{n}\" />", esc(&t)),
@@ -750,11 +864,24 @@ async fn form(ctx: &mut Ctx, e: &Entity, r: &Row, id: Option<i64>) -> String {
         };
         h.push_str(&format!("<div class='fieldcontain'>\n  <label for='{n}'>{}</label>{}\n</div>", label, input));
     }
-    h.push_str(&format!(
-        "                        </fieldset>\n                        <fieldset class=\"buttons\">\n                            <input class=\"save\" type=\"submit\" value=\"{}\" />\n                        </fieldset>\n                    </form>",
-        if id.is_some() { "Update" } else { "Create" }
-    ));
+    if is_page && id.is_some() {
+        h.push_str(
+            "                        </fieldset>\n                        <fieldset class=\"buttons\">\n                            <input id=\"savebutton\" class=\"save\" type=\"submit\" name=\"submitpage\" value=\"Save\" />\n                            <input id=\"updatebutton\" class=\"save\" type=\"submit\" name=\"submitpage\" value=\"Update\" />\n                        </fieldset>\n                    </form>",
+        );
+    } else if is_page {
+        h.push_str(
+            "                        </fieldset>\n                        <fieldset class=\"buttons\">\n                            <input id=\"savebutton\" class=\"save\" type=\"submit\" value=\"Create\" />\n                        </fieldset>\n                    </form>",
+        );
+    } else {
+        h.push_str(&format!(
+            "                        </fieldset>\n                        <fieldset class=\"buttons\">\n                            <input class=\"save\" type=\"submit\" value=\"{}\" />\n                        </fieldset>\n                    </form>",
+            if id.is_some() { "Update" } else { "Create" }
+        ));
+    }
     h.push_str(crate::tags::form_js());
+    if is_page {
+        h.push_str(&page_ace_js(use_vim_editor(ctx).await));
+    }
     h
 }
 
@@ -1180,7 +1307,7 @@ pub async fn lookup(ctx: Ctx, e: &Entity) -> Response {
 
 /// Search pages and trackers the user can open.
 pub async fn search(ctx: Ctx) -> Response {
-    let q = ctx.p("q");
+    let q = { let a = ctx.p("q"); if a.is_empty() { ctx.p("query") } else { a } };
     let like = format!("%{}%", q.trim());
     let mut h = format!("<div class='container'><h1>Search</h1><form method='get' class='row g-2 mb-3'><div class='col'><input class='form-control' name='q' value='{}'/></div><div class='col-auto'><button class='btn btn-primary'>Search</button></div></form>", esc(&q));
     if !q.trim().is_empty() {
@@ -1205,4 +1332,33 @@ pub async fn search(ctx: Ctx) -> Response {
     }
     h.push_str("</div>");
     ctx.html("Search", h).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_vim_setting, page_ace_js};
+
+    #[test]
+    fn vim_setting_values() {
+        assert!(is_vim_setting(Some("vim")));
+        assert!(is_vim_setting(Some(" VIM ")));
+        assert!(is_vim_setting(Some("vi")));
+        assert!(!is_vim_setting(Some("normal")));
+        assert!(!is_vim_setting(Some("")));
+        assert!(!is_vim_setting(None));
+    }
+
+    #[test]
+    fn ace_js_toggles_vim_mode() {
+        let normal = page_ace_js(false);
+        assert!(normal.contains("/static/libs/ace_editor/js/ace.js"));
+        assert!(normal.contains("var vimMode = false;"));
+        assert!(!normal.contains("keybinding-vim.js"));
+
+        let vim = page_ace_js(true);
+        assert!(vim.contains("/static/libs/ace_editor/js/keybinding-vim.js"));
+        assert!(vim.contains("var vimMode = true;"));
+        assert!(vim.contains("ace/keyboard/vim"));
+        assert!(vim.contains("VimApi.defineEx('write', 'w'"));
+    }
 }

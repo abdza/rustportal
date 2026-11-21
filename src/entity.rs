@@ -326,7 +326,7 @@ pub async fn g6_views(db: &Db) -> Result<()> {
                     handphone, directline, company_handphone, address, emergency_name, emergency_contact, profilepic_id, date_joined,
                     secretquestion, secretanswer, password5, lanidexception, resetexception, treesdate, lastlogin, last_updated,
                     last_info_update, last_reminder, active_session_id, active_session_updated, state, profile_id,
-                    telegram_chat_id, telegram_username, telegram_linked_at
+                    telegram_chat_id, telegram_username, telegram_linked_at, telegram_link_token, telegram_token_expiry
              from portal_user",
             "alter view iap_user alter column is_admin set default false;
              alter view iap_user alter column isactive set default true;

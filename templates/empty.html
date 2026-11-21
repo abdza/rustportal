@@ -28,6 +28,7 @@
   <link href="{{ main_css or '/static/css/main.css' }}" rel="stylesheet">
   <link href="/static/css/mobile.css" rel="stylesheet">
   <link href="/static/css/portal.css" rel="stylesheet">
+  {{ brand.style_tag|safe }}
 
   {# jQuery first: page templates use $ in inline scripts #}
   <!-- Vendor JS Files (same set as the Grails portal; in the head because page

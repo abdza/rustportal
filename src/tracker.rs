@@ -900,8 +900,9 @@ impl Tracker {
         if cond.trim().is_empty() {
             return true;
         }
+        let code = if crate::db::g6() || looks_groovy_snippet(&cond) { groovy_tracker_script(&cond) } else { cond };
         let vars = row! {"datas"=>datas.cloned().map(Value::Object).unwrap_or(Value::Null)};
-        match sc.eval(&cond, &vars) {
+        match sc.eval(&code, &vars) {
             Ok(v) => crate::script::truthy(&v),
             Err(e) => {
                 web::log_error(sc.db(), "trackertransition", "testenabled", &format!("{}: {}", t.name, e), Some(&self.module), Some(&self.slug), None).await;
@@ -1294,7 +1295,8 @@ impl Tracker {
         if code.trim().is_empty() {
             return None;
         }
-        match sc.eval(&code, &row! {"datas"=>Value::Object(datas.clone())}) {
+        let eval_code = if crate::db::g6() || looks_groovy_snippet(&code) { groovy_tracker_script(&code) } else { code.clone() };
+        match sc.eval(&eval_code, &row! {"datas"=>Value::Object(datas.clone())}) {
             Ok(v) => Some(vs(&v)).filter(|x| !x.is_empty()),
             Err(_) => Some(code),
         }
@@ -1342,6 +1344,237 @@ pub fn groovy_default(code: &str) -> GroovyDefault {
     GroovyDefault::Code(r)
 }
 
+pub fn looks_groovy_snippet(code: &str) -> bool {
+    code.contains("g6portal.")
+        || code.contains("def ")
+        || code.contains("session?.curuser")
+        || code.contains("return null")
+        || code.contains("replaceAll(")
+        || code.contains("?:")
+}
+
+/// Convert single-quoted Groovy string literals to double-quoted Rhai strings (outside double-quoted strings).
+fn single_to_double_quotes(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + 8);
+    let chars: Vec<char> = src.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' {
+            out.push('"');
+            i += 1;
+            while i < chars.len() {
+                let d = chars[i];
+                out.push(d);
+                i += 1;
+                if d == '\\' && i < chars.len() {
+                    out.push(chars[i]);
+                    i += 1;
+                } else if d == '"' {
+                    break;
+                }
+            }
+        } else if c == '\'' {
+            out.push('"');
+            i += 1;
+            while i < chars.len() {
+                let d = chars[i];
+                if d == '\\' && i + 1 < chars.len() {
+                    let nx = chars[i + 1];
+                    if nx == '\'' {
+                        out.push('\'');
+                    } else {
+                        out.push('\\');
+                        out.push(nx);
+                    }
+                    i += 2;
+                } else if d == '\'' {
+                    out.push('"');
+                    i += 1;
+                    break;
+                } else if d == '"' {
+                    out.push_str("\\\"");
+                    i += 1;
+                } else {
+                    out.push(d);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Translate short Groovy snippets from g6 tracker definitions (`enabledcondition`,
+/// `updatetrails`, `portal_tracker_error.error_function`) into Rhai so shared g6 databases
+/// work without mutating the Grails tracker definitions.
+pub fn groovy_tracker_script(code: &str) -> String {
+    use std::sync::OnceLock;
+    let mut s = single_to_double_quotes(code.trim());
+
+    // Elvis operator for session?.curuser?.name ?: "fallback"
+    static ELVIS_NAME: OnceLock<regex::Regex> = OnceLock::new();
+    let elvis_re = ELVIS_NAME.get_or_init(|| {
+        regex::Regex::new(r#"\(\s*(?:session\??\.)?curuser\??\.name\s*\?:\s*"([^"]*)"\s*\)"#).unwrap()
+    });
+    s = elvis_re
+        .replace_all(&s, r#"(if curuser != () && curuser.name != "" { curuser.name } else { "$1" })"#)
+        .into_owned();
+
+    // g6portal.User.findAllWhere(profile_id: X as Integer).findAll { it.id != curuser?.id }
+    static FIND_PROF: OnceLock<regex::Regex> = OnceLock::new();
+    let find_prof = FIND_PROF.get_or_init(|| {
+        regex::Regex::new(r#"g6portal\.User\.findAllWhere\(\s*profile_id\s*:\s*([^)]+?)\s*(?:as\s+(?:Integer|Long))?\s*\)\.findAll\s*\{\s*it\.id\s*!=\s*curuser\??\.id\s*\}"#).unwrap()
+    });
+    s = find_prof
+        .replace_all(&s, "users_by_profile_id(to_int($1)).filter(|u| curuser == () || u.id != curuser.id)")
+        .into_owned();
+
+    // !others.any { it.id == (X as Long) }
+    static NOT_ANY_ID: OnceLock<regex::Regex> = OnceLock::new();
+    let not_any = NOT_ANY_ID.get_or_init(|| {
+        regex::Regex::new(r#"!(\w+)\.any\s*\{\s*it\.id\s*==\s*\(([^)]+?)\s*(?:as\s+(?:Integer|Long))?\)\s*\}"#).unwrap()
+    });
+    s = not_any
+        .replace_all(&s, "!$1.some(|u| u.id == to_int($2))")
+        .into_owned();
+
+    // others*.userID.join(", ")
+    static SPREAD_JOIN: OnceLock<regex::Regex> = OnceLock::new();
+    let spread_join = SPREAD_JOIN.get_or_init(|| {
+        regex::Regex::new(r#"(\w+)\*\.userID\.join\(([^)]+)\)"#).unwrap()
+    });
+    s = spread_join
+        .replace_all(&s, "$1.map(|u| u.staffid).join($2)")
+        .into_owned();
+
+    // g6portal.User.get(X as Long) -> user(to_int(X))
+    static USER_GET: OnceLock<regex::Regex> = OnceLock::new();
+    let user_get = USER_GET.get_or_init(|| {
+        regex::Regex::new(r#"g6portal\.User\.get\(\s*([^)]+?)\s*(?:as\s+(?:Integer|Long))?\s*\)"#).unwrap()
+    });
+    s = user_get.replace_all(&s, "user(to_int($1))").into_owned();
+
+    // x.toString().replaceAll("a","b") or x.replaceAll("a","b") -> regex_replace("a", to_string(x), "b")
+    static REP_ALL: OnceLock<regex::Regex> = OnceLock::new();
+    let rep_all = REP_ALL.get_or_init(|| {
+        regex::Regex::new(r#"([A-Za-z_][A-Za-z0-9_\[\]"'.]*?)(?:\.toString\(\))?\.replaceAll\(\s*("[^"]*")\s*,\s*("[^"]*")\s*\)"#).unwrap()
+    });
+    s = rep_all.replace_all(&s, "regex_replace($2, to_string($1), $3)").into_owned();
+
+    // g6portal.PortalTracker.load_datas("m","s",["k":v]) -> first_row("m","s",#{"k":v})
+    static LOAD_DATAS: OnceLock<regex::Regex> = OnceLock::new();
+    let load_datas = LOAD_DATAS.get_or_init(|| {
+        regex::Regex::new(r#"g6portal\.PortalTracker\.load_datas\(\s*("[^"]*")\s*,\s*("[^"]*")\s*,\s*\["([^"]*)"\s*:\s*([^\n]+)\]\s*\)"#).unwrap()
+    });
+    s = load_datas.replace_all(&s, r#"first_row($1, $2, #{$3: $4})"#).into_owned();
+
+    // Common Groovy -> Rhai token adjustments
+    s = s.replace("session?.curuser?.", "curuser?.");
+    s = s.replace("session.curuser.", "curuser.");
+    s = s.replace("curuser?.id", "(if curuser != () { curuser.id } else { -1 })");
+    s = s.replace(" as Long", "");
+    s = s.replace(" as Integer", "");
+    s = s.replace(".size()", ".len()");
+    s = s.replace("return null", "return ()");
+
+    // Line-by-line fixes: `def x = ...`, `arr << x`, and braceless single-line `if(...) stmt`
+    static DEF_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static PUSH_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let def_re = DEF_RE.get_or_init(|| regex::Regex::new(r#"^(\s*)def\s+"#).unwrap());
+    let push_re = PUSH_RE.get_or_init(|| regex::Regex::new(r#"^(\s*)(\w+)\s*<<\s*(.+)$"#).unwrap());
+
+    fn split_if_line(line: &str) -> Option<(&str, &str, &str)> {
+        let trimmed = line.trim_start();
+        let ind = &line[..line.len() - trimmed.len()];
+        let after_if = trimmed.strip_prefix("if")?;
+        if after_if.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let rest = after_if.trim_start();
+        if !rest.starts_with('(') {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut esc = false;
+        for (idx, ch) in rest.char_indices() {
+            if in_str {
+                if esc { esc = false; } else if ch == '\\' { esc = true; } else if ch == '"' { in_str = false; }
+                continue;
+            }
+            match ch {
+                '"' => in_str = true,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((ind, &rest[1..idx], rest[idx + 1..].trim()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    let wrap_cond = |cond: &str| -> String {
+        let mut c = cond.trim().to_string();
+        // Replace bare `!ident` or `!ident["k"]` (not `!fn(...)` and not `!arr.some(...)`) with `!truthy(...)`
+        static NEG_TERM: OnceLock<regex::Regex> = OnceLock::new();
+        let neg_re = NEG_TERM.get_or_init(|| {
+            regex::Regex::new(r#"!([A-Za-z_][A-Za-z0-9_]*(?:\["[^"]*"\])?)([.(]?)"#).unwrap()
+        });
+        c = neg_re
+            .replace_all(&c, |caps: &regex::Captures| {
+                let term = &caps[1];
+                let tail = &caps[2];
+                if !tail.is_empty() {
+                    format!("!{}{}", term, tail)
+                } else {
+                    format!("!truthy({})", term)
+                }
+            })
+            .into_owned();
+        if !c.contains("==") && !c.contains("!=") && !c.contains('<') && !c.contains('>') && !c.contains("&&") && !c.contains("||") && !c.starts_with('!') {
+            c = format!("truthy({})", c);
+        } else if c.contains("&&") {
+            static LEAD_TERM: OnceLock<regex::Regex> = OnceLock::new();
+            let lead = LEAD_TERM.get_or_init(|| regex::Regex::new(r#"^([A-Za-z_][A-Za-z0-9_]*(?:\["[^"]*"\])?)\s*&&"#).unwrap());
+            c = lead.replace(&c, "truthy($1) &&").into_owned();
+        }
+        c
+    };
+
+    let mut lines = vec![];
+    for raw in s.lines() {
+        let mut line = def_re.replace(raw, "${1}let ").into_owned();
+        if let Some((ind, cond_raw, tail)) = split_if_line(&line) {
+            let cond = wrap_cond(cond_raw);
+            if tail == "{" {
+                line = format!("{}if {} {{", ind, cond);
+            } else if !tail.is_empty() {
+                let mut body = tail.to_string();
+                if let Some(pc) = push_re.captures(&body) {
+                    body = format!("{}.push({});", &pc[2], &pc[3]);
+                }
+                line = format!("{}if {} {{ {} }}", ind, cond, body);
+            }
+        } else if let Some(pc) = push_re.captures(&line) {
+            line = format!("{}{}.push({});", &pc[1], &pc[2], &pc[3]);
+        }
+        let trimmed = line.trim_end();
+        if !trimmed.is_empty() && !trimmed.ends_with('{') && !trimmed.ends_with('}') && !trimmed.ends_with(';') && !trimmed.trim_start().starts_with("//") {
+            line = format!("{};", trimmed);
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod default_tests {
     use super::*;
@@ -1354,6 +1587,21 @@ mod default_tests {
         assert!(matches!(groovy_default("'#1a237e'"), GroovyDefault::Value(Value::String(v)) if v == "#1a237e"));
         assert!(matches!(groovy_default("session?.curuser?.userID"), GroovyDefault::Code(c) if c == "curuser?.staffid"));
         assert!(matches!(groovy_default("params.event_id_default"), GroovyDefault::Code(c) if c == "params.event_id_default"));
+    }
+
+    #[test]
+    fn groovy_tracker_snippets_compile_in_rhai() {
+        let eng = rhai::Engine::new();
+        let samples = [
+            "return 'Profil dikemaskini oleh ' + (session?.curuser?.name ?: 'pengguna')",
+            "if(!datas || !datas['ic_no']) return false\ndef m = g6portal.PortalTracker.load_datas('ahli','ahli',['no_kp':datas['ic_no'].toString().replaceAll('[^0-9]','')])\nif(!m) return false\nreturn true",
+            "if(!val) return null\ndef clean = val.replaceAll('[^0-9]','')\nif(clean.size()!=12) return null\ndef m = g6portal.PortalTracker.load_datas('ahli','ahli',['no_kp':clean])\nif(!m) return 'Tiada rekod'\nreturn null",
+            "if(!val) return null\ndef clean = val.replaceAll('[^0-9]','')\nif(clean.size()!=12) return null\ndef m = g6portal.PortalTracker.load_datas('ahli','ahli',['no_kp':clean])\nif(!m) return null\ndef others = g6portal.User.findAllWhere(profile_id: m['id'] as Integer).findAll { it.id != curuser?.id }\nif(m['user_id'] && (m['user_id'] as Long) != curuser?.id && !others.any { it.id == (m['user_id'] as Long) }) {\n    def pu = g6portal.User.get(m['user_id'] as Long)\n    if(pu) others << pu\n}\nif(others) return 'Ada (' + others*.userID.join(', ') + ')'\nreturn null",
+        ];
+        for sample in samples {
+            let rhai_code = groovy_tracker_script(sample);
+            eng.compile(&rhai_code).unwrap_or_else(|e| panic!("failed to compile:\n{}\nerror: {}", rhai_code, e));
+        }
     }
 }
 

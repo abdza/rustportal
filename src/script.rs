@@ -730,6 +730,31 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
         web::log_error(x.db(), "script", "log_error", msg, None, None, x.uid()).await;
         Ok(Value::Null)
     });
+    // Telegram bot helpers (g6ikram Telegram.groovy parity)
+    reg!("telegram_enabled", |x| async move { Ok(json!(crate::telegram::enabled(x.db()).await)) });
+    reg!("telegram_bot_name", |x| async move { Ok(json!(crate::telegram::bot_name(x.db()).await)) });
+    reg!("telegram_send_to_user", |x, uid: i64, text: &str| async move { Ok(json!(crate::telegram::send_to_user(x.db(), uid, text).await)) });
+    reg!("telegram_send_message", |x, chat_id: &str, text: &str| async move { Ok(json!(crate::telegram::send_message(x.db(), chat_id, text).await)) });
+    reg!("telegram_queue", |x, uid: i64, title: Dynamic, body: &str| async move {
+        let t = if title.is_unit() { None } else { Some(title.to_string()) };
+        Ok(json!(crate::telegram::queue(&x.st, uid, t.as_deref(), body, &Row::new()).await))
+    });
+    reg!("telegram_queue", |x, uid: i64, title: Dynamic, body: &str, opts: Dynamic| async move {
+        let t = if title.is_unit() { None } else { Some(title.to_string()) };
+        Ok(json!(crate::telegram::queue(&x.st, uid, t.as_deref(), body, &obj(d2j(&opts))).await))
+    });
+    reg!("telegram_handle_reply", |x, chat_id: &str, text: &str, username: Dynamic| async move {
+        let un = if username.is_unit() { None } else { Some(username.to_string()) };
+        Ok(json!(crate::telegram::handle_member_reply(&x.st, chat_id, text, un.as_deref()).await))
+    });
+    reg!("users_by_profile_id", |x, pid: i64| async move {
+        let rows = x
+            .db()
+            .rows("select id, staffid, emp_name, email, profile_id from iap_user where profile_id=:p order by id", &row! {"p"=>pid})
+            .await
+            .unwrap_or_default();
+        Ok(Value::Array(rows.into_iter().map(Value::Object).collect()))
+    });
     // the visitor's session (keys the portal owns are not visible)
     {
         let x = inner.clone();
@@ -835,6 +860,15 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
         }
     });
     e.register_fn("regex_replace", |pat: &str, x: &str, rep: &str| regex::Regex::new(pat).map(|r| r.replace_all(x, rep).into_owned()).unwrap_or_else(|_| x.to_string()));
+    e.register_fn("truthy", |v: Dynamic| truthy(&d2j(&v)));
+    e.register_fn("to_int", |v: Dynamic| -> i64 {
+        match d2j(&v) {
+            Value::Number(n) => n.as_i64().unwrap_or_else(|| n.as_f64().unwrap_or(0.0) as i64),
+            Value::String(s) => s.trim().parse::<i64>().unwrap_or(0),
+            Value::Bool(b) => if b { 1 } else { 0 },
+            _ => 0,
+        }
+    });
     e
 }
 

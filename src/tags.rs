@@ -498,7 +498,12 @@ pub async fn field_errors(sc: &Sc, t: &Tracker, f: &Row, datas: &Row) -> Vec<(St
                 if code.trim().is_empty() {
                     None
                 } else {
-                    match sc.eval(&code, &row! {"datas"=>Value::Object(datas.clone()),"field"=>Value::Object(f.clone()),"value"=>val.clone()}) {
+                    let eval_code = if crate::db::g6() || crate::tracker::looks_groovy_snippet(&code) {
+                        crate::tracker::groovy_tracker_script(&code)
+                    } else {
+                        code
+                    };
+                    match sc.eval(&eval_code, &row! {"datas"=>Value::Object(datas.clone()),"field"=>Value::Object(f.clone()),"value"=>val.clone(),"val"=>val.clone()}) {
                         Ok(v) if crate::script::truthy(&v) => Some(if v == json!(true) { format!("{} is invalid", label) } else { vs(&v) }),
                         Ok(_) => None,
                         Err(e) => {

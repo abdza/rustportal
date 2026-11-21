@@ -14,6 +14,8 @@ module_dir = "modulemigration"
 # run scheduled pages and send queued e-mail; turn off when the other portal on the
 # same database already does, or every job runs twice
 # run_scheduler = true
+# run Telegram bot long-poller, outbox sender, and email mirroring (defaults to run_scheduler)
+# run_telegram = true
 # time zone for the database session (SQL now(), current_date). Unset: this
 # machine's zone when g6_schema is on (as a Grails portal's JDBC driver uses),
 # otherwise UTC
@@ -42,4 +44,10 @@ session_hours = 12
 host = "127.0.0.1"
 port = 1025
 from = "portal@localhost"
+# starttls = true
 disabled = false
+
+# [google_oauth]
+# client_id = ""
+# client_secret = ""
+# callback_url = "https://example.com/auth/google/callback"
