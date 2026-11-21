@@ -308,8 +308,64 @@ fn sqltype(k: K) -> Option<&'static str> {
     })
 }
 
+fn sqlite_default(table: &str, col: &str) -> &'static str {
+    match (table, col) {
+        ("portal_user", "is_admin") => " default false",
+        ("portal_user", "is_active") => " default true",
+        ("portal_user", "reset_password") => " default false",
+        ("portal_user", "email") => " default ''",
+        _ => "",
+    }
+}
+
 /// Create missing tables and add missing columns. Never drops or alters.
 pub async fn sync_schema(db: &Db, ents: &[Entity]) -> Result<()> {
+    if db.is_sqlite() {
+        for e in ents {
+            let mut cols = vec!["id integer primary key autoincrement".to_string(), "version bigint not null default 0".to_string()];
+            for f in &e.fields {
+                match f.kind {
+                    K::Multi(_, join, own, other) => {
+                        db.ddl(&format!("create table if not exists \"{}\" (\"{}\" bigint not null, \"{}\" bigint not null)", join, own, other)).await?;
+                    }
+                    k => {
+                        let t = if e.table == "file_link" && f.name == "path" { "text" } else { sqltype(k).unwrap() };
+                        let def = sqlite_default(e.table, f.name);
+                        cols.push(format!("\"{}\" {} null{}", f.name, t, def));
+                    }
+                }
+            }
+            db.ddl(&format!("create table if not exists \"{}\" ({})", e.table, cols.join(", "))).await?;
+            // Add any columns introduced since the table was first created.
+            let existing: Vec<String> = db.table_columns(e.table).await?.into_iter().map(|(c, _)| c.to_ascii_lowercase()).collect();
+            for f in &e.fields {
+                if matches!(f.kind, K::Multi(..)) {
+                    continue;
+                }
+                if !existing.iter().any(|c| c == &f.name.to_ascii_lowercase()) {
+                    let t = if e.table == "file_link" && f.name == "path" { "text" } else { sqltype(f.kind).unwrap() };
+                    let def = sqlite_default(e.table, f.name);
+                    db.ddl(&format!("alter table \"{}\" add column \"{}\" {} null{}", e.table, f.name, t, def)).await?;
+                }
+            }
+        }
+        db.ddl(
+            "create table if not exists portal_session (id varchar(80) primary key, data text, updated timestamp default (datetime('now', 'localtime')));
+             create index if not exists ix_user_role_user on user_role (user_id);
+             create index if not exists ix_ptf_tracker on portal_tracker_field (tracker_id);
+             create index if not exists ix_pts_tracker on portal_tracker_status (tracker_id);
+             create index if not exists ix_ptt_tracker on portal_tracker_transition (tracker_id);
+             create index if not exists ix_ptr_tracker on portal_tracker_role (tracker_id);
+             create index if not exists ix_tracker_ms on portal_tracker (module, slug);
+             create index if not exists ix_filelink_ms on file_link (module, slug);
+             create index if not exists ix_audit_date on portal_audit_trail (date);",
+        )
+        .await?;
+        db.ddl(&format!("create index if not exists ix_{t}_ms on \"{t}\" (module, slug)", t = crate::db::page_t())).await?;
+        db.ddl("create index if not exists ix_portal_tree_node_tree on portal_tree_node (tree_id, lft)").await?;
+        return Ok(());
+    }
+
     // On a Grails portal's database new tables take their ids from the same
     // hibernate_sequence its tables use, so rows copied across keep their ids
     // and rows added later never collide with either side's.

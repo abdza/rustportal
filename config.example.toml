@@ -1,7 +1,10 @@
 # Copy to config.toml and adjust. Every key is optional.
 port = 9090
 address = "0.0.0.0"
+# PostgreSQL (recommended for production / sharing a DB with a Grails portal):
 database_url = "postgres://postgres@localhost/rustportal"
+# Or use embedded SQLite for zero-setup single-file deployment (no DB server needed):
+# database_url = "sqlite://rustportal.db"
 upload_dir = "uploads"
 module_dir = "modulemigration"
 # where pages and their data sources are kept. Point these at your own tables to run

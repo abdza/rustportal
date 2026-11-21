@@ -120,8 +120,8 @@ pub fn safe_condition(cond: &str) -> Option<String> {
         r"(?i)\bunion\s+select\b",
         r"(?i);\s*select\b",
         r"(?i)\b(into\s+outfile|load_file|load\s+data)\b",
-        r"(?i)\binformation_schema\b",
-        r"(?i)\b(benchmark|sleep|waitfor|pg_sleep)\b",
+        r"(?i)\b(information_schema|sqlite_master|sqlite_schema)\b",
+        r"(?i)\b(benchmark|sleep|waitfor|pg_sleep|pragma)\b",
     ];
     for p in pats {
         if regex::Regex::new(p).map(|r| r.is_match(c)).unwrap_or(false) {
@@ -429,16 +429,17 @@ impl Tracker {
 
     pub async fn updatedb(&self, db: &Db) -> Result<()> {
         let dt = ident(&self.data_table())?;
-        db.ddl(&format!("create table if not exists {} (id serial primary key, dataupdate_id numeric(19,0) null)", dt)).await?;
-        db.ddl(&format!("alter table {} add column if not exists dataupdate_id numeric(19,0) null", dt)).await?;
+        let id_col = if db.is_sqlite() { "id integer primary key autoincrement" } else { "id serial primary key" };
+        db.ddl(&format!("create table if not exists {} ({}, dataupdate_id numeric(19,0) null)", dt, id_col)).await?;
+        db.add_column_if_missing(&self.data_table(), "dataupdate_id", "numeric(19,0)").await?;
         if self.tracker_type != "DataStore" {
-            db.ddl(&format!("alter table {} add column if not exists record_status varchar(255) null", dt)).await?;
+            db.add_column_if_missing(&self.data_table(), "record_status", "varchar(255)").await?;
         }
         if self.tracker_type == "Tracker" {
             let tt = ident(&self.trail_table())?;
             db.ddl(&format!(
-                "create table if not exists {} (id serial primary key, attachment_id numeric(19,0), description text, record_id numeric(19,0), update_date timestamp, updater_id numeric(19,0), status varchar(255), changes text, allowedroles varchar(255))",
-                tt
+                "create table if not exists {} ({}, attachment_id numeric(19,0), description text, record_id numeric(19,0), update_date timestamp, updater_id numeric(19,0), status varchar(255), changes text, allowedroles varchar(255))",
+                tt, id_col
             ))
             .await?;
             db.ddl(&format!("create index if not exists \"ix_{}_record_id\" on {} (record_id)", self.trail_table(), tt)).await?;
@@ -457,7 +458,7 @@ impl Tracker {
             return Ok(());
         }
         let dt = ident(&self.data_table())?;
-        db.ddl(&format!("alter table {} add column if not exists {} {} null", dt, ident(&name)?, t)).await?;
+        db.add_column_if_missing(&self.data_table(), &name, t).await?;
         if matches!(ft.as_str(), "Branch" | "User" | "File" | "BelongsTo" | "TreeNode") {
             db.ddl(&format!("create index if not exists \"ix_{}_{}\" on {} ({})", self.data_table(), name, dt, ident(&name)?)).await?;
         }
@@ -494,21 +495,20 @@ impl Tracker {
 
     /// Create field definitions from the columns of an existing data table.
     pub async fn from_table(&self, db: &Db) -> Result<usize> {
-        let cols = db
-            .rows("select column_name, udt_name from information_schema.columns where table_schema='public' and table_name=:t order by ordinal_position", &row! {"t"=>self.data_table()})
-            .await?;
+        let cols = db.table_columns(&self.data_table()).await?;
         let mut n = 0;
-        for c in cols {
-            let name = s(&c, "column_name");
+        for (name, udt) in cols {
             if matches!(name.as_str(), "id" | "dataupdate_id" | "record_status") || self.field(&name).is_some() {
                 continue;
             }
-            let ft = match s(&c, "udt_name").as_str() {
-                "int2" | "int4" | "int8" => "Integer",
-                "numeric" | "float4" | "float8" => "Number",
+            let base = udt.to_ascii_lowercase();
+            let base = base.split('(').next().unwrap_or(&base).trim();
+            let ft = match base {
+                "int2" | "int4" | "int8" | "int" | "integer" | "bigint" | "smallint" => "Integer",
+                "numeric" | "decimal" | "float4" | "float8" | "real" | "float" | "double" | "double precision" => "Number",
                 "date" => "Date",
-                "timestamp" | "timestamptz" => "DateTime",
-                "bool" => "Checkbox",
+                "timestamp" | "timestamptz" | "datetime" => "DateTime",
+                "bool" | "boolean" => "Checkbox",
                 "text" => "Text Area",
                 _ => "Text",
             };
@@ -633,9 +633,10 @@ impl Tracker {
     }
 
     pub async fn cleardb(&self, db: &Db) -> Result<()> {
-        db.ddl(&format!("truncate table {}", ident(&self.data_table())?)).await?;
+        let stmt = if db.is_sqlite() { "delete from" } else { "truncate table" };
+        db.ddl(&format!("{} {}", stmt, ident(&self.data_table())?)).await?;
         if self.tracker_type == "Tracker" {
-            db.ddl(&format!("truncate table {}", ident(&self.trail_table())?)).await?;
+            db.ddl(&format!("{} {}", stmt, ident(&self.trail_table())?)).await?;
         }
         Ok(())
     }
@@ -989,14 +990,14 @@ impl Tracker {
                                 let ff = other_format(f);
                                 let fmt = if ff.is_empty() { ot.default_field().unwrap_or_default() } else { ff };
                                 if db::ident_ok(&fmt) {
-                                    ors.push(format!("{} in (select id from {} where \"{}\"::text ilike {})", col, qcol(&ot.data_table()), fmt, like));
+                                    ors.push(format!("{} in (select id from {} where \"{}\"::text ilike {} escape '\\')", col, qcol(&ot.data_table()), fmt, like));
                                 }
                             }
                         }
-                        "User" => ors.push(format!("{} in (select id from portal_user where name ilike {l} or userid ilike {l} or email ilike {l})", col, l = like)),
-                        "TreeNode" | "Branch" => ors.push(format!("{} in (select id from portal_tree_node where name ilike {})", col, like)),
+                        "User" => ors.push(format!("{} in (select id from portal_user where name ilike {l} escape '\\' or userid ilike {l} escape '\\' or email ilike {l} escape '\\')", col, l = like)),
+                        "TreeNode" | "Branch" => ors.push(format!("{} in (select id from portal_tree_node where name ilike {} escape '\\')", col, like)),
                         "HasMany" | "FieldGroup" | "File" => {}
-                        _ => ors.push(format!("{}::text ilike {}", col, like)),
+                        _ => ors.push(format!("{}::text ilike {} escape '\\'", col, like)),
                     }
                 }
                 if !ors.is_empty() {

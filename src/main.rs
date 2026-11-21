@@ -19,6 +19,7 @@ mod oauth;
 mod page;
 mod scheduler;
 mod script;
+mod sqlite_compat;
 mod tags;
 mod telegram;
 mod tracker;
@@ -309,7 +310,10 @@ async fn dispatch(State(_st): State<St>, ctx: Ctx) -> Response {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let argv: Vec<String> = std::env::args().collect();
+    let mut argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(|x| x.as_str()) == Some("--") {
+        argv.remove(1);
+    }
     if argv.get(1).map(|x| x.as_str()) == Some("gsp-check") {
         return gsp_check(&argv[2..]);
     }
@@ -324,13 +328,15 @@ async fn main() -> anyhow::Result<()> {
         Some("module-export") | Some("module-import") => Some(argv[1..].to_vec()),
         _ => None,
     };
-    let cfg_path = if translate_modules.is_some() || module_cmd.is_some() || copy_modules.is_some() || check_modules.is_some() {
-        std::env::var("CONFIG").unwrap_or_else(|_| "config.toml".to_string())
+    let explicit_cfg: Option<String> = if translate_modules.is_some() || module_cmd.is_some() || copy_modules.is_some() || check_modules.is_some() {
+        std::env::var("CONFIG").ok()
     } else {
-        std::env::args().nth(1).unwrap_or_else(|| "config.toml".to_string())
+        argv.get(1).cloned().or_else(|| std::env::var("CONFIG").ok())
     };
+    let cfg_path = explicit_cfg.clone().unwrap_or_else(|| "config.toml".to_string());
     let mut cfg: web::Config = match std::fs::read_to_string(&cfg_path) {
         Ok(t) => toml::from_str(&t).map_err(|e| anyhow::anyhow!("{}: {}", cfg_path, e))?,
+        Err(e) if explicit_cfg.is_some() => anyhow::bail!("Cannot read config file '{}': {}", cfg_path, e),
         Err(_) => web::Config::default(),
     };
     if let Ok(u) = std::env::var("DATABASE_URL") {
@@ -517,7 +523,7 @@ async fn copy_pages(db: &db::Db, modules: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("copy-pages needs page_table and page_data_table set to this portal's own tables in the config");
     }
     let cols = |t: &'static str| async move {
-        db.rows("select column_name from information_schema.columns where table_schema=current_schema() and table_name=:t", &row! {"t"=>t}).await.map(|r| r.iter().map(|x| s(x, "column_name")).collect::<Vec<_>>())
+        db.table_columns(t).await.map(|r| r.into_iter().map(|(c, _)| c).collect::<Vec<_>>())
     };
     let common = |a: Vec<String>, b: Vec<String>| a.into_iter().filter(|c| b.contains(c)).map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
     let pcols = common(cols("portal_page").await?, cols(pt).await?);

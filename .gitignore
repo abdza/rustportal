@@ -43,6 +43,10 @@ documents/
 # Runtime data and logs
 /uploads/
 *.log
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
 
 # Local benchmark scripts and their output
 /bench/

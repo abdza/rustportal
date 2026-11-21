@@ -4,9 +4,22 @@ A portal framework for workflow and web systems, written in Rust: dynamic pages
 stored in the database, tracker modules with workflows, and the admin tools around
 them. Modules written for Grails/GSP-based portals can be imported and translated.
 
-Stack: axum, PostgreSQL (sqlx), Rhai for scripts, MiniJinja for templates.
+Stack: axum, PostgreSQL or embedded SQLite (sqlx), Rhai for scripts, MiniJinja for templates.
 
 ## Run
+
+### Quick start (embedded SQLite — no database setup)
+
+    DATABASE_URL=sqlite://rustportal.db cargo run --release
+
+Or set `database_url = "sqlite://rustportal.db"` in `config.toml`. The SQLite
+file (and parent directory, if any) is created automatically in WAL mode. A
+built-in SQL compatibility shim translates common PostgreSQL expressions
+(`ILIKE`, `::type` casts, `now()`, `interval '...'`, `EXTRACT(...)`,
+`DATE_TRUNC(...)`, `TO_CHAR(...)`, `STRING_AGG(...)`, `TRUNCATE TABLE`) so
+portal screens and standard modules work out of the box.
+
+### PostgreSQL (recommended for production / Grails DB sharing)
 
     createdb rustportal            # once
     cp config.example.toml config.toml
