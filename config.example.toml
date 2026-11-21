@@ -36,7 +36,7 @@ app_name = "Portal"
 # copyright = ""     # footer "Copyright <b>...</b>", default: app_name
 # team = ""          # footer "Designed by ...", default: "<app_name> Team"
 # logo_url = ""      # default /static/images/logo.png
-# favicon_url = ""   # default /static/images/favicon.ico
+# favicon_url = ""   # default /static/images/favicon.svg
 # link on "Designed by <app name> Team" in the footer
 # credits_url = "https://example.com/"
 allow_registration = false

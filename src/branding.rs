@@ -241,7 +241,7 @@ async fn index(mut ctx: Ctx) -> Response {
     let homepage = esc(brand["homepage"].as_str().unwrap_or(""));
     let logo_url = esc(brand["logo_url"].as_str().unwrap_or(""));
     let cur_logo = esc(brand["logo"].as_str().unwrap_or("/static/images/logo.png"));
-    let cur_favicon = esc(brand["favicon"].as_str().unwrap_or("/static/images/favicon.ico"));
+    let cur_favicon = esc(brand["favicon"].as_str().unwrap_or("/static/images/favicon.svg"));
     let has_logo_slug = !brand["logo_slug"].as_str().unwrap_or("").is_empty();
     let has_favicon_slug = !brand["favicon_slug"].as_str().unwrap_or("").is_empty();
 

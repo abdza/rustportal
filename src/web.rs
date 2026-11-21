@@ -58,7 +58,7 @@ pub struct Config {
     /// footer "Copyright <b>...</b>" and "Designed by ..." (default: the app name / "<app name> Team")
     pub copyright: String,
     pub team: String,
-    /// header logo and favicon (default: /static/images/logo.png and favicon.ico)
+    /// header logo and favicon (default: /static/images/logo.png and favicon.svg)
     pub logo_url: String,
     pub favicon_url: String,
     /// folders searched first for /assets/x, before this portal's own static files -
@@ -956,7 +956,7 @@ pub async fn branding(st: &St) -> Value {
     let favicon = if !favicon_slug.is_empty() {
         format!("/download/portal/{}", favicon_slug)
     } else {
-        pick("favicon_url", &cfg.favicon_url, "/static/images/favicon.ico".into())
+        pick("favicon_url", &cfg.favicon_url, "/static/images/favicon.svg".into())
     };
     let mut out = Row::new();
     out.insert("app_name".into(), json!(app_name));
