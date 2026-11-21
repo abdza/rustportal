@@ -105,18 +105,20 @@ pub const FIELD_TYPES: &[&str] = &[
 pub fn entities() -> Vec<Entity> {
     use Scope::*;
     use K::*;
-    let mut v = vec![
-        Entity::new("user", "iap_user", "User", "emp_name", Global)
-            .f(&[("staffid", Str), ("emp_name", Str), ("email", Str), ("password", Password), ("is_admin", Bool), ("isactive", Bool),
-                ("passwordreset", Bool), ("new_staffid", Str), ("old_staffid", Str), ("lanid", Str), ("role", Str), ("roletargetid", Int),
+    vec![
+        Entity::new("user", "portal_user", "User", "name", Global)
+            .f(&[("userid", Str), ("name", Str), ("email", Str), ("password", Password), ("is_admin", Bool), ("is_active", Bool),
+                ("reset_password", Bool), ("lanid", Str), ("role", Str), ("roletargetid", Int), ("state", Str), ("profile_id", Int),
                 ("handphone", Str), ("directline", Str), ("company_handphone", Str), ("address", Text), ("emergency_name", Str),
                 ("emergency_contact", Str), ("profilepic_id", Ref("fileLink")), ("date_joined", Date)])
             .h(&[("secretquestion", Str), ("secretanswer", Str), ("password5", Text), ("lanidexception", Bool), ("resetexception", Bool),
                 ("treesdate", Date), ("lastlogin", Date), ("last_updated", Date), ("last_info_update", Date), ("last_reminder", Date),
-                ("active_session_id", Str), ("active_session_updated", Date)])
-            .list(&["staffid", "emp_name", "email", "is_admin", "isactive", "lastlogin"])
+                ("active_session_id", Str), ("active_session_updated", Date),
+                ("telegram_chat_id", Str), ("telegram_username", Str), ("telegram_linked_at", Date),
+                ("telegram_link_token", Str), ("telegram_token_expiry", Date)])
+            .list(&["userid", "name", "email", "is_admin", "is_active", "lastlogin"])
             .children(&[("userRole", "user_id"), ("portalTreeNodeUser", "user_id")])
-            .order("emp_name"),
+            .order("name"),
         Entity::new("userRole", "user_role", "User Role", "role", Module("module"))
             .f(&[("user_id", Ref("user")), ("module", Str), ("role", Str)])
             .list(&["user_id", "module", "role"]),
@@ -271,19 +273,19 @@ pub fn entities() -> Vec<Entity> {
                 ("success", Bool), ("error", Text), ("thread_name", Str)])
             .list(&["start_date", "name", "details", "user_id", "duration_ms", "success", "error"])
             .readonly(),
-        Entity::new("portalTree", "tree", "Tree", "name", Module("module"))
+        Entity::new("portalTree", "portal_tree", "Tree", "name", Module("module"))
             .f(&[("module", Str), ("name", Str), ("valid", Date), ("expire", Date)])
             .h(&[("root_id", Ref("portalTreeNode"))])
             .list(&["module", "name"])
             .order("module,name"),
-        Entity::new("portalTreeNode", "tree_node", "Tree Node", "name", Via("tree_id", "portalTree"))
+        Entity::new("portalTreeNode", "portal_tree_node", "Tree Node", "name", Via("tree_id", "portalTree"))
             .f(&[("tree_id", Ref("portalTree")), ("parent_id", Ref("portalTreeNode")), ("name", Str), ("slug", Str), ("domain", Str),
                 ("domainid", Int), ("mainrole", Str), ("hiderole", Str), ("data", Code), ("disabled", Bool)])
             .h(&[("lft", Int), ("rgt", Int)])
             .list(&["tree_id", "name", "slug", "parent_id"])
             .children(&[("portalTreeNodeUser", "node_id")])
             .order("tree_id,lft"),
-        Entity::new("portalTreeNodeUser", "tree_node_user", "Tree Node User", "role", Global)
+        Entity::new("portalTreeNodeUser", "portal_tree_node_user", "Tree Node User", "role", Global)
             .f(&[("node_id", Ref("portalTreeNode")), ("user_id", Ref("user")), ("role", Str)])
             .list(&["node_id", "user_id", "role"]),
         Entity::new("jobStatus", "job_status", "Job Status", "job_type", Global)
@@ -291,14 +293,7 @@ pub fn entities() -> Vec<Entity> {
                 ("skipped_records", Int), ("error_message", Text), ("module_name", Str), ("cancel_requested", Bool)])
             .list(&["start_time", "job_type", "module_name", "status", "processed_records", "total_records"])
             .readonly(),
-    ];
-    if crate::db::g6() {
-        // g6 portals have no separate new/old staff ids (the views show them empty)
-        if let Some(u) = v.iter_mut().find(|e| e.name == "user") {
-            u.fields.retain(|f| f.name != "new_staffid" && f.name != "old_staffid");
-        }
-    }
-    v
+    ]
 }
 
 fn sqltype(k: K) -> Option<&'static str> {
@@ -313,54 +308,6 @@ fn sqltype(k: K) -> Option<&'static str> {
     })
 }
 
-/// On a g6 Grails portal's database: views under this portal's table names over
-/// the g6 tables, so both portals read and write the same rows. Simple views are
-/// updatable in PostgreSQL; the defaults fill the columns g6 requires but this
-/// portal may leave out. Only views are ever (re)created here, never tables.
-pub async fn g6_views(db: &Db) -> Result<()> {
-    let views: &[(&str, &str, &str)] = &[
-        (
-            "iap_user",
-            "select id, 0::bigint as version, userid as staffid, name as emp_name, email, password, is_admin, is_active as isactive,
-                    reset_password as passwordreset, null::varchar as new_staffid, null::varchar as old_staffid, lanid, role, roletargetid,
-                    handphone, directline, company_handphone, address, emergency_name, emergency_contact, profilepic_id, date_joined,
-                    secretquestion, secretanswer, password5, lanidexception, resetexception, treesdate, lastlogin, last_updated,
-                    last_info_update, last_reminder, active_session_id, active_session_updated, state, profile_id,
-                    telegram_chat_id, telegram_username, telegram_linked_at, telegram_link_token, telegram_token_expiry
-             from portal_user",
-            "alter view iap_user alter column is_admin set default false;
-             alter view iap_user alter column isactive set default true;
-             alter view iap_user alter column passwordreset set default false;
-             alter view iap_user alter column email set default ''",
-        ),
-        ("tree", "select * from portal_tree", ""),
-        ("tree_node", "select * from portal_tree_node", ""),
-        ("tree_node_user", "select * from portal_tree_node_user", ""),
-    ];
-    for (name, sql, extra) in views {
-        let kind = db.first("select c.relkind::text as k from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname=current_schema() and c.relname=:n", &crate::row! {"n"=>*name}).await?;
-        match kind.as_ref().map(|r| crate::db::s(r, "k")) {
-            Some(k) if k != "v" => anyhow::bail!("g6_schema: {} is a table here, not a view - is this really a g6 portal's database?", name),
-            Some(_) => db.ddl(&format!("drop view {}", name)).await?,
-            None => {}
-        }
-        db.ddl(&format!("create view {} as {}", name, sql)).await?;
-        db.ddl(&format!("alter view {} alter column id set default nextval('hibernate_sequence')", name)).await?;
-        if name.starts_with("tree") {
-            // Hibernate's optimistic-lock column is NOT NULL there, with no default
-            db.ddl(&format!("alter view {} alter column version set default 0", name)).await?;
-        }
-        if !extra.is_empty() {
-            db.ddl(extra).await?;
-        }
-    }
-    Ok(())
-}
-
-async fn is_view(db: &Db, table: &str) -> Result<bool> {
-    Ok(db.first("select 1 as x from pg_views where schemaname=current_schema() and viewname=:t", &crate::row! {"t"=>table}).await?.is_some())
-}
-
 /// Create missing tables and add missing columns. Never drops or alters.
 pub async fn sync_schema(db: &Db, ents: &[Entity]) -> Result<()> {
     // On a Grails portal's database new tables take their ids from the same
@@ -369,9 +316,6 @@ pub async fn sync_schema(db: &Db, ents: &[Entity]) -> Result<()> {
     let hib = db.first("select 1 as x from pg_sequences where sequencename='hibernate_sequence'", &crate::db::no_params()).await?.is_some();
     let id_col = if hib { "id bigint primary key default nextval('hibernate_sequence')" } else { "id bigserial primary key" };
     for e in ents {
-        if is_view(db, e.table).await? {
-            continue; // a g6 table under this portal's name: its columns are what they are
-        }
         db.ddl(&format!("create table if not exists \"{}\" ({}, version bigint not null default 0)", e.table, id_col)).await?;
         for f in &e.fields {
             match f.kind {
@@ -390,9 +334,6 @@ pub async fn sync_schema(db: &Db, ents: &[Entity]) -> Result<()> {
     // Give them defaults so both applications can insert into the same database:
     // ids from the same shared sequence, so they never collide.
     for e in ents {
-        if is_view(db, e.table).await? {
-            continue;
-        }
         let p = crate::row! {"t"=>e.table};
         let col = db.first("select column_default, is_nullable from information_schema.columns where table_schema=current_schema() and table_name=:t and column_name='id'", &p).await?;
         if let Some(c) = col {
@@ -416,6 +357,10 @@ pub async fn sync_schema(db: &Db, ents: &[Entity]) -> Result<()> {
     }
     db.ddl(
         "create table if not exists portal_session (id varchar(80) primary key, data text, updated timestamp default now());
+         alter table portal_user alter column is_admin set default false;
+         alter table portal_user alter column is_active set default true;
+         alter table portal_user alter column reset_password set default false;
+         alter table portal_user alter column email set default '';
          create index if not exists ix_user_role_user on user_role (user_id);
          create index if not exists ix_ptf_tracker on portal_tracker_field (tracker_id);
          create index if not exists ix_pts_tracker on portal_tracker_status (tracker_id);
@@ -429,7 +374,6 @@ pub async fn sync_schema(db: &Db, ents: &[Entity]) -> Result<()> {
     )
     .await?;
     db.ddl(&format!("create index if not exists ix_{t}_ms on \"{t}\" (module, slug)", t = crate::db::page_t())).await?;
-    let tn = if crate::db::g6() { "portal_tree_node" } else { "tree_node" };
-    db.ddl(&format!("create index if not exists ix_{t}_tree on {t} (tree_id, lft)", t = tn)).await?;
+    db.ddl("create index if not exists ix_portal_tree_node_tree on portal_tree_node (tree_id, lft)").await?;
     Ok(())
 }

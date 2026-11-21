@@ -103,7 +103,7 @@ async fn api_call(token: &str, method: &str, payload: &Value, read_timeout_secs:
 pub async fn unlink_chat(db: &Db, chat_id: &str) {
     let _ = db
         .exec(
-            "update iap_user set telegram_chat_id=null, telegram_username=null, telegram_linked_at=null where telegram_chat_id=:c",
+            "update portal_user set telegram_chat_id=null, telegram_username=null, telegram_linked_at=null where telegram_chat_id=:c",
             &row! {"c"=>chat_id},
         )
         .await;
@@ -161,7 +161,7 @@ pub async fn send_message(db: &Db, chat_id: &str, text: &str) -> bool {
 }
 
 pub async fn send_to_user(db: &Db, user_id: i64, text: &str) -> bool {
-    let Ok(Some(u)) = db.get("iap_user", user_id).await else { return false };
+    let Ok(Some(u)) = db.get("portal_user", user_id).await else { return false };
     let chat = s(&u, "telegram_chat_id");
     if chat.is_empty() {
         return false;
@@ -192,7 +192,7 @@ pub async fn notify_emails(db: &Db, emails: &str, title: &str, html_body: &str) 
     for email in list {
         let users = db
             .rows(
-                "select telegram_chat_id from iap_user where lower(email)=:e and isactive is true and telegram_chat_id is not null and telegram_chat_id <> ''",
+                "select telegram_chat_id from portal_user where lower(email)=:e and is_active is true and telegram_chat_id is not null and telegram_chat_id <> ''",
                 &row! {"e"=>email},
             )
             .await
@@ -253,7 +253,7 @@ async fn drain_outbox(st: &St) {
         let Some(rid) = i(&d, "id") else { continue };
         let rec_uid = i(&d, "recipient_id");
         let user = match rec_uid {
-            Some(uid) => st.db.get("iap_user", uid).await.ok().flatten(),
+            Some(uid) => st.db.get("portal_user", uid).await.ok().flatten(),
             None => None,
         };
         let mut upd = row! {"id"=>rid};
@@ -304,7 +304,7 @@ pub async fn handle_member_reply(st: &St, chat_id: &str, text: &str, username: O
     let Some(inbox) = Tracker::load(&st.db, "message", "message_inbox").await else { return false };
     let Ok(Some(user)) = st
         .db
-        .first("select * from iap_user where telegram_chat_id=:c and isactive is true order by id limit 1", &row! {"c"=>chat_id})
+        .first("select * from portal_user where telegram_chat_id=:c and is_active is true order by id limit 1", &row! {"c"=>chat_id})
         .await
     else {
         return false;
@@ -420,7 +420,7 @@ async fn handle_update(st: &St, upd: &Value) {
         let found = st
             .db
             .first(
-                "select id, staffid, emp_name from iap_user where telegram_link_token=:t and telegram_token_expiry > now() limit 1",
+                "select id, userid, name from portal_user where telegram_link_token=:t and telegram_token_expiry > now() limit 1",
                 &row! {"t"=>linktoken},
             )
             .await
@@ -431,24 +431,24 @@ async fn handle_update(st: &St, upd: &Value) {
             let _ = st
                 .db
                 .exec(
-                    "update iap_user set telegram_chat_id=null, telegram_username=null, telegram_linked_at=null where telegram_chat_id=:c and id<>:id",
+                    "update portal_user set telegram_chat_id=null, telegram_username=null, telegram_linked_at=null where telegram_chat_id=:c and id<>:id",
                     &row! {"c"=>chat_id.clone(),"id"=>uid},
                 )
                 .await;
             let _ = st
                 .db
                 .exec(
-                    "update iap_user set telegram_chat_id=:c, telegram_username=:un, telegram_linked_at=now(), telegram_link_token=null, telegram_token_expiry=null where id=:id",
+                    "update portal_user set telegram_chat_id=:c, telegram_username=:un, telegram_linked_at=now(), telegram_link_token=null, telegram_token_expiry=null where id=:id",
                     &row! {"c"=>chat_id.clone(),"un"=>username,"id"=>uid},
                 )
                 .await;
-            eprintln!("[telegram] linked chat {} to user {}", chat_id, s(&u, "staffid"));
+            eprintln!("[telegram] linked chat {} to user {}", chat_id, s(&u, "userid"));
             let _ = send_message(
                 &st.db,
                 &chat_id,
                 &format!(
                     "Salam <b>{}</b>! Akaun portal anda telah berjaya disambungkan. Notifikasi portal akan dihantar ke sini. Hantar /stop untuk berhenti.",
-                    esc(&s(&u, "emp_name"))
+                    esc(&s(&u, "name"))
                 ),
             )
             .await;
@@ -458,7 +458,7 @@ async fn handle_update(st: &St, upd: &Value) {
     } else if lower.starts_with("/stop") {
         let n = st
             .db
-            .count("select count(*) from iap_user where telegram_chat_id=:c", &row! {"c"=>chat_id.clone()})
+            .count("select count(*) from portal_user where telegram_chat_id=:c", &row! {"c"=>chat_id.clone()})
             .await
             .unwrap_or(0);
         if n > 0 {

@@ -72,11 +72,11 @@ impl<T: Clone + Send> Clear for Cache<T> {
 }
 
 pub static SETTINGS: Cache<Option<crate::db::Row>> = Cache::new(&["portal_setting"]);
-pub static MENUS: Cache<Option<(crate::db::Row, Vec<crate::db::Row>)>> = Cache::new(&["tree", "tree_node"]);
+pub static MENUS: Cache<Option<(crate::db::Row, Vec<crate::db::Row>)>> = Cache::new(&["portal_tree", "portal_tree_node"]);
 pub static PAGES: Cache<Option<crate::db::Row>> = Cache::new(&["portal_page"]);
 pub static PAGE_DATA: Cache<Vec<crate::db::Row>> = Cache::new(&["portal_page_data", "portal_page"]);
 /// per user: the account row, module role lists and organisational role
-pub static USERS: Cache<serde_json::Value> = Cache::new(&["iap_user", "user_role", "tree_node_user", "tree_node", "portal_setting"]);
+pub static USERS: Cache<serde_json::Value> = Cache::new(&["portal_user", "user_role", "portal_tree_node_user", "portal_tree_node", "portal_setting"]);
 
 fn all() -> [&'static dyn Clear; 5] {
     [&SETTINGS, &MENUS, &PAGES, &PAGE_DATA, &USERS]
@@ -199,8 +199,8 @@ mod tests {
     #[test]
     fn tables() {
         assert_eq!(written_table("insert into \"portal_setting\" (a) values (1)").as_deref(), Some("portal_setting"));
-        assert_eq!(written_table("insert into tree_node(a) values (1)").as_deref(), Some("tree_node"));
-        assert_eq!(written_table("UPDATE public.iap_user set x=1").as_deref(), Some("iap_user"));
+        assert_eq!(written_table("insert into portal_tree_node(a) values (1)").as_deref(), Some("portal_tree_node"));
+        assert_eq!(written_table("UPDATE public.portal_user set x=1").as_deref(), Some("portal_user"));
         assert_eq!(written_table("delete from user_role where id=3").as_deref(), Some("user_role"));
         assert_eq!(written_table("alter table if exists portal_page add column x int").as_deref(), Some("portal_page"));
     }
@@ -211,6 +211,6 @@ mod tests {
         assert!(!m("select 1;"));
         assert!(!m("select $$a;b$$"));
         assert!(m("update a set x=1; update portal_setting set y=2"));
-        assert!(m("select 1; delete from tree"));
+        assert!(m("select 1; delete from portal_tree"));
     }
 }

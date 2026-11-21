@@ -12,12 +12,12 @@ use axum::response::Response;
 use serde_json::{json, Value};
 
 async fn tree_of(ctx: &Ctx, tree_id: i64) -> Option<Row> {
-    ctx.db().get("tree", tree_id).await.ok().flatten()
+    ctx.db().get("portal_tree", tree_id).await.ok().flatten()
 }
 
 /// A node and its tree, if the user may administer the tree's module.
 async fn node_and_tree(ctx: &Ctx, id: i64) -> Result<(Row, Row), (StatusCode, &'static str)> {
-    let node = ctx.db().get("tree_node", id).await.ok().flatten().ok_or((StatusCode::NOT_FOUND, "Tree node not found"))?;
+    let node = ctx.db().get("portal_tree_node", id).await.ok().flatten().ok_or((StatusCode::NOT_FOUND, "Tree node not found"))?;
     let tree = tree_of(ctx, i(&node, "tree_id").unwrap_or(0)).await.ok_or((StatusCode::NOT_FOUND, "Tree not found"))?;
     if !ctx.can_admin(&s(&tree, "module")).await {
         return Err((StatusCode::FORBIDDEN, "You are not authorized to manage this tree"));
@@ -30,7 +30,7 @@ async fn root_id(ctx: &Ctx, tree: &Row) -> Option<i64> {
     if let Some(r) = i(tree, "root_id") {
         return Some(r);
     }
-    ctx.db().first("select id from tree_node where tree_id=:t and parent_id is null order by lft nulls last, id limit 1", &row! {"t"=>i(tree, "id")}).await.ok().flatten().and_then(|r| i(&r, "id"))
+    ctx.db().first("select id from portal_tree_node where tree_id=:t and parent_id is null order by lft nulls last, id limit 1", &row! {"t"=>i(tree, "id")}).await.ok().flatten().and_then(|r| i(&r, "id"))
 }
 
 /// Where the Grails portal goes after any change: the root's page with the node selected.
@@ -94,7 +94,7 @@ fn posted_node(ctx: &Ctx, edit: bool) -> Row {
 fn nodes_li(nodes: &[Row], users: &[Row], n: &Row, o: &mut String) {
     let id = i(n, "id");
     let us: Vec<&Row> = users.iter().filter(|u| i(u, "node_id") == id).collect();
-    let who = if us.len() == 1 { format!(" - {}: {} ({})", esc(&s(us[0], "role")), esc(&s(us[0], "emp_name")), esc(&s(us[0], "staffid"))) } else { String::new() };
+    let who = if us.len() == 1 { format!(" - {}: {} ({})", esc(&s(us[0], "role")), esc(&s(us[0], "name")), esc(&s(us[0], "userid"))) } else { String::new() };
     o.push_str(&format!("<li class='jstree-drop' id='{}'><a href='#'>{}{}</a>", id.unwrap_or(0), esc(&s(n, "name")), who));
     let kids: Vec<&Row> = nodes.iter().filter(|c| i(c, "parent_id") == id).collect();
     if !kids.is_empty() {
@@ -219,8 +219,8 @@ async fn show(mut ctx: Ctx, id: i64) -> Response {
         Err((c, m)) => return ctx.status(c, m).await,
     };
     let tid = i(&tree, "id").unwrap_or(0);
-    let nodes = ctx.db().rows("select id, parent_id, name from tree_node where tree_id=:t order by lft nulls last, id", &row! {"t"=>tid}).await.unwrap_or_default();
-    let users = ctx.db().rows("select tnu.node_id, tnu.role, u.emp_name, u.staffid from tree_node_user tnu join tree_node n on n.id=tnu.node_id join iap_user u on u.id=tnu.user_id where n.tree_id=:t", &row! {"t"=>tid}).await.unwrap_or_default();
+    let nodes = ctx.db().rows("select id, parent_id, name from portal_tree_node where tree_id=:t order by lft nulls last, id", &row! {"t"=>tid}).await.unwrap_or_default();
+    let users = ctx.db().rows("select tnu.node_id, tnu.role, u.name, u.userid from portal_tree_node_user tnu join portal_tree_node n on n.id=tnu.node_id join portal_user u on u.id=tnu.user_id where n.tree_id=:t", &row! {"t"=>tid}).await.unwrap_or_default();
     let mut list = String::new();
     nodes_li(&nodes, &users, &node, &mut list);
     let selected = ctx.pi("nodeid").unwrap_or(id);
@@ -325,9 +325,9 @@ async fn node_json(ctx: Ctx, id: i64) -> Response {
         Err((c, m)) => return ctx.status(c, m).await,
     };
     let db = ctx.db();
-    let users = db.rows("select tnu.id, tnu.user_id, tnu.role, u.emp_name, u.staffid from tree_node_user tnu join iap_user u on u.id=tnu.user_id where tnu.node_id=:n order by tnu.role, u.emp_name", &row! {"n"=>id}).await.unwrap_or_default();
+    let users = db.rows("select tnu.id, tnu.user_id, tnu.role, u.name, u.userid from portal_tree_node_user tnu join portal_user u on u.id=tnu.user_id where tnu.node_id=:n order by tnu.role, u.name", &row! {"n"=>id}).await.unwrap_or_default();
     // ancestors, root first (the Grails portal's getfullpath)
-    let path = db.rows("select name from tree_node where tree_id=:t and lft<:l and rgt>:r order by lft", &row! {"t"=>i(&node, "tree_id"),"l"=>i(&node, "lft").unwrap_or(0),"r"=>i(&node, "rgt").unwrap_or(0)}).await.unwrap_or_default();
+    let path = db.rows("select name from portal_tree_node where tree_id=:t and lft<:l and rgt>:r order by lft", &row! {"t"=>i(&node, "tree_id"),"l"=>i(&node, "lft").unwrap_or(0),"r"=>i(&node, "rgt").unwrap_or(0)}).await.unwrap_or_default();
     let mut names: Vec<String> = path.iter().map(|r| s(r, "name")).collect();
     names.push(s(&node, "name"));
     let canswitch = ctx.is_admin() && !ctx.sess.contains_key("adminlink");
@@ -338,7 +338,7 @@ async fn node_json(ctx: Ctx, id: i64) -> Response {
             "domainid": node.get("domainid").cloned().unwrap_or(Value::Null), "data": s(&node, "data"),
             "lft": node.get("lft").cloned().unwrap_or(Value::Null), "rgt": node.get("rgt").cloned().unwrap_or(Value::Null),
             "parent": node.get("parent_id").cloned().unwrap_or(Value::Null),
-            "users": users.iter().map(|u| json!({"id": i(u, "id"), "user_id": i(u, "user_id"), "name": format!("{} ({})", s(u, "emp_name"), s(u, "staffid")), "role": s(u, "role"), "staff_id": s(u, "staffid")})).collect::<Vec<_>>(),
+            "users": users.iter().map(|u| json!({"id": i(u, "id"), "user_id": i(u, "user_id"), "name": format!("{} ({})", s(u, "name"), s(u, "userid")), "role": s(u, "role"), "staff_id": s(u, "userid")})).collect::<Vec<_>>(),
         }
     });
     ctx.json(v).await
@@ -356,7 +356,7 @@ async fn movenode(ctx: Ctx) -> Response {
     };
     let tid = i(&tree, "id").unwrap_or(0);
     let db = ctx.db();
-    let all = db.rows("select id, parent_id from tree_node where tree_id=:t order by lft nulls last, id", &row! {"t"=>tid}).await.unwrap_or_default();
+    let all = db.rows("select id, parent_id from portal_tree_node where tree_id=:t order by lft nulls last, id", &row! {"t"=>tid}).await.unwrap_or_default();
     if !all.iter().any(|n| i(n, "id") == Some(r)) {
         return ctx.status(StatusCode::BAD_REQUEST, "Nodes can only be moved within their own tree").await;
     }
@@ -371,10 +371,10 @@ async fn movenode(ctx: Ctx) -> Response {
     let mut sibs: Vec<i64> = all.iter().filter(|n| i(n, "parent_id") == Some(r) && i(n, "id") != Some(o)).filter_map(|n| i(n, "id")).collect();
     let pos = ctx.pi("p").unwrap_or(sibs.len() as i64).clamp(0, sibs.len() as i64) as usize;
     sibs.insert(pos, o);
-    let _ = db.exec("update tree_node set parent_id=:r where id=:o", &row! {"r"=>r,"o"=>o}).await;
+    let _ = db.exec("update portal_tree_node set parent_id=:r where id=:o", &row! {"r"=>r,"o"=>o}).await;
     // rebuild() keeps siblings in lft order, so number them in their new order first
     for (ix, sid) in sibs.iter().enumerate() {
-        let _ = db.exec("update tree_node set lft=:l where id=:id", &row! {"l"=>ix as i64,"id"=>*sid}).await;
+        let _ = db.exec("update portal_tree_node set lft=:l where id=:id", &row! {"l"=>ix as i64,"id"=>*sid}).await;
     }
     let _ = rebuild(db, tid).await;
     crate::cache::MENUS.clear();
@@ -397,13 +397,13 @@ async fn user_form(mut ctx: Ctx) -> Response {
     let user = ctx.pi("user");
     // the row being changed must belong to this node
     let tnu = match ctx.pi("usernodeid") {
-        Some(x) => db.get("tree_node_user", x).await.ok().flatten().filter(|r| i(r, "node_id") == Some(nid)),
+        Some(x) => db.get("portal_tree_node_user", x).await.ok().flatten().filter(|r| i(r, "node_id") == Some(nid)),
         None => None,
     };
     match ctx.p("nodeaction").as_str() {
         "new" => match user {
             Some(u) if !role.is_empty() => {
-                let _ = db.insert("tree_node_user", &row! {"node_id"=>nid,"user_id"=>u,"role"=>role}).await;
+                let _ = db.insert("portal_tree_node_user", &row! {"node_id"=>nid,"user_id"=>u,"role"=>role}).await;
                 ctx.flash("User added to the node");
             }
             _ => ctx.flash("Choose a user and enter a role"),
@@ -411,10 +411,10 @@ async fn user_form(mut ctx: Ctx) -> Response {
         "edit" => match (tnu, user) {
             (Some(t), Some(u)) if !role.is_empty() => {
                 let tid = i(&t, "id").unwrap_or(0);
-                let _ = db.update("tree_node_user", tid, &row! {"user_id"=>u,"role"=>role}).await;
+                let _ = db.update("portal_tree_node_user", tid, &row! {"user_id"=>u,"role"=>role}).await;
                 // the row now belongs to someone else: the previous holder stops acting as it
                 if i(&t, "user_id") != Some(u) {
-                    let _ = db.exec("update iap_user set roletargetid=null where roletargetid=:t and id<>:u", &row! {"t"=>tid,"u"=>u}).await;
+                    let _ = db.exec("update portal_user set roletargetid=null where roletargetid=:t and id<>:u", &row! {"t"=>tid,"u"=>u}).await;
                 }
                 ctx.flash("Node user updated");
             }
@@ -423,8 +423,8 @@ async fn user_form(mut ctx: Ctx) -> Response {
         "delete" => {
             if let Some(t) = tnu {
                 let tid = i(&t, "id").unwrap_or(0);
-                let _ = db.exec("update iap_user set roletargetid=null where roletargetid=:t", &row! {"t"=>tid}).await;
-                let _ = db.delete("tree_node_user", tid).await;
+                let _ = db.exec("update portal_user set roletargetid=null where roletargetid=:t", &row! {"t"=>tid}).await;
+                let _ = db.delete("portal_tree_node_user", tid).await;
                 ctx.flash("User removed from the node");
             }
         }
@@ -485,7 +485,7 @@ async fn create(mut ctx: Ctx) -> Response {
             d.insert("tree_id".into(), json!(i(&tree, "id")));
             d.insert("parent_id".into(), json!(parent));
             d.insert("disabled".into(), json!(false));
-            match ctx.db().insert("tree_node", &d).await {
+            match ctx.db().insert("portal_tree_node", &d).await {
                 Ok(nid) => {
                     let _ = rebuild(ctx.db(), i(&tree, "id").unwrap_or(0)).await;
                     crate::cache::MENUS.clear();
@@ -520,7 +520,7 @@ async fn edit(mut ctx: Ctx, id: i64) -> Response {
         if s(&d, "name").is_empty() {
             ctx.flash("Name is required");
         } else {
-            match ctx.db().update("tree_node", id, &d).await {
+            match ctx.db().update("portal_tree_node", id, &d).await {
                 Ok(_) => {
                     crate::cache::MENUS.clear();
                     ctx.flash(&format!("PortalTreeNode {} updated", id));
@@ -567,7 +567,7 @@ async fn delete(mut ctx: Ctx, id: i64) -> Response {
 
 /// /portalTreeNode/fixnodes: renumber lft/rgt of every tree the user manages.
 async fn fixnodes(mut ctx: Ctx) -> Response {
-    let trees = ctx.db().rows("select id, module from tree order by id", &db::no_params()).await.unwrap_or_default();
+    let trees = ctx.db().rows("select id, module from portal_tree order by id", &db::no_params()).await.unwrap_or_default();
     let mut n = 0;
     for t in &trees {
         if ctx.can_admin(&s(t, "module")).await {
@@ -616,8 +616,8 @@ pub async fn tree_action(mut ctx: Ctx, action: &str, id: Option<i64>) -> Respons
             let tid = i(&tree, "id").unwrap_or(0);
             if action == "create_root" {
                 if root_id(&ctx, &tree).await.is_none() {
-                    if let Ok(r) = ctx.db().insert("tree_node", &row! {"tree_id"=>tid,"name"=>s(&tree, "name"),"disabled"=>false}).await {
-                        let _ = ctx.db().update("tree", tid, &row! {"root_id"=>r}).await;
+                    if let Ok(r) = ctx.db().insert("portal_tree_node", &row! {"tree_id"=>tid,"name"=>s(&tree, "name"),"disabled"=>false}).await {
+                        let _ = ctx.db().update("portal_tree", tid, &row! {"root_id"=>r}).await;
                         let _ = rebuild(ctx.db(), tid).await;
                     }
                 }
@@ -731,6 +731,6 @@ pub async fn user_api_list(ctx: Ctx) -> Response {
     }
     let q = ctx.p("q");
     let like = format!("%{}%", q.trim());
-    let rows = ctx.db().rows("select id, emp_name, staffid from iap_user where isactive is not false and (emp_name ilike :q or staffid ilike :q or new_staffid ilike :q) order by emp_name limit 30", &row! {"q"=>like}).await.unwrap_or_default();
-    ctx.json(json!({"users": rows.iter().map(|r| json!({"id": i(r, "id"), "name": format!("{} ({})", s(r, "emp_name"), s(r, "staffid"))})).collect::<Vec<_>>()})).await
+    let rows = ctx.db().rows("select id, name, userid from portal_user where is_active is not false and (name ilike :q or userid ilike :q) order by name limit 30", &row! {"q"=>like}).await.unwrap_or_default();
+    ctx.json(json!({"users": rows.iter().map(|r| json!({"id": i(r, "id"), "name": format!("{} ({})", s(r, "name"), s(r, "userid"))})).collect::<Vec<_>>()})).await
 }

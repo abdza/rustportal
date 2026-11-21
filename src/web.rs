@@ -69,8 +69,8 @@ pub struct Config {
     /// on a Grails portal's database with its own copy of the pages beside the other's
     pub page_table: String,
     pub page_data_table: String,
-    /// the database is a g6 Grails portal's (portal_user, portal_tree...): this
-    /// portal reaches those tables through views under its own names
+    /// g6 Grails portal compatibility mode (GSP role rules, raw HTML field
+    /// display, g6 file link rules, etc.)
     pub g6_schema: bool,
     /// run scheduled pages and send queued e-mail. Off when another portal on the
     /// same database already does, or every job would run twice.
@@ -455,12 +455,12 @@ impl FromRequest<St> for Ctx {
     }
 }
 
-/// Load a user row for use by pages and scripts. Secrets are stripped and a
-/// few friendly aliases are added (`name`, `isAdmin`, `staffID`).
+/// Load a user row for use by pages and scripts. Secrets are stripped and
+/// compatibility aliases are added (`emp_name`, `isAdmin`, `isActive`, `isactive`, `userID`, `staffid`, `staffID`).
 pub async fn load_user(db: &Db, id: i64) -> Option<Row> {
     let v = crate::cache::USERS
         .get_or(format!("u:{}", id), async {
-            match db.get("iap_user", id).await.ok().flatten() {
+            match db.get("portal_user", id).await.ok().flatten() {
                 Some(mut u) => {
                     clean_user(&mut u);
                     Value::Object(u)
@@ -485,16 +485,21 @@ pub fn clean_user(u: &mut Row) {
     for k in ["password", "password5", "secretanswer", "version"] {
         u.remove(k);
     }
-    let name = u.get("emp_name").cloned().unwrap_or(Value::Null);
-    u.insert("name".into(), name);
+    let name = u.get("name").cloned().unwrap_or(Value::Null);
+    u.insert("emp_name".into(), name);
     let adm = u.get("is_admin").cloned().unwrap_or(Value::Bool(false));
     u.insert("isAdmin".into(), adm);
-    let sid = u.get("staffid").cloned().unwrap_or(Value::Null);
-    u.insert("staffID".into(), sid);
+    let act = u.get("is_active").cloned().unwrap_or(Value::Bool(false));
+    u.insert("isActive".into(), act.clone());
+    u.insert("isactive".into(), act);
+    let uid = u.get("userid").cloned().unwrap_or(Value::Null);
+    u.insert("userID".into(), uid.clone());
+    u.insert("staffid".into(), uid.clone());
+    u.insert("staffID".into(), uid);
 }
 
 pub async fn find_user_by_staffid(db: &Db, staffid: &str) -> Option<Row> {
-    db.first("select * from iap_user where staffid=:s or new_staffid=:s order by id limit 1", &row! {"s"=>staffid}).await.ok().flatten()
+    db.first("select * from portal_user where userid=:s order by id limit 1", &row! {"s"=>staffid}).await.ok().flatten()
 }
 
 pub async fn setting(db: &Db, name: &str) -> Option<Value> {
@@ -602,7 +607,7 @@ pub async fn current_role(db: &Db, user: &Row) -> Option<Row> {
         .get_or(format!("r:{}", i(user, "id").unwrap_or(0)), async {
     let uid = i(user, "id").unwrap_or(0);
     db.first(
-        "select tnu.role, tnu.node_id, n.name as node_name, n.tree_id from tree_node_user tnu left join tree_node n on n.id=tnu.node_id where tnu.user_id=:u order by tnu.id limit 1",
+        "select tnu.role, tnu.node_id, n.name as node_name, n.tree_id from portal_tree_node_user tnu left join portal_tree_node n on n.id=tnu.node_id where tnu.user_id=:u order by tnu.id limit 1",
         &row! {"u"=>uid},
     )
     .await
@@ -856,7 +861,7 @@ impl Ctx {
             if let Some(uid) = i(u, "id") {
                 let rows = db
                     .rows(
-                        "select tnu.id, tnu.role, n.name as node_name from tree_node_user tnu left join tree_node n on n.id=tnu.node_id where tnu.user_id=:u order by tnu.id",
+                        "select tnu.id, tnu.role, n.name as node_name from portal_tree_node_user tnu left join portal_tree_node n on n.id=tnu.node_id where tnu.user_id=:u order by tnu.id",
                         &row! {"u"=>uid},
                     )
                     .await

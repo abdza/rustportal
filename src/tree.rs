@@ -61,8 +61,8 @@ async fn tree_nodes(db: &Db, module: &str, name: &str) -> Option<(Row, Vec<Row>)
 }
 
 async fn tree_nodes_db(db: &Db, module: &str, name: &str) -> Option<(Row, Vec<Row>)> {
-    let tree = db.first("select * from tree where module=:m and name=:n order by id limit 1", &row! {"m"=>module,"n"=>name}).await.ok().flatten()?;
-    let nodes = db.rows("select * from tree_node where tree_id=:t and disabled is not true order by lft nulls last, id", &row! {"t"=>i(&tree, "id")}).await.ok()?;
+    let tree = db.first("select * from portal_tree where module=:m and name=:n order by id limit 1", &row! {"m"=>module,"n"=>name}).await.ok().flatten()?;
+    let nodes = db.rows("select * from portal_tree_node where tree_id=:t and disabled is not true order by lft nulls last, id", &row! {"t"=>i(&tree, "id")}).await.ok()?;
     Some((tree, nodes))
 }
 
@@ -125,7 +125,7 @@ pub async fn side_menu(db: &Db, name: &str, module_admin: bool) -> String {
 
 /// Recompute lft/rgt for a whole tree from the parent links.
 pub async fn rebuild(db: &Db, tree_id: i64) -> anyhow::Result<()> {
-    let nodes = db.rows("select id,parent_id,lft from tree_node where tree_id=:t order by lft nulls last, id", &row! {"t"=>tree_id}).await?;
+    let nodes = db.rows("select id,parent_id,lft from portal_tree_node where tree_id=:t order by lft nulls last, id", &row! {"t"=>tree_id}).await?;
     fn walk(nodes: &[Row], id: i64, counter: &mut i64, out: &mut Vec<(i64, i64, i64)>) {
         let lft = *counter;
         *counter += 1;
@@ -141,10 +141,10 @@ pub async fn rebuild(db: &Db, tree_id: i64) -> anyhow::Result<()> {
         walk(&nodes, i(r, "id").unwrap_or(0), &mut counter, &mut out);
     }
     for (id, l, r) in out {
-        db.exec("update tree_node set lft=:l, rgt=:r where id=:id", &row! {"l"=>l,"r"=>r,"id"=>id}).await?;
+        db.exec("update portal_tree_node set lft=:l, rgt=:r where id=:id", &row! {"l"=>l,"r"=>r,"id"=>id}).await?;
     }
     if let Some(root) = nodes.iter().find(|n| i(n, "parent_id").is_none()).and_then(|n| i(n, "id")) {
-        db.exec("update tree set root_id=:r where id=:t and root_id is null", &row! {"r"=>root,"t"=>tree_id}).await?;
+        db.exec("update portal_tree set root_id=:r where id=:t and root_id is null", &row! {"r"=>root,"t"=>tree_id}).await?;
     }
     Ok(())
 }
@@ -163,10 +163,10 @@ fn node_key(n: &Row) -> String {
 
 /// One tree as the Grails portal exports it.
 pub async fn export_tree(db: &Db, tree_id: i64, staff_on: bool) -> anyhow::Result<Value> {
-    let tree = db.get("tree", tree_id).await?.ok_or_else(|| anyhow::anyhow!("tree {} not found", tree_id))?;
-    let nodes = db.rows("select * from tree_node where tree_id=:t order by lft nulls last, id", &row! {"t"=>tree_id}).await?;
+    let tree = db.get("portal_tree", tree_id).await?.ok_or_else(|| anyhow::anyhow!("tree {} not found", tree_id))?;
+    let nodes = db.rows("select * from portal_tree_node where tree_id=:t order by lft nulls last, id", &row! {"t"=>tree_id}).await?;
     let users = if staff_on {
-        db.rows("select tnu.node_id, tnu.role, coalesce(nullif(u.new_staffid,''), u.staffid) as staffid from tree_node_user tnu join tree_node n on n.id=tnu.node_id join iap_user u on u.id=tnu.user_id where n.tree_id=:t order by 3, 2", &row! {"t"=>tree_id}).await?
+        db.rows("select tnu.node_id, tnu.role, u.userid as staffid from portal_tree_node_user tnu join portal_tree_node n on n.id=tnu.node_id join portal_user u on u.id=tnu.user_id where n.tree_id=:t order by 3, 2", &row! {"t"=>tree_id}).await?
     } else {
         vec![]
     };
@@ -250,16 +250,16 @@ pub async fn import_tree(db: &Db, itree: &Row, module: Option<&str>, staff_on: b
     }
     let module = module.map(String::from).unwrap_or_else(|| { let m = s(itree, "module"); if m.is_empty() { "portal".into() } else { m } });
     let date = |k: &str| { let v = s(itree, k); if v.len() >= 10 { Value::String(v[..10].to_string()) } else { Value::Null } };
-    let tree_id = match db.first("select id from tree where module=:m and name=:n order by id limit 1", &row! {"m"=>module.clone(),"n"=>name.clone()}).await? {
+    let tree_id = match db.first("select id from portal_tree where module=:m and name=:n order by id limit 1", &row! {"m"=>module.clone(),"n"=>name.clone()}).await? {
         Some(t) => {
             let id = i(&t, "id").unwrap_or(0);
-            db.update("tree", id, &row! {"valid"=>date("valid"),"expire"=>date("expire")}).await?;
+            db.update("portal_tree", id, &row! {"valid"=>date("valid"),"expire"=>date("expire")}).await?;
             st.trees_updated += 1;
             id
         }
         None => {
             st.trees_added += 1;
-            db.insert("tree", &row! {"module"=>module.clone(),"name"=>name.clone(),"valid"=>date("valid"),"expire"=>date("expire")}).await?
+            db.insert("portal_tree", &row! {"module"=>module.clone(),"name"=>name.clone(),"valid"=>date("valid"),"expire"=>date("expire")}).await?
         }
     };
     let inodes: Vec<Value> = match itree.get("nodes") {
@@ -273,9 +273,9 @@ pub async fn import_tree(db: &Db, itree: &Row, module: Option<&str>, staff_on: b
     rebuild(db, tree_id).await?;
     let root_key = s(itree, "root");
     if !root_key.is_empty() {
-        let roots = db.rows("select * from tree_node where tree_id=:t and parent_id is null order by lft nulls last, id", &row! {"t"=>tree_id}).await?;
+        let roots = db.rows("select * from portal_tree_node where tree_id=:t and parent_id is null order by lft nulls last, id", &row! {"t"=>tree_id}).await?;
         if let Some(r) = roots.iter().find(|n| node_key(n) == root_key) {
-            db.update("tree", tree_id, &row! {"root_id"=>i(r, "id")}).await?;
+            db.update("portal_tree", tree_id, &row! {"root_id"=>i(r, "id")}).await?;
         }
     }
     Ok(tree_id)
@@ -284,8 +284,8 @@ pub async fn import_tree(db: &Db, itree: &Row, module: Option<&str>, staff_on: b
 fn import_nodes<'a>(db: &'a Db, tree_id: i64, parent: Option<i64>, inodes: &'a [Value], staff_on: bool, st: &'a mut ImportStats) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let existing = match parent {
-            Some(p) => db.rows("select * from tree_node where parent_id=:p order by lft nulls last, id", &row! {"p"=>p}).await?,
-            None => db.rows("select * from tree_node where tree_id=:t and parent_id is null order by lft nulls last, id", &row! {"t"=>tree_id}).await?,
+            Some(p) => db.rows("select * from portal_tree_node where parent_id=:p order by lft nulls last, id", &row! {"p"=>p}).await?,
+            None => db.rows("select * from portal_tree_node where tree_id=:t and parent_id is null order by lft nulls last, id", &row! {"t"=>tree_id}).await?,
         };
         let mut pool: Vec<(String, i64)> = existing.iter().map(|n| (node_key(n), i(n, "id").unwrap_or(0))).collect();
         for v in inodes {
@@ -298,7 +298,7 @@ fn import_nodes<'a>(db: &'a Db, tree_id: i64, parent: Option<i64>, inodes: &'a [
             let nid = match pool.iter().position(|(k, _)| *k == key) {
                 Some(ix) => {
                     let id = pool.remove(ix).1;
-                    db.update("tree_node", id, &d).await?;
+                    db.update("portal_tree_node", id, &d).await?;
                     st.nodes_updated += 1;
                     id
                 }
@@ -306,18 +306,19 @@ fn import_nodes<'a>(db: &'a Db, tree_id: i64, parent: Option<i64>, inodes: &'a [
                     d.insert("tree_id".into(), serde_json::json!(tree_id));
                     d.insert("parent_id".into(), parent.map(|p| serde_json::json!(p)).unwrap_or(Value::Null));
                     st.nodes_added += 1;
-                    db.insert("tree_node", &d).await?
+                    db.insert("portal_tree_node", &d).await?
                 }
             };
             if staff_on {
                 if let Some(Value::Array(us)) = n.get("users") {
                     for u in us.iter().filter_map(|u| u.as_object()) {
-                        let (sid, role) = (s(u, "staffid"), s(u, "role"));
+                        let sid = { let x = s(u, "userid"); if x.is_empty() { s(u, "staffid") } else { x } };
+                        let role = s(u, "role");
                         match crate::web::find_user_by_staffid(db, &sid).await {
                             Some(user) => {
                                 let p = row! {"n"=>nid,"u"=>i(&user, "id"),"r"=>role.clone()};
-                                if db.count("select count(*) from tree_node_user where node_id=:n and user_id=:u and role=:r", &p).await? == 0 {
-                                    db.insert("tree_node_user", &row! {"node_id"=>nid,"user_id"=>i(&user, "id"),"role"=>role}).await?;
+                                if db.count("select count(*) from portal_tree_node_user where node_id=:n and user_id=:u and role=:r", &p).await? == 0 {
+                                    db.insert("portal_tree_node_user", &row! {"node_id"=>nid,"user_id"=>i(&user, "id"),"role"=>role}).await?;
                                     st.users_added += 1;
                                 }
                             }
@@ -340,7 +341,7 @@ fn import_nodes<'a>(db: &'a Db, tree_id: i64, parent: Option<i64>, inodes: &'a [
 /// Delete a node with everything under it, its role holders, and a tree's root
 /// pointer to any of them; then renumber the tree.
 pub async fn delete_node_deep(db: &Db, tree_id: i64, id: i64) -> anyhow::Result<()> {
-    let all = db.rows("select id, parent_id from tree_node where tree_id=:t", &row! {"t"=>tree_id}).await?;
+    let all = db.rows("select id, parent_id from portal_tree_node where tree_id=:t", &row! {"t"=>tree_id}).await?;
     let mut gone = vec![id];
     let mut ix = 0;
     while ix < gone.len() {
@@ -349,10 +350,10 @@ pub async fn delete_node_deep(db: &Db, tree_id: i64, id: i64) -> anyhow::Result<
         ix += 1;
     }
     let list = crate::db::lit(&json!(gone));
-    db.exec(&format!("update iap_user set roletargetid=null where roletargetid in (select id from tree_node_user where node_id in {})", list), &crate::db::no_params()).await?;
-    db.exec(&format!("delete from tree_node_user where node_id in {}", list), &crate::db::no_params()).await?;
-    db.exec(&format!("update tree set root_id=null where root_id in {}", list), &crate::db::no_params()).await?;
-    db.exec(&format!("delete from tree_node where id in {}", list), &crate::db::no_params()).await?;
+    db.exec(&format!("update portal_user set roletargetid=null where roletargetid in (select id from portal_tree_node_user where node_id in {})", list), &crate::db::no_params()).await?;
+    db.exec(&format!("delete from portal_tree_node_user where node_id in {}", list), &crate::db::no_params()).await?;
+    db.exec(&format!("update portal_tree set root_id=null where root_id in {}", list), &crate::db::no_params()).await?;
+    db.exec(&format!("delete from portal_tree_node where id in {}", list), &crate::db::no_params()).await?;
     rebuild(db, tree_id).await?;
     crate::cache::MENUS.clear();
     Ok(())
@@ -362,33 +363,33 @@ pub async fn delete_node_deep(db: &Db, tree_id: i64, id: i64) -> anyhow::Result<
 /// missing. Returns the tree row (with root_id) and whether it was created.
 pub async fn ensure_tree(db: &Db, module: &str, name: &str) -> anyhow::Result<(Row, bool)> {
     let mut created = false;
-    let tid = match db.first("select id from tree where module=:m and name=:n", &row! {"m"=>module,"n"=>name}).await? {
+    let tid = match db.first("select id from portal_tree where module=:m and name=:n", &row! {"m"=>module,"n"=>name}).await? {
         Some(t) => i(&t, "id").unwrap_or(0),
         None => {
             created = true;
-            db.insert("tree", &row! {"module"=>module,"name"=>name}).await?
+            db.insert("portal_tree", &row! {"module"=>module,"name"=>name}).await?
         }
     };
-    let t = db.first("select * from tree where id=:t", &row! {"t"=>tid}).await?.unwrap_or_default();
+    let t = db.first("select * from portal_tree where id=:t", &row! {"t"=>tid}).await?.unwrap_or_default();
     let root_ok = match i(&t, "root_id") {
-        Some(r) => db.first("select id from tree_node where id=:r", &row! {"r"=>r}).await?.is_some(),
+        Some(r) => db.first("select id from portal_tree_node where id=:r", &row! {"r"=>r}).await?.is_some(),
         None => false,
     };
     if !root_ok {
-        let rid = db.insert("tree_node", &row! {"tree_id"=>tid,"name"=>name}).await?;
-        db.exec("update tree set root_id=:r where id=:t", &row! {"r"=>rid,"t"=>tid}).await?;
+        let rid = db.insert("portal_tree_node", &row! {"tree_id"=>tid,"name"=>name}).await?;
+        db.exec("update portal_tree set root_id=:r where id=:t", &row! {"r"=>rid,"t"=>tid}).await?;
         rebuild(db, tid).await?;
     }
-    let t = db.first("select * from tree where id=:t", &row! {"t"=>tid}).await?.unwrap_or_default();
+    let t = db.first("select * from portal_tree where id=:t", &row! {"t"=>tid}).await?.unwrap_or_default();
     crate::cache::MENUS.clear();
     Ok((t, created))
 }
 
 /// Add a node as the last child of `parent`; returns its id.
 pub async fn add_node(db: &Db, parent: i64, name: &str, slug: Option<&str>, data: Option<&str>) -> anyhow::Result<i64> {
-    let p = db.first("select id, tree_id from tree_node where id=:p", &row! {"p"=>parent}).await?.ok_or_else(|| anyhow::anyhow!("tree node {} not found", parent))?;
+    let p = db.first("select id, tree_id from portal_tree_node where id=:p", &row! {"p"=>parent}).await?.ok_or_else(|| anyhow::anyhow!("tree node {} not found", parent))?;
     let tid = i(&p, "tree_id").unwrap_or(0);
-    let id = db.insert("tree_node", &row! {"tree_id"=>tid,"parent_id"=>parent,"name"=>name,"slug"=>slug,"data"=>data}).await?;
+    let id = db.insert("portal_tree_node", &row! {"tree_id"=>tid,"parent_id"=>parent,"name"=>name,"slug"=>slug,"data"=>data}).await?;
     rebuild(db, tid).await?;
     crate::cache::MENUS.clear();
     Ok(id)

@@ -35,7 +35,7 @@ pub async fn serve(ctx: Ctx, module: String, slug: String, rest: String) -> Resp
     match s(&ep, "auth_mode").as_str() {
         "None" => {}
         "Session" => match &ctx.user {
-            Some(u) if role_ok(&ctx, &ep, u).await => remote_user = s(u, "staffid"),
+            Some(u) if role_ok(&ctx, &ep, u).await => remote_user = s(u, "userid"),
             _ => return plain(StatusCode::FORBIDDEN, "Forbidden"),
         },
         "Token" => {
@@ -52,7 +52,7 @@ pub async fn serve(ctx: Ctx, module: String, slug: String, rest: String) -> Resp
             let mut ok = false;
             if let Some((u, p)) = creds.as_deref().and_then(|c| c.split_once(':')) {
                 if let Some(user) = web::find_user_by_staffid(ctx.db(), u).await {
-                    if b(&user, "isactive") && bcrypt::verify(p, &s(&user, "password")).unwrap_or(false) && role_ok(&ctx, &ep, &user).await {
+                    if b(&user, "is_active") && bcrypt::verify(p, &s(&user, "password")).unwrap_or(false) && role_ok(&ctx, &ep, &user).await {
                         ok = true;
                         remote_user = u.to_string();
                     }

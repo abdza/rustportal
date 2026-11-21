@@ -35,7 +35,7 @@ async fn user_name(sc: &Sc, id: i64) -> String {
     if let Some(v) = sc.cache_get(&key) {
         return vs(&v);
     }
-    let n = sc.db().first("select emp_name from iap_user where id=:id", &row! {"id"=>id}).await.ok().flatten().map(|r| s(&r, "emp_name")).unwrap_or_default();
+    let n = sc.db().first("select name from portal_user where id=:id", &row! {"id"=>id}).await.ok().flatten().map(|r| s(&r, "name")).unwrap_or_default();
     sc.cache_put(&key, json!(n));
     n
 }
@@ -45,7 +45,7 @@ async fn node_name(sc: &Sc, id: i64) -> String {
     if let Some(v) = sc.cache_get(&key) {
         return vs(&v);
     }
-    let n = sc.db().first("select name from tree_node where id=:id", &row! {"id"=>id}).await.ok().flatten().map(|r| s(&r, "name")).unwrap_or_default();
+    let n = sc.db().first("select name from portal_tree_node where id=:id", &row! {"id"=>id}).await.ok().flatten().map(|r| s(&r, "name")).unwrap_or_default();
     sc.cache_put(&key, json!(n));
     n
 }
@@ -239,9 +239,9 @@ if(df=='Before'){{$('#{n}').val(a?('<'+a):'');}}else if(df=='After'){{$('#{n}').
                 }
             }
         } else if ftype == "User" {
-            let q = format!("select d.v, u.emp_name from ({}) d left join iap_user u on u.id::text = d.v::text order by d.v", distinct.replace(" order by ", " order by ").trim_end());
+            let q = format!("select d.v, u.name from ({}) d left join portal_user u on u.id::text = d.v::text order by d.v", distinct.replace(" order by ", " order by ").trim_end());
             for r in sc.db().rows(&q, &Row::new()).await.unwrap_or_default() {
-                o.push_str(&opt(&s(&r, "v"), &s(&r, "emp_name"), &cur));
+                o.push_str(&opt(&s(&r, "v"), &s(&r, "name"), &cur));
             }
         } else if ftype == "Drop Down" {
             for (v, _) in field_options(sc, f, &Row::new()).await {
@@ -1119,7 +1119,7 @@ pub async fn tracker_updates(sc: &Sc, t: &Tracker, id: i64) -> String {
     let uroles = t.user_roles(sc, Some(&datas)).await;
     let trail = db
         .rows(
-            &format!("select tr.*, u.emp_name from {} tr left join iap_user u on u.id=tr.updater_id where tr.record_id=:id order by tr.update_date desc, tr.id desc", qcol(&t.trail_table())),
+            &format!("select tr.*, u.name as updater_name from {} tr left join portal_user u on u.id=tr.updater_id where tr.record_id=:id order by tr.update_date desc, tr.id desc", qcol(&t.trail_table())),
             &row! {"id"=>id},
         )
         .await
@@ -1142,7 +1142,7 @@ pub async fn tracker_updates(sc: &Sc, t: &Tracker, id: i64) -> String {
                 o.push_str(&format!("Attached file : <a href=\"/fileLink/get/{}\">{}</a><br/>", a, esc(&s(&fl, "name"))));
             }
         }
-        o.push_str(&format!("</td><td>{}</td><td>{}</td></tr>", esc(&s(r, "emp_name")), esc(&crate::groovy::java_date(&s(r, "update_date"), "HH:mm a dd-MMM-yy"))));
+        o.push_str(&format!("</td><td>{}</td><td>{}</td></tr>", esc(&s(r, "updater_name")), esc(&crate::groovy::java_date(&s(r, "update_date"), "HH:mm a dd-MMM-yy"))));
     }
     o.push_str("</table>");
     o

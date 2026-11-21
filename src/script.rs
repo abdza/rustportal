@@ -261,10 +261,18 @@ async fn api_user(inner: &Arc<Inner>, id: i64) -> Result<Value> {
     Ok(alias_user(web::load_user(inner.db(), id).await.map(Value::Object).unwrap_or(Value::Null)))
 }
 
-/// Users also answer to the Grails property names (`name`, `staffID`, `isAdmin`).
+/// Users also answer to Grails and legacy property names (`emp_name`, `userID`, `staffid`, `staffID`, `isAdmin`, `isActive`, `isactive`).
 pub fn alias_user(mut u: Value) -> Value {
     if let Value::Object(m) = &mut u {
-        for (alias, col) in [("name", "emp_name"), ("staffID", "staffid"), ("isAdmin", "is_admin"), ("isActive", "isactive")] {
+        for (alias, col) in [
+            ("emp_name", "name"),
+            ("userID", "userid"),
+            ("staffid", "userid"),
+            ("staffID", "userid"),
+            ("isAdmin", "is_admin"),
+            ("isActive", "is_active"),
+            ("isactive", "is_active"),
+        ] {
             if !m.contains_key(alias) {
                 if let Some(v) = m.get(col).cloned() {
                     m.insert(alias.into(), v);
@@ -451,7 +459,7 @@ async fn api_users_with_role(inner: &Arc<Inner>, module: &str, role: &str) -> Re
     let mut rows = inner
         .db()
         .rows(
-            "select u.* from iap_user u where u.isactive is not false and u.id in (select user_id from user_role where module=:m and role=:r) order by u.emp_name",
+            "select u.* from portal_user u where u.is_active is not false and u.id in (select user_id from user_role where module=:m and role=:r) order by u.name",
             &row! {"m"=>module,"r"=>role},
         )
         .await?;
@@ -625,6 +633,7 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     reg!("setting", |x, n: &str, d: Dynamic| api_setting(x, n, d2j(&d)));
     reg!("user", |x, id: i64| api_user(x, id));
     reg!("user_by_staffid", |x, sid: &str| api_user_staff(x, sid));
+    reg!("user_by_userid", |x, sid: &str| api_user_staff(x, sid));
     reg!("users_with_role", |x, m: &str, r: &str| api_users_with_role(x, m, r));
     // may the current user open page module/slug (its allowedroles, as the router checks
     // them)? () when there is no such page
@@ -636,6 +645,7 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
         })
     });
     reg!("module_roles", |x, m: &str| api_module_roles(x, m));
+    reg!("user_roles", |x, m: &str| api_module_roles(x, m));
     reg!("has_role", |x, m: &str, r: &str| async move { Ok(json!(api_module_roles(x, m).await?.as_array().map(|a| a.iter().any(|v| vs(v) == r)).unwrap_or(false))) });
     reg!("user_module_roles", |x, uid: i64, m: &str| async move {
         Ok(match web::load_user(x.db(), uid).await {
@@ -649,6 +659,8 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     reg!("run_page", |x, m: &str, sl: &str, v: Dynamic| run_page(x, m, sl, obj(d2j(&v))));
     reg!("render_page", |x, m: &str, sl: &str| async move { Ok(json!(include_page(x, m, sl, Row::new()).await?)) });
     reg!("render_page", |x, m: &str, sl: &str, v: Dynamic| async move { Ok(json!(include_page(x, m, sl, obj(d2j(&v))).await?)) });
+    reg!("include_page", |x, m: &str, sl: &str| async move { Ok(json!(include_page(x, m, sl, Row::new()).await?)) });
+    reg!("include_page", |x, m: &str, sl: &str, v: Dynamic| async move { Ok(json!(include_page(x, m, sl, obj(d2j(&v))).await?)) });
     reg!("render_text", |x, tpl: &str, v: Dynamic| async move { Sc::from_inner(x.clone()).render(tpl, &obj(d2j(&v)), true).map(|h| json!(h)) });
     reg!("file_info", |x, id: i64| async move { Ok(x.db().get("file_link", id).await?.map(Value::Object).unwrap_or(Value::Null)) });
     reg!("read_excel", |x, id: i64| api_read_excel(x, id, 0));
@@ -671,27 +683,27 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
         Ok(json!(crate::tree::add_node(x.db(), parent, n, sl.as_deref(), da.as_deref()).await?))
     });
     reg!("tree_children", |x, node: i64| async move {
-        Ok(Value::Array(x.db().rows("select * from tree_node where parent_id=:p order by lft, id", &row! {"p"=>node}).await?.into_iter().map(Value::Object).collect()))
+        Ok(Value::Array(x.db().rows("select * from portal_tree_node where parent_id=:p order by lft, id", &row! {"p"=>node}).await?.into_iter().map(Value::Object).collect()))
     });
     reg!("tree_find_node", |x, tid: i64, n: &str| async move {
-        Ok(x.db().first("select * from tree_node where tree_id=:t and name=:n order by lft limit 1", &row! {"t"=>tid,"n"=>n}).await?.map(Value::Object).unwrap_or(Value::Null))
+        Ok(x.db().first("select * from portal_tree_node where tree_id=:t and name=:n order by lft limit 1", &row! {"t"=>tid,"n"=>n}).await?.map(Value::Object).unwrap_or(Value::Null))
     });
     reg!("tree_delete_node", |x, id: i64| async move {
-        if let Some(n) = x.db().first("select tree_id from tree_node where id=:i", &row! {"i"=>id}).await? {
+        if let Some(n) = x.db().first("select tree_id from portal_tree_node where id=:i", &row! {"i"=>id}).await? {
             crate::tree::delete_node_deep(x.db(), i(&n, "tree_id").unwrap_or(0), id).await?;
         }
         Ok(Value::Null)
     });
     reg!("tree_clear", |x, tid: i64| async move {
-        let t = x.db().first("select root_id from tree where id=:t", &row! {"t"=>tid}).await?.unwrap_or_default();
+        let t = x.db().first("select root_id from portal_tree where id=:t", &row! {"t"=>tid}).await?.unwrap_or_default();
         if let Some(root) = i(&t, "root_id") {
-            for c in x.db().rows("select id from tree_node where parent_id=:p", &row! {"p"=>root}).await? {
+            for c in x.db().rows("select id from portal_tree_node where parent_id=:p", &row! {"p"=>root}).await? {
                 crate::tree::delete_node_deep(x.db(), tid, i(&c, "id").unwrap_or(0)).await?;
             }
         }
         Ok(Value::Null)
     });
-    reg!("tree_count", |x, tid: i64| async move { Ok(json!(x.db().count("select count(*) from tree_node where tree_id=:t", &row! {"t"=>tid}).await?)) });
+    reg!("tree_count", |x, tid: i64| async move { Ok(json!(x.db().count("select count(*) from portal_tree_node where tree_id=:t", &row! {"t"=>tid}).await?)) });
     // delete_file(id): remove a stored file, its FileLink, and its folder when that is left empty
     reg!("delete_file", |x, id: i64| async move {
         if let Some(f) = x.db().get("file_link", id).await? {
@@ -932,11 +944,14 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
         Ok(json!(crate::telegram::handle_member_reply(&x.st, chat_id, text, un.as_deref()).await))
     });
     reg!("users_by_profile_id", |x, pid: i64| async move {
-        let rows = x
+        let mut rows = x
             .db()
-            .rows("select id, staffid, emp_name, email, profile_id from iap_user where profile_id=:p order by id", &row! {"p"=>pid})
+            .rows("select id, userid, name, email, profile_id from portal_user where profile_id=:p order by id", &row! {"p"=>pid})
             .await
             .unwrap_or_default();
+        for r in rows.iter_mut() {
+            web::clean_user(r);
+        }
         Ok(Value::Array(rows.into_iter().map(Value::Object).collect()))
     });
     // the visitor's session (keys the portal owns are not visible)
@@ -1010,7 +1025,17 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     });
     // a random whole number from 0 up to (not including) n
     e.register_fn("random_int", |n: i64| -> i64 { if n <= 0 { 0 } else { (uuid::Uuid::new_v4().as_u128() % n as u128) as i64 } });
+    e.register_fn("random_code", |n: i64| -> String {
+        const ALPHA: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        let mut out = String::new();
+        for _ in 0..n.clamp(0, 64) {
+            let idx = (uuid::Uuid::new_v4().as_u128() % ALPHA.len() as u128) as usize;
+            out.push(ALPHA[idx] as char);
+        }
+        out
+    });
     e.register_fn("now", || web::now_str());
+    e.register_fn("now_iso", || web::now_str());
     e.register_fn("today", || chrono::Local::now().format("%Y-%m-%d").to_string());
     e.register_fn("date_add", |d: &str, days: i64| -> String {
         match parse_dt(d) {
@@ -1030,9 +1055,12 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     });
     e.register_fn("format_number", |v: Dynamic, d: i64| fmt_number(&d2j(&v), d.max(0) as usize));
     e.register_fn("json_string", |v: Dynamic| d2j(&v).to_string());
+    e.register_fn("to_json", |v: Dynamic| d2j(&v).to_string());
     e.register_fn("json_parse", |x: &str| j2d(&serde_json::from_str::<Value>(x).unwrap_or(Value::Null)));
+    e.register_fn("parse_json", |x: &str| j2d(&serde_json::from_str::<Value>(x).unwrap_or(Value::Null)));
     e.register_fn("url_encode", |x: &str| web::enc(x));
     e.register_fn("html_escape", |x: &str| web::esc(x));
+    e.register_fn("escape_html", |x: &str| web::esc(x));
     e.register_fn("sql_quote", |v: Dynamic| db::lit(&d2j(&v)));
     e.register_fn("to_string", |v: Dynamic| vs(&d2j(&v)));
     e.register_fn("regex_match", |pat: &str, x: &str| regex::Regex::new(pat).map(|r| r.is_match(x)).unwrap_or(false));
@@ -1360,7 +1388,7 @@ impl Sc {
         });
         func!("setting", |x, a, kw| async move { Ok(j2m(&api_setting(x, &arg(&a, 0), a.get(1).map(m2j).unwrap_or(Value::Null)).await?)) });
         func!("user", |x, a, kw| async move { Ok(j2m(&api_user(x, arg(&a, 0).parse().unwrap_or(0)).await?)) });
-        func!("user_name", |x, a, kw| async move { Ok(MV::from(api_user(x, arg(&a, 0).parse().unwrap_or(0)).await?.get("emp_name").map(vs).unwrap_or_default())) });
+        func!("user_name", |x, a, kw| async move { Ok(MV::from(api_user(x, arg(&a, 0).parse().unwrap_or(0)).await?.get("name").map(vs).unwrap_or_default())) });
         func!("users_with_role", |x, a, kw| async move { Ok(j2m(&api_users_with_role(x, &arg(&a, 0), &arg(&a, 1)).await?)) });
         func!("module_roles", |x, a, kw| async move { Ok(j2m(&api_module_roles(x, &arg(&a, 0)).await?)) });
         func!("has_role", |x, a, kw| async move {
@@ -1491,6 +1519,7 @@ impl Sc {
             if v.is_undefined() || v.is_none() { String::new() } else { crate::groovy::java_date(&v.to_string(), f.as_deref().unwrap_or("yyyy-MM-dd HH:mm:ss")) }
         });
         func!("user_by_staffid", |x, a, kw| async move { Ok(j2m(&alias_user(api_user_staff(x, &arg(&a, 0)).await?))) });
+        func!("user_by_userid", |x, a, kw| async move { Ok(j2m(&alias_user(api_user_staff(x, &arg(&a, 0)).await?))) });
         func!("tracker_ref", |x, a, kw| async move {
             Ok(match Tracker::load(x.db(), &arg(&a, 0), &arg(&a, 1)).await {
                 Some(t) => j2m(&Value::Object(t.row.clone())),

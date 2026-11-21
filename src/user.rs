@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 const TOKEN_FILE: &str = "setup-token.txt";
 
 pub async fn has_admin(db: &crate::db::Db) -> bool {
-    db.count("select count(*) from iap_user where is_admin is true", &Row::new()).await.unwrap_or(1) > 0
+    db.count("select count(*) from portal_user where is_admin is true", &Row::new()).await.unwrap_or(1) > 0
 }
 
 /// On a brand new instance print a one-time token for creating the first administrator.
@@ -40,11 +40,12 @@ pub async fn setup(mut ctx: Ctx) -> Response {
     }
     if ctx.method == "POST" {
         let want = std::fs::read_to_string(TOKEN_FILE).unwrap_or_default();
-        let (sid, name, pw) = (ctx.p("staffid"), ctx.p("name"), ctx.p("password"));
+        let sid = { let x = ctx.p("userid"); if x.is_empty() { ctx.p("staffid") } else { x } };
+        let (name, pw) = (ctx.p("name"), ctx.p("password"));
         let err = if want.trim().is_empty() || ctx.p("token").trim() != want.trim() {
             Some("The setup token is not correct")
-        } else if sid.len() < 7 || !sid.chars().all(|c| c.is_ascii_alphanumeric()) {
-            Some("Staff ID must be at least 7 letters and numbers")
+        } else if sid.len() < 3 || !sid.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+            Some("User ID must be at least 3 letters, numbers, dots, underscores or dashes")
         } else if name.trim().is_empty() {
             Some("Name is required")
         } else if pw.len() < 8 {
@@ -58,7 +59,7 @@ pub async fn setup(mut ctx: Ctx) -> Response {
             Some(e) => ctx.flash(e),
             None => {
                 let hash = bcrypt::hash(&pw, 12).unwrap_or_default();
-                let r = ctx.db().insert("iap_user", &row! {"staffid"=>sid,"emp_name"=>name.trim(),"email"=>ctx.p("email"),"password"=>hash,"is_admin"=>true,"isactive"=>true,"date_joined"=>now_str(),"last_updated"=>now_str()}).await;
+                let r = ctx.db().insert("portal_user", &row! {"userid"=>sid,"name"=>name.trim(),"email"=>ctx.p("email"),"password"=>hash,"is_admin"=>true,"is_active"=>true,"reset_password"=>false,"date_joined"=>now_str(),"last_updated"=>now_str()}).await;
                 return match r {
                     Ok(uid) => {
                         let _ = std::fs::remove_file(TOKEN_FILE);
@@ -77,17 +78,16 @@ pub async fn setup(mut ctx: Ctx) -> Response {
         }
         return ctx.redirect("/setup").await;
     }
-    let f = format!("<p>Create the first administrator. The token was printed on the server console and written to <code>setup-token.txt</code>.</p><form method='post' action='/setup'>{}<label class='form-label'>Setup token</label><input class='form-control mb-2' name='token' required/><label class='form-label'>Staff ID (login name)</label><input class='form-control mb-2' name='staffid' required minlength='7'/><label class='form-label'>Name</label><input class='form-control mb-2' name='name' required/><label class='form-label'>E-mail</label><input type='email' class='form-control mb-2' name='email'/><label class='form-label'>Password</label><input type='password' class='form-control mb-2' name='password' required minlength='8'/><label class='form-label'>Repeat password</label><input type='password' class='form-control mb-3' name='password2' required/><button class='btn btn-primary'>Create administrator</button></form>", ctx.csrf_field());
+    let f = format!("<p>Create the first administrator. The token was printed on the server console and written to <code>setup-token.txt</code>.</p><form method='post' action='/setup'>{}<label class='form-label'>Setup token</label><input class='form-control mb-2' name='token' required/><label class='form-label'>User ID (login name)</label><input class='form-control mb-2' name='userid' required minlength='3'/><label class='form-label'>Name</label><input class='form-control mb-2' name='name' required/><label class='form-label'>E-mail</label><input type='email' class='form-control mb-2' name='email'/><label class='form-label'>Password</label><input type='password' class='form-control mb-2' name='password' required minlength='8'/><label class='form-label'>Repeat password</label><input type='password' class='form-control mb-3' name='password2' required/><button class='btn btn-primary'>Create administrator</button></form>", ctx.csrf_field());
     ctx.html("Setup", card("First-time setup", &f)).await
 }
 
 pub async fn login(mut ctx: Ctx) -> Response {
     if ctx.method == "POST" {
-        // "username" is what the Grails portal's form posts
-        let sid = { let x = ctx.p("staffid"); if x.is_empty() { ctx.p("username") } else { x } };
+        let sid = ["username", "userid", "staffid"].iter().map(|k| ctx.p(k)).find(|v| !v.is_empty()).unwrap_or_default();
         let user = web::find_user_by_staffid(ctx.db(), sid.trim()).await;
         let ok = match &user {
-            Some(u) => b(u, "isactive") && !s(u, "password").is_empty() && bcrypt::verify(ctx.p("password"), &s(u, "password")).unwrap_or(false),
+            Some(u) => b(u, "is_active") && !s(u, "password").is_empty() && bcrypt::verify(ctx.p("password"), &s(u, "password")).unwrap_or(false),
             None => {
                 // spend comparable time whether or not the account exists
                 let _ = bcrypt::verify("x", "$2b$12$C6UzMDM.H6dfI/f/IKcEeO7ZPp0vT8d8mB9pP1b6oQe5Yq3q9i0mW");
@@ -96,7 +96,7 @@ pub async fn login(mut ctx: Ctx) -> Response {
         };
         if !ok {
             web::user_log(ctx.db(), "login", &format!("Failed login for {}", sid.chars().take(40).collect::<String>()), None, user.as_ref().and_then(|u| i(u, "id")), &ctx.ip).await;
-            ctx.flash("Invalid staff ID or password");
+            ctx.flash("Invalid username or password");
             return ctx.redirect("/login").await;
         }
         let u = user.unwrap();
@@ -107,9 +107,9 @@ pub async fn login(mut ctx: Ctx) -> Response {
         ctx.sess = Row::new();
         ctx.sess.insert("userid".into(), json!(uid));
         ctx.csrf();
-        let _ = ctx.db().exec("update iap_user set lastlogin=now() where id=:id", &row! {"id"=>uid}).await;
+        let _ = ctx.db().exec("update portal_user set lastlogin=now() where id=:id", &row! {"id"=>uid}).await;
         web::user_log(ctx.db(), "login", "Logged in", Some(uid), None, &ctx.ip).await;
-        if b(&u, "passwordreset") {
+        if b(&u, "reset_password") {
             return ctx.redirect("/user/change_password").await;
         }
         let to = if back.starts_with('/') && !back.starts_with("//") { back } else { "/".to_string() };
@@ -192,7 +192,7 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<String>) -> Response {
         "login" | "authenticate" => return login(ctx).await,
         "logout" => {
             if let Some(u) = &ctx.user {
-                let name = s(u, "emp_name");
+                let name = s(u, "name");
                 web::user_log(ctx.db(), "login", "Logged out", ctx.uid(), None, &ctx.ip).await;
                 let _ = ctx.db().exec("delete from portal_session where id=:id", &row! {"id"=>ctx.sid.clone()}).await;
                 ctx.sid = web::token();
@@ -207,17 +207,18 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<String>) -> Response {
                 return ctx.status(StatusCode::NOT_FOUND, "Registration is not enabled").await;
             }
             if ctx.method == "POST" {
-                let (sid, name, pw) = (ctx.p("staffid"), ctx.p("name"), ctx.p("password"));
+                let sid = { let x = ctx.p("userid"); if x.is_empty() { ctx.p("staffid") } else { x } };
+                let (name, pw) = (ctx.p("name"), ctx.p("password"));
                 let taken = web::find_user_by_staffid(ctx.db(), &sid).await.is_some();
-                if taken || sid.len() < 7 || !sid.chars().all(|c| c.is_ascii_alphanumeric()) || name.trim().is_empty() || pw.len() < 8 {
-                    ctx.flash("Registration failed: staff ID must be 7+ letters/numbers and unused, name is required, password 8+ characters");
+                if taken || sid.len() < 3 || !sid.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) || name.trim().is_empty() || pw.len() < 8 {
+                    ctx.flash("Registration failed: user ID must be 3+ letters/numbers and unused, name is required, password 8+ characters");
                     return ctx.redirect("/user/register").await;
                 }
-                let _ = ctx.db().insert("iap_user", &row! {"staffid"=>sid,"emp_name"=>name.trim(),"email"=>ctx.p("email"),"password"=>bcrypt::hash(&pw, 12).unwrap_or_default(),"is_admin"=>false,"isactive"=>true,"date_joined"=>now_str()}).await;
+                let _ = ctx.db().insert("portal_user", &row! {"userid"=>sid,"name"=>name.trim(),"email"=>ctx.p("email"),"password"=>bcrypt::hash(&pw, 12).unwrap_or_default(),"is_admin"=>false,"is_active"=>true,"reset_password"=>false,"date_joined"=>now_str()}).await;
                 ctx.flash("Account created. Please log in.");
                 return ctx.redirect("/login").await;
             }
-            let f = format!("<form method='post' action='/user/register'>{}<label class='form-label'>Staff ID</label><input class='form-control mb-2' name='staffid' required/><label class='form-label'>Name</label><input class='form-control mb-2' name='name' required/><label class='form-label'>E-mail</label><input type='email' class='form-control mb-2' name='email'/><label class='form-label'>Password</label><input type='password' class='form-control mb-3' name='password' required minlength='8'/><button class='btn btn-primary'>Register</button></form>", ctx.csrf_field());
+            let f = format!("<form method='post' action='/user/register'>{}<label class='form-label'>User ID</label><input class='form-control mb-2' name='userid' required/><label class='form-label'>Name</label><input class='form-control mb-2' name='name' required/><label class='form-label'>E-mail</label><input type='email' class='form-control mb-2' name='email'/><label class='form-label'>Password</label><input type='password' class='form-control mb-3' name='password' required minlength='8'/><button class='btn btn-primary'>Register</button></form>", ctx.csrf_field());
             return ctx.html("Register", card("Register", &f)).await;
         }
         _ => {}
@@ -235,13 +236,13 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<String>) -> Response {
                     d.insert(k.to_string(), json!(ctx.p(k)));
                 }
                 d.insert("last_info_update".into(), json!(now_str()));
-                let _ = ctx.db().update("iap_user", uid, &d).await;
+                let _ = ctx.db().update("portal_user", uid, &d).await;
                 ctx.flash("Profile updated");
                 return ctx.redirect("/user/my_profile").await;
             }
             let u = ctx.user.clone().unwrap();
             let roles = ctx.db().rows("select module, role from user_role where user_id=:u order by module, role", &row! {"u"=>uid}).await.unwrap_or_default();
-            let mut f = format!("<p><b>{}</b> &middot; {}</p><form method='post' action='/user/my_profile'>{}", esc(&s(&u, "emp_name")), esc(&s(&u, "staffid")), ctx.csrf_field());
+            let mut f = format!("<p><b>{}</b> &middot; {}</p><form method='post' action='/user/my_profile'>{}", esc(&s(&u, "name")), esc(&s(&u, "userid")), ctx.csrf_field());
             for k in EDITABLE {
                 f.push_str(&format!("<label class='form-label'>{}</label><input class='form-control mb-2' name='{}' value='{}'/>", crate::entity::label_of(k), k, esc(&s(&u, k))));
             }
@@ -254,7 +255,7 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<String>) -> Response {
         }
         "change_password" | "update_password" => {
             if ctx.method == "POST" {
-                let full = ctx.db().get("iap_user", uid).await.ok().flatten().unwrap_or_default();
+                let full = ctx.db().get("portal_user", uid).await.ok().flatten().unwrap_or_default();
                 let new = ctx.p("password");
                 let msg = if !bcrypt::verify(ctx.p("current"), &s(&full, "password")).unwrap_or(false) {
                     "The current password is not correct"
@@ -263,7 +264,7 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<String>) -> Response {
                 } else if new != ctx.p("password2") {
                     "The passwords do not match"
                 } else {
-                    let _ = ctx.db().update("iap_user", uid, &row! {"password"=>bcrypt::hash(&new, 12).unwrap_or_default(),"passwordreset"=>false,"last_updated"=>now_str()}).await;
+                    let _ = ctx.db().update("portal_user", uid, &row! {"password"=>bcrypt::hash(&new, 12).unwrap_or_default(),"reset_password"=>false,"last_updated"=>now_str()}).await;
                     web::user_log(ctx.db(), "password", "Password changed", Some(uid), None, &ctx.ip).await;
                     ctx.flash("Password changed");
                     return ctx.redirect("/").await;
@@ -284,11 +285,11 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<String>) -> Response {
                 return ctx.redirect("/user/index").await;
             };
             let me = ctx.user.clone().unwrap();
-            ctx.sess.insert("adminlink".into(), json!(s(&me, "staffid")));
+            ctx.sess.insert("adminlink".into(), json!(s(&me, "userid")));
             ctx.sess.insert("realuserid".into(), json!(uid));
             ctx.sess.insert("userid".into(), target.get("id").cloned().unwrap_or(Value::Null));
             web::user_log(ctx.db(), "switch", "Switched user", Some(uid), i(&target, "id"), &ctx.ip).await;
-            ctx.flash(&format!("Now acting as {}", s(&target, "emp_name")));
+            ctx.flash(&format!("Now acting as {}", s(&target, "name")));
             ctx.redirect("/").await
         }
         "restoreadmin" => {
@@ -302,8 +303,8 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<String>) -> Response {
         }
         "changerole" => {
             if let Some(target_id) = ctx.pi("chosenrole") {
-                if let Ok(Some(tnu)) = ctx.db().first("select id, role from tree_node_user where id=:id and user_id=:u limit 1", &row! {"id"=>target_id,"u"=>uid}).await {
-                    let _ = ctx.db().update("iap_user", uid, &row! {"role"=>s(&tnu, "role"),"roletargetid"=>target_id}).await;
+                if let Ok(Some(tnu)) = ctx.db().first("select id, role from portal_tree_node_user where id=:id and user_id=:u limit 1", &row! {"id"=>target_id,"u"=>uid}).await {
+                    let _ = ctx.db().update("portal_user", uid, &row! {"role"=>s(&tnu, "role"),"roletargetid"=>target_id}).await;
                     crate::cache::USERS.clear();
                 }
             }

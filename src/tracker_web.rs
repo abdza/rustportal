@@ -119,10 +119,10 @@ async fn build_excel(sc: &Sc, t: &Tracker, params: &Row, path: &str) -> anyhow::
             }
             if audit {
                 let trail = db
-                    .rows(&format!("select tr.update_date, tr.description, u.emp_name from {} tr left join iap_user u on u.id=tr.updater_id where tr.record_id=:id order by tr.id", qcol(&t.trail_table())), &row! {"id"=>i(r, "id")})
+                    .rows(&format!("select tr.update_date, tr.description, u.name from {} tr left join portal_user u on u.id=tr.updater_id where tr.record_id=:id order by tr.id", qcol(&t.trail_table())), &row! {"id"=>i(r, "id")})
                     .await
                     .unwrap_or_default();
-                line.push(json!(trail.iter().map(|x| format!("{} {}: {}", s(x, "update_date"), s(x, "emp_name"), s(x, "description"))).collect::<Vec<_>>().join("\n")));
+                line.push(json!(trail.iter().map(|x| format!("{} {}: {}", s(x, "update_date"), s(x, "name"), s(x, "description"))).collect::<Vec<_>>().join("\n")));
             }
             out.push(line);
         }
@@ -703,11 +703,15 @@ pub async fn userlist(mut ctx: Ctx) -> Response {
         if let Ok(Value::Array(a)) = sc.eval(&opts, &Row::new()) {
             for u in a {
                 let (id, name) = match &u {
-                    Value::Object(o) => (s(o, "id"), format!("{} ({})", s(o, "emp_name"), s(o, "staffid"))),
+                    Value::Object(o) => {
+                        let nm = { let x = s(o, "name"); if x.is_empty() { s(o, "emp_name") } else { x } };
+                        let uid = { let x = s(o, "userid"); if x.is_empty() { s(o, "staffid") } else { x } };
+                        (s(o, "id"), format!("{} ({})", nm, uid))
+                    }
                     other => {
                         let id = vs(other);
                         let n = match id.parse::<i64>() {
-                            Ok(x) => web::load_user(ctx.db(), x).await.map(|u| format!("{} ({})", s(&u, "emp_name"), s(&u, "staffid"))).unwrap_or_default(),
+                            Ok(x) => web::load_user(ctx.db(), x).await.map(|u| format!("{} ({})", s(&u, "name"), s(&u, "userid"))).unwrap_or_default(),
                             Err(_) => String::new(),
                         };
                         (id, n)
@@ -721,10 +725,10 @@ pub async fn userlist(mut ctx: Ctx) -> Response {
     } else {
         let rows = ctx
             .db()
-            .rows("select id, emp_name, staffid from iap_user where isactive is not false and (emp_name ilike :q or staffid ilike :q or new_staffid ilike :q) order by emp_name limit 20", &row! {"q"=>like})
+            .rows("select id, name, userid from portal_user where is_active is not false and (name ilike :q or userid ilike :q) order by name limit 20", &row! {"q"=>like})
             .await
             .unwrap_or_default();
-        out = rows.iter().map(|r| (s(r, "id"), format!("{} ({})", s(r, "emp_name"), s(r, "staffid")))).collect();
+        out = rows.iter().map(|r| (s(r, "id"), format!("{} ({})", s(r, "name"), s(r, "userid")))).collect();
     }
     ctx.json(select2(out)).await
 }
@@ -743,7 +747,7 @@ pub async fn nodeslist(mut ctx: Ctx) -> Response {
     if tok.len() == 3 && tok[0] == "tree" {
         let rows = ctx
             .db()
-            .rows("select n.id, n.name from tree_node n join tree t on t.id=n.tree_id where t.module=:m and t.name=:n and n.name ilike :q and n.disabled is not true order by n.lft limit 50", &row! {"m"=>tok[1],"n"=>tok[2],"q"=>format!("%{}%", q)})
+            .rows("select n.id, n.name from portal_tree_node n join portal_tree t on t.id=n.tree_id where t.module=:m and t.name=:n and n.name ilike :q and n.disabled is not true order by n.lft limit 50", &row! {"m"=>tok[1],"n"=>tok[2],"q"=>format!("%{}%", q)})
             .await
             .unwrap_or_default();
         out = rows.iter().map(|r| (s(r, "id"), s(r, "name"))).collect();
@@ -759,7 +763,7 @@ pub async fn nodeslist(mut ctx: Ctx) -> Response {
             }
         }
     } else {
-        let rows = ctx.db().rows("select id, name from tree_node where name ilike :q and disabled is not true order by name limit 50", &row! {"q"=>format!("%{}%", q)}).await.unwrap_or_default();
+        let rows = ctx.db().rows("select id, name from portal_tree_node where name ilike :q and disabled is not true order by name limit 50", &row! {"q"=>format!("%{}%", q)}).await.unwrap_or_default();
         out = rows.iter().map(|r| (s(r, "id"), s(r, "name"))).collect();
     }
     ctx.json(select2(out)).await
@@ -793,7 +797,7 @@ pub async fn dropdowndata(ctx: Ctx) -> Response {
     if let (Some((t, f)), Some(did)) = (field_and_tracker(&ctx).await, ctx.pi("data_id")) {
         match s(&f, "field_type").as_str() {
             "User" => datas = web::load_user(ctx.db(), did).await.map(Value::Object).unwrap_or(Value::Null),
-            "TreeNode" | "Branch" => datas = ctx.db().get("tree_node", did).await.ok().flatten().map(Value::Object).unwrap_or(Value::Null),
+            "TreeNode" | "Branch" => datas = ctx.db().get("portal_tree_node", did).await.ok().flatten().map(Value::Object).unwrap_or(Value::Null),
             _ => {
                 if let Some(ot) = t.other_tracker(ctx.db(), &f).await {
                     datas = ot.get(ctx.db(), did).await.map(Value::Object).unwrap_or(Value::Null);

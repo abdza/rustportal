@@ -8,8 +8,7 @@ module_dir = "modulemigration"
 # on a Grails portal's database next to it: everything else is shared, the pages are not.
 # page_table = "portal_page"
 # page_data_table = "portal_page_data"
-# the database is a g6 Grails portal's (portal_user, portal_tree...): reach those tables
-# through views under this portal's names, so both portals share the same rows
+# g6 Grails portal compatibility mode (GSP role rules, raw HTML field display, file links)
 # g6_schema = false
 # run scheduled pages and send queued e-mail; turn off when the other portal on the
 # same database already does, or every job runs twice

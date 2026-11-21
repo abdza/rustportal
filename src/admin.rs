@@ -115,12 +115,12 @@ async fn ref_names(ctx: &Ctx, target: &str, ids: &[i64]) -> HashMap<i64, String>
     if ids.is_empty() {
         return m;
     }
-    let extra = if te.name == "user" { ", staffid" } else if te.field("module").is_some() && te.display != "module" { ", module" } else { "" };
+    let extra = if te.name == "user" { ", userid" } else if te.field("module").is_some() && te.display != "module" { ", module" } else { "" };
     let q = format!("select id, \"{}\"::text as d{} from \"{}\" where id in {}", te.display, extra, te.table, lit(&json!(ids)));
     for r in ctx.db().rows(&q, &db::no_params()).await.unwrap_or_default() {
         let mut d = s(&r, "d");
         if te.name == "user" {
-            d = format!("{} ({})", d, s(&r, "staffid"));
+            d = format!("{} ({})", d, s(&r, "userid"));
         } else if r.contains_key("module") && matches!(te.name, "portalPage" | "portalTracker") {
             d = format!("{}: {}", s(&r, "module"), d);
         }
@@ -391,15 +391,15 @@ async fn module_sections(ctx: &Ctx, m: &Row, csrf: &str) -> String {
     h.push_str(&section("Pages", &if is_dev { vec![add("portalPage", "Page")] } else { vec![] }, &["Title", "Slug", "Kind", "Published", "Action"], prs, "No pages in this module."));
 
     // roles
-    let rows = db.rows("select r.id, r.role, u.emp_name, u.staffid from user_role r left join iap_user u on u.id=r.user_id where r.module=:m order by r.role, u.emp_name", &p).await.unwrap_or_default();
+    let rows = db.rows("select r.id, r.role, u.name, u.userid from user_role r left join portal_user u on u.id=r.user_id where r.module=:m order by r.role, u.name", &p).await.unwrap_or_default();
     let can_switch = ctx.is_admin();
     let rrs = rows.iter().map(|r| {
         let id = i(r, "id").unwrap_or(0);
-        let nm = esc(&s(r, "emp_name"));
-        vec![if can_switch { format!("<a href='/user/switchuser/{}' title='Switch to this user'>{}</a>", enc(&s(r, "staffid")), nm) } else { nm }, esc(&s(r, "staffid")), esc(&s(r, "role")),
+        let nm = esc(&s(r, "name"));
+        vec![if can_switch { format!("<a href='/user/switchuser/{}' title='Switch to this user'>{}</a>", enc(&s(r, "userid")), nm) } else { nm }, esc(&s(r, "userid")), esc(&s(r, "role")),
             act(vec![is_adm.then(|| format!("<a href='/userRole/edit/{id}'>Edit</a>")), is_adm.then(|| format!("<a href='/userRole/show/{id}'>Details</a>"))])]
     }).collect();
-    h.push_str(&section("Roles", &if is_adm { vec![add("userRole", "User Role")] } else { vec![] }, &["Name", "Staff ID", "Role", "Action"], rrs, "Nobody has a role in this module."));
+    h.push_str(&section("Roles", &if is_adm { vec![add("userRole", "User Role")] } else { vec![] }, &["Name", "User ID", "Role", "Action"], rrs, "Nobody has a role in this module."));
 
     // settings
     let rows = db.rows("select * from portal_setting where module=:m order by name", &p).await.unwrap_or_default();
@@ -425,7 +425,7 @@ async fn module_sections(ctx: &Ctx, m: &Row, csrf: &str) -> String {
     h.push_str(&section("Schedules", &if is_dev { vec![add("portalScheduler", "Schedule")] } else { vec![] }, &["Name", "Pages", "Hour", "Day of week", "Day of month", "Enabled", "Last run", "Action"], crs, "No schedules in this module."));
 
     // trees
-    let rows = db.rows("select t.*, (select name from tree_node n where n.id=t.root_id) as root_name, (select count(*) from tree_node n where n.tree_id=t.id) as nodes from tree t where t.module=:m order by t.name", &p).await.unwrap_or_default();
+    let rows = db.rows("select t.*, (select name from portal_tree_node n where n.id=t.root_id) as root_name, (select count(*) from portal_tree_node n where n.tree_id=t.id) as nodes from portal_tree t where t.module=:m order by t.name", &p).await.unwrap_or_default();
     let ers = rows.iter().map(|r| {
         let id = i(r, "id").unwrap_or(0);
         vec![esc(&s(r, "name")), esc(&s(r, "root_name")), s(r, "nodes"), esc(&s(r, "valid").chars().take(10).collect::<String>()), esc(&s(r, "expire").chars().take(10).collect::<String>()),
@@ -530,7 +530,7 @@ async fn show_extras(ctx: &mut Ctx, e: &Entity, r: &Row) -> String {
         "portalModuleAccessReview" => o.push_str(&post_button(ctx, &format!("/portalModuleAccessReview/approve/{}", id), "Approve review", "btn-outline-success", Some("Confirm that the access list of this module is correct?"))),
         "user" => {
             if ctx.is_admin() {
-                o.push_str(&format!("<a class='btn btn-sm btn-outline-secondary' href='/user/switchuser/{}'>Switch to this user</a> ", enc(&s(r, "staffid"))));
+                o.push_str(&format!("<a class='btn btn-sm btn-outline-secondary' href='/user/switchuser/{}'>Switch to this user</a> ", enc(&s(r, "userid"))));
             }
         }
         _ => {}
@@ -591,7 +591,7 @@ pub async fn show(mut ctx: Ctx, e: &Entity, id: i64) -> Response {
     if e.name == "portalTree" {
         // as the Grails portal: the nodes are browsed from the root node's page
         let root = match i(&r, "root_id") {
-            Some(rid) => ctx.db().get("tree_node", rid).await.ok().flatten().map(|n| format!("<a href=\"/portalTreeNode/show/{}\">{}</a>", rid, esc(&s(&n, "name")))),
+            Some(rid) => ctx.db().get("portal_tree_node", rid).await.ok().flatten().map(|n| format!("<a href=\"/portalTreeNode/show/{}\">{}</a>", rid, esc(&s(&n, "name")))),
             None => None,
         }
         .unwrap_or_else(|| format!("<a href=\"/portalTree/create_root/{}\">Create root node</a>", id));
@@ -667,7 +667,7 @@ fn is_vim_setting(val: Option<&str>) -> bool {
 
 /// Matches the Grails portal's `PortalSetting.namedefault(curuser.userID + '_editor', 'normal') == 'vim'`.
 async fn use_vim_editor(ctx: &Ctx) -> bool {
-    let staffid = ctx.user.as_ref().map(|u| s(u, "staffid")).unwrap_or_default();
+    let staffid = ctx.user.as_ref().map(|u| s(u, "userid")).unwrap_or_default();
     if staffid.is_empty() {
         return false;
     }
@@ -1008,13 +1008,13 @@ async fn gather(ctx: &Ctx, e: &Entity, existing: Option<&Row>) -> Result<Row, St
             d.insert("last_updated".into(), json!(now_str()));
         }
         "user" => {
-            let sid = s(&d, "staffid");
+            let sid = s(&d, "userid");
             if sid.len() < 3 || !sid.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
-                return Err("Staff ID must be letters and numbers".into());
+                return Err("User ID must be letters and numbers".into());
             }
-            let dup = ctx.db().count("select count(*) from iap_user where staffid=:s and id!=:id", &row! {"s"=>sid,"id"=>existing.and_then(|x| i(x, "id")).unwrap_or(0)}).await.unwrap_or(0);
+            let dup = ctx.db().count("select count(*) from portal_user where userid=:s and id!=:id", &row! {"s"=>sid,"id"=>existing.and_then(|x| i(x, "id")).unwrap_or(0)}).await.unwrap_or(0);
             if dup > 0 {
-                return Err("That staff ID is already in use".into());
+                return Err("That user ID is already in use".into());
             }
             if existing.is_none() && !d.contains_key("password") {
                 return Err("A password is required for a new user".into());
@@ -1094,8 +1094,8 @@ async fn after_save(ctx: &Ctx, e: &Entity, id: i64, created: bool) -> Option<Str
             }
             "portalTree" if created => {
                 let name = db.get(e.table, id).await?.map(|r| s(&r, "name")).unwrap_or_default();
-                let root = db.insert("tree_node", &row! {"tree_id"=>id,"name"=>name,"lft"=>1,"rgt"=>2,"disabled"=>false}).await?;
-                db.update("tree", id, &row! {"root_id"=>root}).await?;
+                let root = db.insert("portal_tree_node", &row! {"tree_id"=>id,"name"=>name,"lft"=>1,"rgt"=>2,"disabled"=>false}).await?;
+                db.update("portal_tree", id, &row! {"root_id"=>root}).await?;
             }
             "portalPage" | "portalSetting" | "userRole" => {
                 ensure_module(db, &db.get(e.table, id).await?.map(|r| s(&r, "module")).unwrap_or_default()).await;
@@ -1240,12 +1240,12 @@ fn delete_row<'a>(ctx: &'a Ctx, e: &'a Entity, id: i64, depth: usize) -> std::pi
             }
         }
         if e.name == "portalTreeNode" && depth < 30 {
-            for c in db.rows(&format!("select id from tree_node where parent_id={}", id), &db::no_params()).await.unwrap_or_default() {
+            for c in db.rows(&format!("select id from portal_tree_node where parent_id={}", id), &db::no_params()).await.unwrap_or_default() {
                 if let Some(cid) = i(&c, "id") {
                     delete_row(ctx, e, cid, depth + 1).await;
                 }
             }
-            let _ = db.exec(&format!("update tree set root_id=null where root_id={}", id), &db::no_params()).await;
+            let _ = db.exec(&format!("update portal_tree set root_id=null where root_id={}", id), &db::no_params()).await;
         }
         for f in &e.fields {
             if let K::Multi(_, join, own, _) = f.kind {
@@ -1286,7 +1286,7 @@ pub async fn lookup(ctx: Ctx, e: &Entity) -> Response {
     }
     let q = ctx.p("q");
     let like = lit(&json!(format!("%{}%", q.trim().replace(' ', "%"))));
-    let mut cond = vec![if e.name == "user" { format!("(emp_name ilike {l} or staffid ilike {l} or email ilike {l})", l = like) } else { format!("\"{}\"::text ilike {}", e.display, like) }];
+    let mut cond = vec![if e.name == "user" { format!("(name ilike {l} or userid ilike {l} or email ilike {l})", l = like) } else { format!("\"{}\"::text ilike {}", e.display, like) }];
     if !ctx.is_admin() && e.name != "user" {
         let mods = my_modules(&ctx, e).await;
         match scope_filter(&ctx, e, &mods) {
@@ -1298,7 +1298,7 @@ pub async fn lookup(ctx: Ctx, e: &Entity) -> Response {
     let res: Vec<Value> = rows
         .iter()
         .map(|r| {
-            let text = if e.name == "user" { format!("{} ({})", s(r, "emp_name"), s(r, "staffid")) } else if e.field("module").is_some() && e.display != "module" { format!("{}: {}", s(r, "module"), s(r, e.display)) } else { s(r, e.display) };
+            let text = if e.name == "user" { format!("{} ({})", s(r, "name"), s(r, "userid")) } else if e.field("module").is_some() && e.display != "module" { format!("{}: {}", s(r, "module"), s(r, e.display)) } else { s(r, e.display) };
             json!({"id": i(r, "id"), "text": text})
         })
         .collect();

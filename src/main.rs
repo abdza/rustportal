@@ -214,7 +214,7 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
                     Err(e) => ctx.flash(&format!("Sending failed: {}", e)),
                 },
                 "portalScheduler" => {
-                    scheduler::run_scheduler(&st, &r, &ctx.user.as_ref().map(|u| s(u, "staffid")).unwrap_or_default()).await;
+                    scheduler::run_scheduler(&st, &r, &ctx.user.as_ref().map(|u| s(u, "userid")).unwrap_or_default()).await;
                     ctx.flash("Scheduler run finished; see Scheduler Runs for the result");
                 }
                 "portalTree" => {
@@ -226,7 +226,7 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
                     ctx.flash("Marked as resolved");
                 }
                 _ => {
-                    let snapshot = st.db.rows("select u.staffid, u.emp_name, r.role from user_role r join iap_user u on u.id=r.user_id where r.module=:m order by 1,3", &row! {"m"=>module}).await.unwrap_or_default();
+                    let snapshot = st.db.rows("select u.userid, u.name, r.role from user_role r join portal_user u on u.id=r.user_id where r.module=:m order by 1,3", &row! {"m"=>module}).await.unwrap_or_default();
                     let _ = st.db.update(table, rid, &row! {"status"=>"Approved","approved_by_id"=>ctx.uid(),"approved_date"=>web::now_str(),"approved_snapshot"=>serde_json::to_string(&snapshot).unwrap_or_default(),"last_updated"=>web::now_str()}).await;
                     let _ = st.db.insert("portal_module_access_review_log", &row! {"review_id"=>rid,"action"=>"Approved","actor_id"=>ctx.uid(),"date_created"=>web::now_str(),"detail"=>format!("{} role assignments confirmed", snapshot.len())}).await;
                     ctx.flash("Access review approved");
@@ -343,9 +343,6 @@ async fn main() -> anyhow::Result<()> {
     db::set_g6(cfg.g6_schema);
     let tz = cfg.db_timezone.clone().or_else(|| if cfg.g6_schema { db::local_timezone() } else { None });
     let database = db::Db::connect(&cfg.database_url, cfg.db_pool, tz).await?;
-    if cfg.g6_schema {
-        entity::g6_views(&database).await?;
-    }
     let entities = entity::entities();
     entity::sync_schema(&database, &entities).await?;
     if let Some(mods) = translate_modules {

@@ -156,7 +156,7 @@ pub async fn export(st: &St, module: &str, with_roles: bool) -> Result<PathBuf> 
     write_json(&dir.join("schedulerlist.json"), &Value::Array(scheds.iter().map(|x| Value::Object(pick(x, SCHED_KEYS))).collect()))?;
     let eps = db.rows("select * from portal_endpoint where module=:m order by slug", &row! {"m"=>module}).await?;
     write_json(&dir.join("endpointlist.json"), &Value::Array(eps.iter().map(|x| Value::Object(pick(x, ENDPOINT_KEYS))).collect()))?;
-    let trees = db.rows("select * from tree where module=:m order by name", &row! {"m"=>module}).await?;
+    let trees = db.rows("select * from portal_tree where module=:m order by name", &row! {"m"=>module}).await?;
     let mut tl = vec![];
     for t in trees {
         // the Grails portal's nested format, so the zip imports there too
@@ -164,7 +164,7 @@ pub async fn export(st: &St, module: &str, with_roles: bool) -> Result<PathBuf> 
     }
     write_json(&dir.join("treelist.json"), &Value::Array(tl))?;
     if with_roles {
-        let roles = db.rows("select u.staffid, r.role from user_role r join iap_user u on u.id=r.user_id where r.module=:m order by u.staffid, r.role", &row! {"m"=>module}).await?;
+        let roles = db.rows("select u.userid as staffid, u.userid, r.role from user_role r join portal_user u on u.id=r.user_id where r.module=:m order by u.userid, r.role", &row! {"m"=>module}).await?;
         write_json(&dir.join("userroles.json"), &Value::Array(roles.into_iter().map(Value::Object).collect()))?;
     }
     Ok(dir)
@@ -510,7 +510,7 @@ pub async fn import_from(st: &St, module: &str, dir: &Path, with_roles: bool) ->
     if with_roles {
         if let Some(list) = read_json(&dir.join("userroles.json")).or_else(|| read_json(&dir.join("userrolelist.json"))) {
             for x in &list {
-                let staffid = if s(x, "staffid").is_empty() { s(x, "user") } else { s(x, "staffid") };
+                let staffid = ["userid", "staffid", "user"].iter().map(|k| s(x, k)).find(|v| !v.is_empty()).unwrap_or_default();
                 if let Some(u) = web::find_user_by_staffid(db, &staffid).await {
                     let p = row! {"u"=>i(&u, "id"),"m"=>module,"r"=>s(x, "role")};
                     if db.count("select count(*) from user_role where user_id=:u and module=:m and role=:r", &p).await? == 0 {
@@ -697,7 +697,7 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<i64>) -> Response {
                 };
                 match res {
                     Ok((m, msg, detail)) => {
-                        let _ = ctx.db().insert("portal_module_import_log", &row! {"module"=>m,"staffid"=>ctx.user.as_ref().map(|u| s(u, "staffid")),"staffname"=>ctx.user.as_ref().map(|u| s(u, "emp_name")),"remarks"=>msg.clone(),"diff"=>detail,"date_created"=>now_str()}).await;
+                        let _ = ctx.db().insert("portal_module_import_log", &row! {"module"=>m,"staffid"=>ctx.user.as_ref().map(|u| s(u, "userid")),"staffname"=>ctx.user.as_ref().map(|u| s(u, "name")),"remarks"=>msg.clone(),"diff"=>detail,"date_created"=>now_str()}).await;
                         ctx.flash(&msg);
                         return match crate::admin::module_url(ctx.db(), &m).await {
                             Some(u) => ctx.redirect(&u).await,
@@ -731,7 +731,7 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<i64>) -> Response {
                 }
                 match import(&ctx.st, &m, ctx.params.contains_key("staff_on")).await {
                     Ok((msg, detail)) => {
-                        let _ = ctx.db().insert("portal_module_import_log", &row! {"module"=>m,"staffid"=>ctx.user.as_ref().map(|u| s(u, "staffid")),"staffname"=>ctx.user.as_ref().map(|u| s(u, "emp_name")),"remarks"=>msg.clone(),"diff"=>detail,"date_created"=>now_str()}).await;
+                        let _ = ctx.db().insert("portal_module_import_log", &row! {"module"=>m,"staffid"=>ctx.user.as_ref().map(|u| s(u, "userid")),"staffname"=>ctx.user.as_ref().map(|u| s(u, "name")),"remarks"=>msg.clone(),"diff"=>detail,"date_created"=>now_str()}).await;
                         ctx.flash(&msg);
                     }
                     Err(e) => ctx.flash(&format!("Import failed: {}", e)),

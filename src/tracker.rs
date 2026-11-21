@@ -993,8 +993,8 @@ impl Tracker {
                                 }
                             }
                         }
-                        "User" => ors.push(format!("{} in (select id from iap_user where emp_name ilike {l} or staffid ilike {l} or new_staffid ilike {l} or email ilike {l})", col, l = like)),
-                        "TreeNode" | "Branch" => ors.push(format!("{} in (select id from tree_node where name ilike {})", col, like)),
+                        "User" => ors.push(format!("{} in (select id from portal_user where name ilike {l} or userid ilike {l} or email ilike {l})", col, l = like)),
+                        "TreeNode" | "Branch" => ors.push(format!("{} in (select id from portal_tree_node where name ilike {})", col, like)),
                         "HasMany" | "FieldGroup" | "File" => {}
                         _ => ors.push(format!("{}::text ilike {}", col, like)),
                     }
@@ -1340,7 +1340,7 @@ pub fn groovy_default(code: &str) -> GroovyDefault {
         return GroovyDefault::Value(Value::String(m[1].replace("\\'", "'")));
     }
     let mut r = c.replace("session?.curuser?.", "curuser?.").replace("session.curuser.", "curuser.");
-    r = r.replace("curuser?.userID", "curuser?.staffid").replace("curuser.userID", "curuser.staffid");
+    r = r.replace("curuser?.userID", "curuser?.userid").replace("curuser.userID", "curuser.userid");
     GroovyDefault::Code(r)
 }
 
@@ -1448,7 +1448,7 @@ pub fn groovy_tracker_script(code: &str) -> String {
         regex::Regex::new(r#"(\w+)\*\.userID\.join\(([^)]+)\)"#).unwrap()
     });
     s = spread_join
-        .replace_all(&s, "$1.map(|u| u.staffid).join($2)")
+        .replace_all(&s, "$1.map(|u| u.userid).join($2)")
         .into_owned();
 
     // g6portal.User.get(X as Long) -> user(to_int(X))
@@ -1585,7 +1585,7 @@ mod default_tests {
             _ => panic!("date"),
         }
         assert!(matches!(groovy_default("'#1a237e'"), GroovyDefault::Value(Value::String(v)) if v == "#1a237e"));
-        assert!(matches!(groovy_default("session?.curuser?.userID"), GroovyDefault::Code(c) if c == "curuser?.staffid"));
+        assert!(matches!(groovy_default("session?.curuser?.userID"), GroovyDefault::Code(c) if c == "curuser?.userid"));
         assert!(matches!(groovy_default("params.event_id_default"), GroovyDefault::Code(c) if c == "params.event_id_default"));
     }
 

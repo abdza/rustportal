@@ -43,7 +43,7 @@ Pages are written in **Rhai** (scripts) and **MiniJinja** (templates).
 | field options / default / error function / error message, transition enabled condition and update trail, row class, e-mail to/cc | Rhai expression |
 | "Data Compare" role rule, page data source query | MiniJinja producing SQL (use `\|sql` to quote values) |
 
-Variables: `params`, `curuser` (`id`, `name`, `staffid`, `email`, `is_admin`, ...),
+Variables: `params`, `curuser` (`id`, `name`, `userid`, `email`, `is_admin`, ...),
 `datas`; plus `pp`, `tracker`, `transition`, `userroles`, `flash` in templates and
 `trail_id`, `prevdata`, `transition`, `tracker` in postprocess scripts.
 
@@ -119,8 +119,9 @@ Grails portal on the same database. Tracker definitions refer to pages by id
 their ids; on such a database new tables take ids from `hibernate_sequence`, so
 pages added on either side never collide.
 
-For a g6 Grails portal also set `g6_schema = true` (its `portal_user` and
-`portal_tree*` tables are reached through views under this portal's names),
+For a g6 Grails portal also set `g6_schema = true` (enables g6 runtime
+compatibility for GSP role rules, raw HTML field values, and file links;
+`portal_user` and `portal_tree*` tables are used directly),
 `run_scheduler = false` when the Grails portal already runs the schedules, and
 `content_security_policy` to the policy the Grails portal sends, so pages that
 load outside fonts or images look the same on both, and `user_profile` to its

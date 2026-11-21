@@ -404,7 +404,7 @@ pub fn set_g6(on: bool) {
     G6.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Running on a g6 Grails portal's database (see `entity::g6_views`).
+/// Running in g6 Grails portal compatibility mode.
 pub fn g6() -> bool {
     G6.load(std::sync::atomic::Ordering::Relaxed)
 }

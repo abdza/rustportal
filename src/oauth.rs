@@ -148,13 +148,13 @@ pub async fn callback(mut ctx: Ctx) -> Response {
 
     let existing = ctx
         .db()
-        .first("select * from iap_user where lower(email)=lower(:e) order by id limit 1", &row! {"e"=>email.clone()})
+        .first("select * from portal_user where lower(email)=lower(:e) order by id limit 1", &row! {"e"=>email.clone()})
         .await
         .ok()
         .flatten();
     let uid = match existing {
         Some(u) => {
-            if !b(&u, "isactive") {
+            if !b(&u, "is_active") {
                 ctx.flash("This account is inactive");
                 return ctx.redirect("/login").await;
             }
@@ -166,14 +166,15 @@ pub async fn callback(mut ctx: Ctx) -> Response {
             match ctx
                 .db()
                 .insert(
-                    "iap_user",
+                    "portal_user",
                     &row! {
-                        "staffid"=>userid,
-                        "emp_name"=>name,
+                        "userid"=>userid,
+                        "name"=>name,
                         "email"=>email,
                         "password"=>rand_pw,
                         "is_admin"=>false,
-                        "isactive"=>true,
+                        "is_active"=>true,
+                        "reset_password"=>false,
                         "date_joined"=>now_str(),
                         "last_updated"=>now_str()
                     },
@@ -195,7 +196,7 @@ pub async fn callback(mut ctx: Ctx) -> Response {
     ctx.sess = Row::new();
     ctx.sess.insert("userid".into(), json!(uid));
     ctx.csrf();
-    let _ = ctx.db().exec("update iap_user set lastlogin=now() where id=:id", &row! {"id"=>uid}).await;
+    let _ = ctx.db().exec("update portal_user set lastlogin=now() where id=:id", &row! {"id"=>uid}).await;
     web::user_log(ctx.db(), "login", "Logged in via Google OAuth", Some(uid), None, &ctx.ip).await;
     let to = if back.starts_with('/') && !back.starts_with("//") { back } else { "/".to_string() };
     ctx.redirect(&to).await
