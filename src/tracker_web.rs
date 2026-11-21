@@ -160,6 +160,7 @@ async fn excel(mut ctx: Ctx, t: Tracker) -> Response {
         return ctx.status(StatusCode::FORBIDDEN, "Excel download is not enabled for this tracker").await;
     }
     let token = web::token();
+    let base = format!("/{}/{}/list", web::enc(&t.module), web::enc(&t.slug));
     ctx.st.excel_jobs.lock().unwrap().insert(token.clone(), ExcelJob { done: false, file: None, error: None, filename: t.slug.clone() });
     let sc = make_sc(&mut ctx);
     let st = ctx.st.clone();
@@ -200,15 +201,17 @@ body{{font-family:Arial,sans-serif;text-align:center;padding:60px 20px;backgroun
 .spinner{{display:inline-block;width:40px;height:40px;border:4px solid #ddd;border-top-color:#0078d4;border-radius:50%;animation:spin .8s linear infinite;margin-bottom:16px;}}
 @keyframes spin{{to{{transform:rotate(360deg);}}}} .error{{color:#c00;}}</style></head><body><div class="box"><div class="spinner" id="spinner"></div>
 <h2>Generating Excel Report</h2><p id="status">Please wait while your report is being prepared&hellip;</p></div><script>
-var token='{}';var baseUrl=window.location.href.split('?')[0];
+var token='{token}';var baseUrl='{base}';
 var checkUrl=baseUrl+'?excel=1&excel_token='+token+'&excel_status=1';var downloadUrl=baseUrl+'?excel=1&excel_token='+token;
-function check(){{fetch(checkUrl,{{credentials:'same-origin'}}).then(function(r){{return r.json();}}).then(function(d){{
+var errs=0;
+function check(){{fetch(checkUrl,{{credentials:'same-origin'}}).then(function(r){{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}}).then(function(d){{
+errs=0;
 if(d.ready){{document.getElementById('status').textContent='Report ready! Downloading…';document.getElementById('spinner').style.display='none';
 var a=document.createElement('a');a.href=downloadUrl;a.download='';document.body.appendChild(a);a.click();setTimeout(function(){{window.location.href=baseUrl;}},1500);}}
 else if(d.error){{document.getElementById('spinner').style.display='none';document.getElementById('status').innerHTML='<span class="error">Error: '+d.error+'</span>';}}
-else{{setTimeout(check,1500);}}}}).catch(function(){{setTimeout(check,2000);}});}}
-setTimeout(check,800);</script></body></html>"#,
-        token
+else{{setTimeout(check,1000);}}}}).catch(function(e){{errs++;if(errs>=5){{document.getElementById('spinner').style.display='none';document.getElementById('status').innerHTML='<span class="error">Error checking report status: '+(e&&e.message?e.message:e)+'</span>';}}else{{setTimeout(check,1500);}}}});}}
+setTimeout(check,500);</script></body></html>"#,
+        token = token, base = base
     );
     ctx.raw_html(html).await
 }

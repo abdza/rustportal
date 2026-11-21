@@ -546,6 +546,7 @@ async fn xlsx_async(mut ctx: Ctx, page: Row, args: Vec<String>) -> Response {
         };
     }
     let token = uuid::Uuid::new_v4().to_string();
+    let base = format!("/run/{}/{}", web::enc(&s(&page, "module")), web::enc(&s(&page, "slug")));
     ctx.st.excel_jobs.lock().unwrap().insert(token.clone(), ExcelJob { done: false, file: None, error: None, filename: s(&page, "slug") });
     let sc = make_sc(&mut ctx);
     let vars = row! {"args"=>args,"request"=>json!({"method": ctx.method, "path": ctx.path, "ip": ctx.ip})};
@@ -586,7 +587,7 @@ async fn xlsx_async(mut ctx: Ctx, page: Row, args: Vec<String>) -> Response {
             }
         }
     });
-    ctx.raw_html(XLSX_WAIT_PAGE.replace("{token}", &token)).await
+    ctx.raw_html(XLSX_WAIT_PAGE.replace("{token}", &token).replace("{base}", &base)).await
 }
 
 /// The page g6 shows while a runable page's spreadsheet is built.
@@ -613,13 +614,18 @@ h2{color:#333;margin-bottom:10px;}
 </div>
 <script>
 var token = '{token}';
-var baseUrl = window.location.href.split('?')[0];
+var baseUrl = '{base}';
 var checkUrl = baseUrl + '?async_token=' + token + '&async_status=1';
 var downloadUrl = baseUrl + '?async_token=' + token;
+var errs = 0;
 function check() {
     fetch(checkUrl, {credentials:'same-origin'})
-        .then(function(r){return r.json();})
+        .then(function(r){
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        })
         .then(function(data){
+            errs = 0;
             if(data.ready){
                 document.getElementById('status').textContent='Report ready! Downloading\u2026';
                 document.getElementById('spinner').style.display='none';
@@ -641,12 +647,32 @@ function check() {
                 document.getElementById('spinner').style.display='none';
                 document.getElementById('status').innerHTML='<span class="error">Error: '+data.error+'</span>';
             } else {
-                setTimeout(check,2000);
+                setTimeout(check,1000);
             }
         })
-        .catch(function(){setTimeout(check,2000);});
+        .catch(function(e){
+            errs++;
+            if (errs >= 5) {
+                document.getElementById('spinner').style.display='none';
+                document.getElementById('status').innerHTML='<span class="error">Error checking report status: '+(e && e.message ? e.message : e)+'</span>';
+            } else {
+                setTimeout(check,1500);
+            }
+        });
 }
-setTimeout(check,2000);
+setTimeout(check,500);
 </script>
 </body>
 </html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xlsx_wait_page_uses_canonical_run_url() {
+        let html = XLSX_WAIT_PAGE.replace("{token}", "tok-1").replace("{base}", "/run/ahli/harijadi_ahli_excel");
+        assert!(html.contains("var baseUrl = '/run/ahli/harijadi_ahli_excel';"));
+        assert!(!html.contains("window.location.href.split('?')[0]"));
+    }
+}
