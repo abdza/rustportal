@@ -81,6 +81,116 @@ pub fn read_sheet(path: &str, sheet: usize) -> Result<Vec<Vec<Value>>> {
     Ok(out)
 }
 
+/// Read every sheet of an uploaded spreadsheet (.xlsx/.xls/.ods/.csv/.txt) as trimmed
+/// text rows, dropping trailing empty cells and rows.
+pub fn read_all_sheets(path: &str, filename: &str, max_sheets: usize, max_rows: usize, max_cols: usize) -> Result<(Vec<(String, Vec<Vec<String>>)>, bool)> {
+    let lower = filename.to_lowercase();
+    let mut clipped = false;
+    let tidy = |rows: Vec<Vec<String>>, clipped: &mut bool| -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = rows
+            .into_iter()
+            .map(|r| {
+                let mut c: Vec<String> = r
+                    .into_iter()
+                    .map(|x| x.replace(['\r', '\n', '\t'], " ").trim().to_string())
+                    .collect();
+                while c.last().map(|s| s.is_empty()).unwrap_or(false) {
+                    c.pop();
+                }
+                if c.len() > max_cols {
+                    c.truncate(max_cols);
+                    *clipped = true;
+                }
+                c
+            })
+            .collect();
+        while out.last().map(|r| r.is_empty()).unwrap_or(false) {
+            out.pop();
+        }
+        out
+    };
+    if lower.ends_with(".csv") || lower.ends_with(".txt") {
+        let bytes = std::fs::read(path)?;
+        let text = match String::from_utf8(bytes.clone()) {
+            Ok(s) => s,
+            Err(_) => bytes.into_iter().map(|b| b as char).collect(),
+        };
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let sep = [',', ';', '\t'].into_iter().max_by_key(|&c| first.matches(c).count()).unwrap_or(',');
+        let mut rows: Vec<Vec<String>> = vec![];
+        let mut row: Vec<String> = vec![];
+        let mut cell = String::new();
+        let mut quoted = false;
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if quoted {
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        cell.push('"');
+                        chars.next();
+                    } else {
+                        quoted = false;
+                    }
+                } else {
+                    cell.push(ch);
+                }
+            } else if ch == '"' && cell.is_empty() {
+                quoted = true;
+            } else if ch == sep {
+                row.push(std::mem::take(&mut cell));
+            } else if ch == '\n' || ch == '\r' {
+                if ch == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                row.push(std::mem::take(&mut cell));
+                rows.push(std::mem::take(&mut row));
+                if rows.len() >= max_rows {
+                    clipped = true;
+                    break;
+                }
+            } else {
+                cell.push(ch);
+            }
+        }
+        if !cell.is_empty() || !row.is_empty() {
+            row.push(cell);
+            rows.push(row);
+        }
+        let sname = filename.rsplit_once('.').map(|(a, _)| a).unwrap_or(filename).to_string();
+        let cleaned = tidy(rows, &mut clipped);
+        let out = if cleaned.is_empty() { vec![] } else { vec![(sname, cleaned)] };
+        return Ok((out, clipped));
+    }
+    let mut wb = calamine::open_workbook_auto(path).map_err(|e| anyhow!("Cannot open {}: {}", filename, e))?;
+    let names = wb.sheet_names().to_vec();
+    if names.len() > max_sheets {
+        clipped = true;
+    }
+    let mut sheets = vec![];
+    for name in names.into_iter().take(max_sheets) {
+        let Ok(range) = wb.worksheet_range(&name) else { continue };
+        let (sr, sc) = range.start().unwrap_or((0, 0));
+        let mut rows: Vec<Vec<String>> = vec![vec![]; (sr as usize).min(max_rows)];
+        for r in range.rows() {
+            if rows.len() >= max_rows {
+                clipped = true;
+                break;
+            }
+            let mut line: Vec<String> = vec![String::new(); (sc as usize).min(max_cols + 1)];
+            for c in r.iter().take(max_cols + 1 - line.len()) {
+                line.push(vs(&cell_value(c)));
+            }
+            rows.push(line);
+        }
+        let cleaned = tidy(rows, &mut clipped);
+        if !cleaned.is_empty() {
+            sheets.push((name, cleaned));
+        }
+    }
+    Ok((sheets, clipped))
+}
+
 fn norm(x: &str) -> String {
     x.to_lowercase().chars().filter(|c| c.is_ascii_alphanumeric()).collect()
 }

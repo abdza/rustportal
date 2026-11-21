@@ -464,14 +464,37 @@ pub async fn runpage(mut ctx: Ctx, module: &str, slug: &str, args: Vec<String>) 
             };
         }
         "File" => {
-            // result: a file_link id, #{file_id: n}, or #{content: "...", filename: "x.csv", content_type: "text/csv"}
+            // result: a file_link id, #{file_id: n}, #{path: "..."} (under upload_dir), or #{content: "...", filename: "x.csv", content_type: "text/csv"}
             if let Some(fid) = result.as_i64().or_else(|| result.get("file_id").and_then(|v| v.as_i64())) {
                 return crate::files::get(ctx, fid).await;
             }
             if let Some(o) = result.as_object() {
+                let inline = o.get("inline").and_then(|v| v.as_bool()).unwrap_or(false);
                 let name = { let n = s(o, "filename"); if n.is_empty() { "download.txt".to_string() } else { n } };
-                let ct = { let c = s(o, "content_type"); if c.is_empty() { mime_guess::from_path(&name).first_or_octet_stream().to_string() } else { c } };
-                return ctx.bytes(&ct, Some(&name), s(o, "content").into_bytes(), false).await;
+                let ct = {
+                    let c = s(o, "content_type");
+                    let c = if c.is_empty() { s(o, "contentType") } else { c };
+                    if c.is_empty() { mime_guess::from_path(&name).first_or_octet_stream().to_string() } else { c }
+                };
+                let path_str = s(o, "path");
+                if !path_str.is_empty() {
+                    if let (Ok(base), Ok(cand)) = (std::fs::canonicalize(&ctx.st.cfg.upload_dir), std::fs::canonicalize(&path_str)) {
+                        if cand.starts_with(&base) {
+                            if let Ok(bytes) = tokio::fs::read(&cand).await {
+                                let cache_secs = o.get("cacheSeconds").or_else(|| o.get("cache_seconds")).and_then(|v| v.as_i64()).unwrap_or(0);
+                                let mut resp = ctx.bytes(&ct, Some(&name), bytes, inline).await;
+                                if cache_secs > 0 {
+                                    if let Ok(hv) = axum::http::HeaderValue::from_str(&format!("public, max-age={}", cache_secs)) {
+                                        resp.headers_mut().insert(axum::http::header::CACHE_CONTROL, hv);
+                                    }
+                                }
+                                return resp;
+                            }
+                        }
+                    }
+                    return ctx.status(axum::http::StatusCode::NOT_FOUND, "Not found").await;
+                }
+                return ctx.bytes(&ct, Some(&name), s(o, "content").into_bytes(), inline).await;
             }
             ctx.flash("The file you requested does not exist");
             return ctx.redirect("/").await;

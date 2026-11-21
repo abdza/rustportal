@@ -7,10 +7,10 @@ use crate::row;
 use crate::tracker::Tracker;
 use crate::web::{self, St, Upload};
 use anyhow::{anyhow, Result};
-use minijinja::value::{Kwargs, Rest, Value as MV};
+use minijinja::value::{Kwargs, Object as MObj, Rest, Value as MV};
 use rhai::{Dynamic, Engine, EvalAltResult, Scope};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -726,6 +726,190 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
         };
         Ok(json!({"filename": name, "size": size, "text": String::from_utf8_lossy(&data)}))
     });
+    // read every sheet of an uploaded spreadsheet (.xlsx/.xls/.ods/.csv/.txt) without storing it permanently
+    reg!("upload_sheets", |x, field: &str| async move {
+        let info = x.files.lock().unwrap().get(field).map(|u| (u.filename.clone(), u.size, u.temp.clone(), u.bytes.clone()));
+        let Some((name, size, temp, bytes)) = info else { return Ok(Value::Null) };
+        if size > 10 * 1024 * 1024 {
+            return Ok(json!({"error": "too large"}));
+        }
+        let (path, cleanup) = match temp {
+            Some(t) => (t, false),
+            None => {
+                let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("xlsx");
+                let dir = std::path::PathBuf::from(&x.st.cfg.upload_dir).join("tmp");
+                let _ = tokio::fs::create_dir_all(&dir).await;
+                let p = dir.join(format!("sheet_{}.{}", uuid::Uuid::new_v4(), ext));
+                tokio::fs::write(&p, &bytes).await?;
+                (p, true)
+            }
+        };
+        let p_str = path.to_string_lossy().to_string();
+        let res = crate::upload::read_all_sheets(&p_str, &name, 20, 20000, 40);
+        if cleanup {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+        match res {
+            Ok((sheets, clipped)) => {
+                let arr: Vec<Value> = sheets.into_iter().map(|(n, rows)| json!({"name": n, "rows": rows})).collect();
+                Ok(json!({"name": name, "sheets": arr, "clipped": clipped}))
+            }
+            Err(e) => Ok(json!({"error": e.to_string()})),
+        }
+    });
+    // safe helpers scoped to upload_dir for scripts that keep files by path (logos, media)
+    reg!("file_exists", |x, path: &str| async move {
+        let ok = std::fs::canonicalize(&x.st.cfg.upload_dir)
+            .ok()
+            .zip(std::fs::canonicalize(path).ok())
+            .map(|(b, p)| p.starts_with(&b) && p.is_file())
+            .unwrap_or(false);
+        Ok(json!(ok))
+    });
+    reg!("file_mtime", |x, path: &str| async move {
+        let ms = std::fs::canonicalize(&x.st.cfg.upload_dir)
+            .ok()
+            .zip(std::fs::canonicalize(path).ok())
+            .filter(|(b, p)| p.starts_with(b) && p.is_file())
+            .and_then(|(_, p)| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        Ok(json!(ms))
+    });
+    reg!("delete_upload_path", |x, path: &str| async move {
+        if let (Ok(base), Ok(p)) = (std::fs::canonicalize(&x.st.cfg.upload_dir), std::fs::canonicalize(path)) {
+            if p.starts_with(&base) && p.is_file() {
+                let _ = tokio::fs::remove_file(p).await;
+            }
+        }
+        Ok(Value::Null)
+    });
+    reg!("delete_upload_dir", |x, rel: &str| async move {
+        let safe = !rel.is_empty() && !rel.starts_with('/') && rel.split('/').all(|c| !c.is_empty() && c != "." && c != "..");
+        if safe {
+            let target = std::path::Path::new(&x.st.cfg.upload_dir).join(rel);
+            if let (Ok(base), Ok(p)) = (std::fs::canonicalize(&x.st.cfg.upload_dir), std::fs::canonicalize(&target)) {
+                if p.starts_with(&base) && p != base && p.is_dir() {
+                    let _ = tokio::fs::remove_dir_all(p).await;
+                }
+            }
+        }
+        Ok(Value::Null)
+    });
+    // Magic-byte media check for uploaded photos and videos: returns #{ext, content_type, size} or ()
+    reg!("upload_detect_media", |x, field: &str, kind: &str| async move {
+        let info = x.files.lock().unwrap().get(field).map(|u| (u.size, u.temp.clone(), u.bytes.clone()));
+        let Some((size, temp, bytes)) = info else { return Ok(Value::Null) };
+        if size == 0 { return Ok(Value::Null); }
+        let mut head = [0u8; 16];
+        let got = if let Some(t) = temp {
+            use std::io::Read;
+            std::fs::File::open(t).and_then(|mut f| f.read(&mut head)).unwrap_or(0)
+        } else {
+            let n = bytes.len().min(16);
+            head[..n].copy_from_slice(&bytes[..n]);
+            n
+        };
+        let ascii = |from: usize, to: usize| -> String {
+            if got >= to { head[from..to].iter().map(|&b| b as char).collect() } else { String::new() }
+        };
+        let detected: Option<(&str, &str)> = if kind == "Photo" {
+            if got >= 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF { Some(("jpg", "image/jpeg")) }
+            else if got >= 8 && head[0] == 0x89 && ascii(1, 4) == "PNG" { Some(("png", "image/png")) }
+            else if ascii(0, 4) == "GIF8" { Some(("gif", "image/gif")) }
+            else if ascii(0, 4) == "RIFF" && ascii(8, 12) == "WEBP" { Some(("webp", "image/webp")) }
+            else { None }
+        } else {
+            let bx = ascii(4, 8);
+            if bx == "ftyp" {
+                let brand = ascii(8, 12);
+                if brand == "qt  " { Some(("mov", "video/quicktime")) }
+                else if brand.starts_with("3g") { Some(("3gp", "video/3gpp")) }
+                else if !matches!(brand.as_str(), "heic" | "heix" | "mif1" | "msf1" | "avif") { Some(("mp4", "video/mp4")) }
+                else { None }
+            } else if matches!(bx.as_str(), "moov" | "mdat" | "wide" | "free" | "skip") {
+                Some(("mov", "video/quicktime"))
+            } else if got >= 4 && head[0] == 0x1A && head[1] == 0x45 && head[2] == 0xDF && head[3] == 0xA3 {
+                Some(("webm", "video/webm"))
+            } else { None }
+        };
+        Ok(match detected {
+            Some((ext, ct)) => json!({"ext": ext, "content_type": ct, "size": size as i64}),
+            None => Value::Null,
+        })
+    });
+    // Save uploaded file directly under <upload_dir>/<rel_dir>/<filename> (no file_link row)
+    reg!("save_upload_raw", |x, field: &str, rel_dir: &str, filename: &str| async move {
+        let Some(up) = x.files.lock().unwrap().remove(field) else { return Ok(Value::Null) };
+        let safe = |p: &str| !p.is_empty() && !p.starts_with('/') && p.split('/').all(|c| !c.is_empty() && c != "." && c != "..");
+        if !safe(rel_dir) || !safe(filename) || filename.contains('/') {
+            return Err(anyhow!("save_upload_raw: rel_dir and filename must be plain relative names"));
+        }
+        let folder = std::path::Path::new(&x.st.cfg.upload_dir).join(rel_dir);
+        tokio::fs::create_dir_all(&folder).await?;
+        let target = folder.join(filename);
+        up.save_to(&target).await?;
+        let meta = tokio::fs::metadata(&target).await?;
+        let abs = std::fs::canonicalize(&target).unwrap_or(target);
+        Ok(json!({"path": abs.to_string_lossy().to_string(), "size": meta.len() as i64}))
+    });
+    // Fetch a remote PNG/JPEG image and cache it under <upload_dir>/<rel_path>, returning #{path, content_type}
+    reg!("fetch_image_cached", |x, url: &str, rel_path: &str, max_age_secs: i64, user_agent: &str| async move {
+        let safe = !rel_path.is_empty() && !rel_path.starts_with('/') && rel_path.split('/').all(|c| !c.is_empty() && c != "." && c != "..");
+        if !safe || !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Ok(Value::Null);
+        }
+        let file = std::path::Path::new(&x.st.cfg.upload_dir).join(rel_path);
+        let stale = match std::fs::metadata(&file) {
+            Ok(m) if m.is_file() && m.len() > 0 => {
+                let age = m.modified().ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_secs() as i64).unwrap_or(i64::MAX);
+                age > max_age_secs
+            }
+            _ => true,
+        };
+        if stale {
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(8))
+                .timeout(std::time::Duration::from_secs(12))
+                .build();
+            if let Ok(cli) = client {
+                if let Ok(resp) = cli.get(url).header("User-Agent", user_agent).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(bytes) = resp.bytes().await {
+                            let png = bytes.len() > 8 && bytes[0] == 0x89 && bytes[1] == b'P';
+                            let jpg = bytes.len() > 3 && bytes[0] == 0xFF && bytes[1] == 0xD8;
+                            if png || jpg {
+                                if let Some(parent) = file.parent() {
+                                    let _ = tokio::fs::create_dir_all(parent).await;
+                                }
+                                let tmp = file.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+                                if tokio::fs::write(&tmp, &bytes).await.is_ok() {
+                                    if tokio::fs::rename(&tmp, &file).await.is_err() {
+                                        let _ = tokio::fs::write(&file, &bytes).await;
+                                        let _ = tokio::fs::remove_file(&tmp).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(m) = std::fs::metadata(&file) {
+            if m.is_file() && m.len() > 0 {
+                let mut b0 = [0u8; 1];
+                let is_png = std::fs::File::open(&file).and_then(|mut f| std::io::Read::read(&mut f, &mut b0)).map(|n| n == 1 && b0[0] == 0x89).unwrap_or(false);
+                let abs = std::fs::canonicalize(&file).unwrap_or(file);
+                return Ok(json!({
+                    "path": abs.to_string_lossy().to_string(),
+                    "content_type": if is_png { "image/png" } else { "image/jpeg" }
+                }));
+            }
+        }
+        Ok(Value::Null)
+    });
     reg!("log_error", |x, msg: &str| async move {
         web::log_error(x.db(), "script", "log_error", msg, None, None, x.uid()).await;
         Ok(Value::Null)
@@ -899,6 +1083,102 @@ pub fn java_shuffle(mut a: rhai::Array, seed: i64) -> rhai::Array {
     a
 }
 
+struct PortalServiceObj(Arc<Inner>);
+
+impl std::fmt::Debug for PortalServiceObj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("portalService")
+    }
+}
+
+impl MObj for PortalServiceObj {
+    fn call_method(
+        self: &Arc<Self>,
+        _state: &minijinja::State,
+        name: &str,
+        args: &[MV],
+    ) -> std::result::Result<MV, minijinja::Error> {
+        let m = arg(args, 0);
+        let sl = arg(args, 1);
+        let vars = args.get(2).map(m2j).map(obj).unwrap_or_default();
+        match name {
+            "runPage" | "run_page" => self.0.block(run_page(&self.0, &m, &sl, vars)).map(|v| j2m(&v)).map_err(mj_err),
+            "includePage" | "include_page" | "renderPage" | "render_page" => {
+                self.0.block(include_page(&self.0, &m, &sl, vars)).map(MV::from_safe_string).map_err(mj_err)
+            }
+            _ => Err(minijinja::Error::new(minijinja::ErrorKind::UnknownMethod, format!("portalService has no method {}", name))),
+        }
+    }
+}
+
+struct SystemObj;
+
+impl std::fmt::Debug for SystemObj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("System")
+    }
+}
+
+impl MObj for SystemObj {
+    fn call_method(
+        self: &Arc<Self>,
+        _state: &minijinja::State,
+        name: &str,
+        _args: &[MV],
+    ) -> std::result::Result<MV, minijinja::Error> {
+        match name {
+            "currentTimeMillis" => Ok(MV::from(chrono::Local::now().timestamp_millis())),
+            _ => Err(minijinja::Error::new(minijinja::ErrorKind::UnknownMethod, format!("System has no method {}", name))),
+        }
+    }
+}
+
+struct JsonOutputObj;
+impl std::fmt::Debug for JsonOutputObj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("JsonOutput") }
+}
+impl MObj for JsonOutputObj {
+    fn call_method(
+        self: &Arc<Self>,
+        _state: &minijinja::State,
+        name: &str,
+        args: &[MV],
+    ) -> std::result::Result<MV, minijinja::Error> {
+        let v = args.first().map(m2j).unwrap_or(Value::Null);
+        match name {
+            "toJson" => Ok(MV::from(serde_json::to_string(&v).unwrap_or_else(|_| "null".into()))),
+            "prettyPrint" => Ok(MV::from(serde_json::to_string_pretty(&v).unwrap_or_else(|_| "null".into()))),
+            _ => Err(minijinja::Error::new(minijinja::ErrorKind::UnknownMethod, format!("JsonOutput has no method {}", name))),
+        }
+    }
+}
+
+struct GroovyJsonObj;
+impl std::fmt::Debug for GroovyJsonObj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("groovy.json") }
+}
+impl MObj for GroovyJsonObj {
+    fn get_value(self: &Arc<Self>, key: &MV) -> Option<MV> {
+        match key.as_str()? {
+            "JsonOutput" => Some(MV::from_object(JsonOutputObj)),
+            _ => None,
+        }
+    }
+}
+
+struct GroovyObj;
+impl std::fmt::Debug for GroovyObj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("groovy") }
+}
+impl MObj for GroovyObj {
+    fn get_value(self: &Arc<Self>, key: &MV) -> Option<MV> {
+        match key.as_str()? {
+            "json" => Some(MV::from_object(GroovyJsonObj)),
+            _ => None,
+        }
+    }
+}
+
 fn mj_err(e: impl ToString) -> minijinja::Error {
     minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
 }
@@ -1033,7 +1313,15 @@ impl Sc {
             }
             ctx.insert("session".into(), Value::Object(sess));
         }
-        tokio::task::block_in_place(|| env.render_str(tpl, Value::Object(ctx)).map_err(|e| anyhow!("{:#}", e)))
+        let mut mctx: BTreeMap<String, MV> = ctx.into_iter().map(|(k, v)| (k, j2m(&v))).collect();
+        let ps_obj = MV::from_object(PortalServiceObj(self.inner.clone()));
+        mctx.entry("portalService".into()).or_insert_with(|| ps_obj.clone());
+        if mctx.get("ps").map(|v| v.is_none() || v.is_undefined()).unwrap_or(true) {
+            mctx.insert("ps".into(), ps_obj);
+        }
+        mctx.entry("System".into()).or_insert_with(|| MV::from_object(SystemObj));
+        mctx.entry("groovy".into()).or_insert_with(|| MV::from_object(GroovyObj));
+        tokio::task::block_in_place(|| env.render_str(tpl, MV::from(mctx)).map_err(|e| anyhow!("{:#}", e)))
     }
 
     fn add_functions(&self, env: &mut minijinja::Environment) {

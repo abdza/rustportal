@@ -304,7 +304,10 @@ pub fn method(recv: &Value, name: &str, a: &[Value]) -> Value {
                 // dates are text here: "2026-01-31 10:00:00"
                 "format" => json!(java_date(&s, &vs(&a0))),
                 "clearTime" => json!(match crate::script::parse_dt(&s) { Some(d) => d.date().format("%Y-%m-%d 00:00:00").to_string(), None => s }),
-                "getTime" => crate::script::parse_dt(&s).map(|d| json!(d.and_utc().timestamp_millis())).unwrap_or(Value::Null),
+                "getTime" => crate::script::parse_dt(&s)
+                    .and_then(|d| d.and_local_timezone(chrono::Local).earliest())
+                    .map(|d| json!(d.timestamp_millis()))
+                    .unwrap_or(Value::Null),
                 "getYear" => crate::script::parse_dt(&s).map(|d| json!(d.format("%Y").to_string().parse::<i64>().unwrap_or(0) - 1900)).unwrap_or(Value::Null),
                 "getMonth" => crate::script::parse_dt(&s).map(|d| json!(d.format("%m").to_string().parse::<i64>().unwrap_or(1) - 1)).unwrap_or(Value::Null),
                 "getDate" => crate::script::parse_dt(&s).map(|d| json!(d.format("%d").to_string().parse::<i64>().unwrap_or(0))).unwrap_or(Value::Null),
