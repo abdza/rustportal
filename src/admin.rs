@@ -335,16 +335,130 @@ async fn show_extras(ctx: &mut Ctx, e: &Entity, r: &Row) -> String {
     let id = i(r, "id").unwrap_or(0);
     let mut o = String::new();
     match e.name {
-        "portalPage" => {
-            let (m, sl) = (s(r, "module"), s(r, "slug"));
-            o.push_str(&format!("<a class='btn btn-sm btn-success' href='/{}/{}/{}'>{}</a> ", if b(r, "runable") { "run" } else { "view" }, m, sl, if b(r, "runable") { "Run" } else { "View" }));
-        }
         "portalErrorLog" => o.push_str(&post_button(ctx, &format!("/portalErrorLog/resolve/{}", id), "Mark resolved", "btn-outline-primary", None)),
         "portalEndpoint" => o.push_str(&format!("<code>/svc/{}/{}</code> ", esc(&s(r, "module")), esc(&s(r, "slug")))),
         "portalModuleAccessReview" => o.push_str(&post_button(ctx, &format!("/portalModuleAccessReview/approve/{}", id), "Approve review", "btn-outline-success", Some("Confirm that the access list of this module is correct?"))),
         _ => {}
     }
     o
+}
+
+fn fmt_bool_tf(v: Option<&Value>) -> &'static str {
+    match v {
+        Some(Value::Bool(true)) => "True",
+        Some(Value::Bool(false)) => "False",
+        Some(Value::Number(n)) if n.as_i64() == Some(1) => "True",
+        Some(Value::Number(n)) if n.as_i64() == Some(0) => "False",
+        Some(Value::String(x)) if x.eq_ignore_ascii_case("true") || x == "1" => "True",
+        Some(Value::String(x)) if x.eq_ignore_ascii_case("false") || x == "0" => "False",
+        _ => "",
+    }
+}
+
+fn fmt_dt_show(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if let Some(dt) = crate::script::parse_dt(t) {
+        return dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    }
+    let norm = t.replace('T', " ");
+    let base = norm.split('.').next().unwrap_or(&norm).trim_end_matches('Z');
+    let base = if base.len() > 19 { &base[..19] } else { base };
+    match crate::script::parse_dt(base) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => t.to_string(),
+    }
+}
+
+/// Match g6ikram's `views/portalPage/show.gsp` + `datasources/_displayWrapper.gsp`
+/// + `content/_displayWrapper.gsp`.
+async fn show_portal_page(mut ctx: Ctx, e: &Entity, r: &Row, id: i64) -> Response {
+    let m = s(r, "module");
+    let sl = s(r, "slug");
+    let runable = b(r, "runable");
+    let mod_cell = match module_url(ctx.db(), &m).await {
+        Some(u) => format!("<a href=\"{u}\">{}</a>", esc(&m)),
+        None => esc(&m),
+    };
+    let content_raw = s(r, "content");
+    let content_cell = if runable {
+        if content_raw.is_empty() {
+            String::new()
+        } else {
+            format!("<pre class=\"code-view\">{}</pre>", esc(&content_raw))
+        }
+    } else {
+        content_raw.replace('\r', "<br/>")
+    };
+    let pre_raw = s(r, "preprocess");
+    let pre_cell = if pre_raw.is_empty() {
+        String::new()
+    } else {
+        format!("<pre class=\"code-view\">{}</pre>", esc(&pre_raw))
+    };
+
+    let dss = ctx
+        .db()
+        .rows(
+            &format!("select * from \"{}\" where page_id=:id order by id", db::page_data_t()),
+            &row! {"id"=>id},
+        )
+        .await
+        .unwrap_or_default();
+    let mut ds_items = String::new();
+    for ds in &dss {
+        let dsid = i(ds, "id").unwrap_or(0);
+        ds_items.push_str(&format!(
+            "<li><a class=\"create\" href=\"/portalPageData/edit/{dsid}?page_id={id}\">{}</a> : {}</li>\n",
+            esc(&s(ds, "name")),
+            esc(&s(ds, "query")),
+        ));
+    }
+    ds_items.push_str(&format!("<li><a class=\"create\" href=\"/portalPageData/create?page_id={id}\">Add Datasource</a></li>\n"));
+
+    let prop = |key: &str, label: &str, val: &str| {
+        format!(
+            "    <li class=\"fieldcontain\">\n        <span id=\"{key}-label\" class=\"property-label\">{label}</span>\n        <div class=\"property-value\" aria-labelledby=\"{key}-label\">{val}</div>\n    </li>\n"
+        )
+    };
+    let mut h = String::from("<ol class=\"property-list portalPage\">\n");
+    h.push_str(&prop("title", "Title", &esc(&s(r, "title"))));
+    h.push_str(&prop("slug", "Slug", &esc(&sl)));
+    h.push_str(&prop("module", "Module", &mod_cell));
+    h.push_str(&prop("published", "Published", fmt_bool_tf(r.get("published"))));
+    h.push_str(&prop("requirelogin", "Requirelogin", fmt_bool_tf(r.get("requirelogin"))));
+    h.push_str(&prop("allowedroles", "Allowedroles", &esc(&s(r, "allowedroles"))));
+    h.push_str(&prop("runable", "Runable", fmt_bool_tf(r.get("runable"))));
+    h.push_str(&prop("redirectafter", "Redirectafter", &esc(&s(r, "redirectafter"))));
+    h.push_str(&prop("fullpage", "Fullpage", fmt_bool_tf(r.get("fullpage"))));
+    h.push_str(&prop("render", "Render", &esc(&s(r, "render"))));
+    h.push_str(&prop("lastUpdated", "Last Updated", &esc(&fmt_dt_show(&s(r, "last_updated")))));
+    h.push_str(&prop("side_menu", "Side Menu", &esc(&s(r, "side_menu"))));
+    h.push_str(&prop("content", "Content", &content_cell));
+    h.push_str(&prop("preprocess", "Preprocess", &pre_cell));
+    h.push_str(&prop("datasources", "Datasources", &format!("<a id=\"dslist\"></a>\n<ul>\n{ds_items}</ul>")));
+    h.push_str("</ol>\n");
+    h.push_str(&format!(
+        "                    <form action=\"/portalPage/delete/{id}\" method=\"post\">{}\n                        <fieldset class=\"buttons\">\n                            <a href=\"/portalPage/edit/{id}\" class=\"edit\">Edit</a>\n                            <input class=\"delete\" type=\"submit\" value=\"Delete\" onclick=\"return confirm('Are you sure?');\" />\n                        </fieldset>\n                    </form>",
+        ctx.csrf_field()
+    ));
+
+    let view_or_run = if runable {
+        li("create", &format!("/run/{}/{}", enc(&m), enc(&sl)), "Run")
+    } else {
+        li("create", &format!("/view/{}/{}", enc(&m), enc(&sl)), "View")
+    };
+    let extra_nav = format!(
+        "{}{}{}",
+        li("edit", &format!("/portalPage/edit/{id}"), "Edit"),
+        view_or_run,
+        li("list", "#dslist", "Datasources"),
+    );
+    let flash = s(&ctx.sess, "flash");
+    let page = frame(e, "show", &nav(e, &extra_nav), "Show PortalPage", &flash, &h);
+    ctx.html("Show PortalPage", page).await
 }
 
 pub async fn show(mut ctx: Ctx, e: &Entity, id: i64) -> Response {
@@ -354,6 +468,9 @@ pub async fn show(mut ctx: Ctx, e: &Entity, id: i64) -> Response {
     let Ok(Some(r)) = ctx.db().get(e.table, id).await else { return ctx.status(StatusCode::NOT_FOUND, "Not found").await };
     if !may(&ctx, e, &r).await {
         return ctx.status(StatusCode::FORBIDDEN, "You are not authorized to view this").await;
+    }
+    if e.name == "portalPage" {
+        return show_portal_page(ctx, e, &r, id).await;
     }
     let mut h = String::new();
     let extras = show_extras(&mut ctx, e, &r).await;
@@ -698,6 +815,11 @@ pub async fn create(mut ctx: Ctx, e: &Entity) -> Response {
     if e.name == "portalPage" {
         r.entry("requirelogin".to_string()).or_insert(json!(true));
     }
+    if e.name == "portalPageData" && !r.contains_key("page_id") && ctx.params.contains_key("page") {
+        if let Ok(pid) = ctx.p("page").parse::<i64>() {
+            r.insert("page_id".into(), json!(pid));
+        }
+    }
     let body = form(&mut ctx, e, &r, None).await;
     let flash = s(&ctx.sess, "flash");
     let page = frame(e, "create", &nav_for(e, "", true, false), &format!("Create {}", ename(e)), &flash, &body);
@@ -712,9 +834,19 @@ pub async fn edit(mut ctx: Ctx, e: &Entity, id: i64) -> Response {
     if e.readonly || !may(&ctx, e, &r).await {
         return ctx.status(StatusCode::FORBIDDEN, "You are not authorized to edit this").await;
     }
+    let extra_nav = if e.name == "portalPage" {
+        let (m, sl) = (s(&r, "module"), s(&r, "slug"));
+        if b(&r, "runable") {
+            li("create", &format!("/run/{}/{}", enc(&m), enc(&sl)), "Run")
+        } else {
+            li("create", &format!("/view/{}/{}", enc(&m), enc(&sl)), "View")
+        }
+    } else {
+        String::new()
+    };
     let body = form(&mut ctx, e, &r, Some(id)).await;
     let flash = s(&ctx.sess, "flash");
-    let page = frame(e, "edit", &nav(e, ""), &format!("Edit {}", ename(e)), &flash, &body);
+    let page = frame(e, "edit", &nav(e, &extra_nav), &format!("Edit {}", ename(e)), &flash, &body);
     ctx.html(&format!("Edit {}", ename(e)), page).await
 }
 

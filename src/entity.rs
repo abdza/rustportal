@@ -132,11 +132,11 @@ pub fn entities() -> Vec<Entity> {
             .list(&["name", "module", "type", "text", "date_value", "number", "datum_type"])
             .order("id"),
         Entity::new("portalPage", crate::db::page_t(), "Page", "title", Module("module"))
-            .f(&[("title", Str), ("slug", Str), ("module", Str), ("side_menu", Str), ("allowedroles", Str), ("requirelogin", Bool),
-                ("published", Bool), ("runable", Bool), ("fullpage", Bool), ("render", Choice(&["", "Default", "HTML", "XML", "JSON", "File", "XLSX"])),
-                ("redirectafter", Str), ("content", Code), ("preprocess", Code)])
+            .f(&[("title", Str), ("slug", Str), ("module", Str), ("published", Bool), ("requirelogin", Bool), ("allowedroles", Str),
+                ("runable", Bool), ("redirectafter", Str), ("fullpage", Bool), ("render", Choice(&["", "Default", "HTML", "XML", "JSON", "File", "XLSX"])),
+                ("side_menu", Str), ("content", Code), ("preprocess", Code)])
             .h(&[("last_updated", Date)])
-            .list(&["module", "slug", "title", "published", "runable", "last_updated"])
+            .list(&["title", "slug", "module", "published", "requirelogin", "allowedroles", "runable"])
             .children(&[("portalPageData", "page_id")])
             .order("module,slug"),
         Entity::new("portalPageData", crate::db::page_data_t(), "Page Data Source", "name", Via("page_id", "portalPage"))
