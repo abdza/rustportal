@@ -312,8 +312,7 @@ fn li(class: &str, href: &str, label: &str) -> String {
 fn index_extras(e: &Entity, is_admin: bool) -> String {
     let mut o = match e.name {
         "portalErrorLog" => li("list", "/portalErrorLog/index?resolved=false", "Unresolved only"),
-        "portalScheduler" if is_admin => li("list", "/portalSchedulerRun/index", "Scheduler Runs"),
-        "portalSchedulerRun" => li("list", "/portalScheduler/index", "Scheduler List"),
+        "portalSchedulerRun" => format!("{}{}", li("list", "/portalScheduler/status", "Scheduler Status"), li("list", "/portalScheduler/index", "Scheduler List")),
         "userRole" if is_admin => li("list", "/user/index", "User List"),
         _ => String::new(),
     };
@@ -340,7 +339,6 @@ async fn show_extras(ctx: &mut Ctx, e: &Entity, r: &Row) -> String {
             let (m, sl) = (s(r, "module"), s(r, "slug"));
             o.push_str(&format!("<a class='btn btn-sm btn-success' href='/{}/{}/{}'>{}</a> ", if b(r, "runable") { "run" } else { "view" }, m, sl, if b(r, "runable") { "Run" } else { "View" }));
         }
-        "portalScheduler" => o.push_str(&post_button(ctx, &format!("/portalScheduler/run/{}", id), "Run now", "btn-outline-primary", None)),
         "portalErrorLog" => o.push_str(&post_button(ctx, &format!("/portalErrorLog/resolve/{}", id), "Mark resolved", "btn-outline-primary", None)),
         "portalEndpoint" => o.push_str(&format!("<code>/svc/{}/{}</code> ", esc(&s(r, "module")), esc(&s(r, "slug")))),
         "portalModuleAccessReview" => o.push_str(&post_button(ctx, &format!("/portalModuleAccessReview/approve/{}", id), "Approve review", "btn-outline-success", Some("Confirm that the access list of this module is correct?"))),

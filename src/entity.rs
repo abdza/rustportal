@@ -246,9 +246,9 @@ pub fn entities() -> Vec<Entity> {
             .list(&["title", "module", "emailto", "emailcc", "body", "delivery_time", "email_sent", "time_sent"])
             .order("delivery_time desc, id desc"),
         Entity::new("portalScheduler", "portal_scheduler", "Scheduler", "name", Module("module"))
-            .f(&[("module", Str), ("name", Str), ("slugs", Text), ("hour", Str), ("day_of_week", Str), ("day_of_month", Str), ("enabled", Bool), ("catch_up", Bool)])
-            .h(&[("lastrun", Date), ("last_updated", Date)])
-            .list(&["module", "name", "slugs", "hour", "day_of_week", "day_of_month", "enabled", "lastrun"]),
+            .f(&[("name", Str), ("module", Str), ("slugs", Text), ("hour_of_day", Str), ("day_of_week", Str), ("day_of_month", Str), ("enabled", Bool), ("catch_up", Bool)])
+            .h(&[("hour", Str), ("lastrun", Date), ("last_updated", Date)])
+            .list(&["name", "module", "slugs", "hour_of_day", "day_of_week", "day_of_month", "lastrun", "enabled", "catch_up"]),
         Entity::new("portalSchedulerRun", "portal_scheduler_run", "Scheduler Run", "name", Global)
             .f(&[("run_type", Str), ("status", Str), ("scheduler_id", Int), ("tick_id", Int), ("name", Str), ("module", Str), ("slug", Str),
                 ("due_slot", Date), ("started", Date), ("finished", Date), ("duration_ms", Int), ("error", Text), ("result", Text),

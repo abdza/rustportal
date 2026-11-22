@@ -150,7 +150,9 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
         ("portalFileManager", _) => return file_manager::controller(ctx, action, id).await,
         ("portalEmail", "lookup") => {}
         ("portalEmail", _) => return mail::controller(ctx, action, id).await,
-        ("portalScheduler", "run") | ("portalErrorLog", "resolve") | ("portalModuleAccessReview", "approve") => {
+        ("portalScheduler", "lookup") => {}
+        ("portalScheduler", _) => return scheduler::controller(ctx, action, id).await,
+        ("portalErrorLog", "resolve") | ("portalModuleAccessReview", "approve") => {
             let ename = if c == "accessReview" { "portalModuleAccessReview" } else { c };
             let rid = id.unwrap_or(0);
             let table = st.entity(ename).map(|e| e.table).unwrap_or("");
@@ -164,10 +166,6 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
                 return ctx.status(axum::http::StatusCode::FORBIDDEN, "Not allowed").await;
             }
             match ename {
-                "portalScheduler" => {
-                    scheduler::run_scheduler(&st, &r, &ctx.user.as_ref().map(|u| s(u, "userid")).unwrap_or_default()).await;
-                    ctx.flash("Scheduler run finished; see Scheduler Runs for the result");
-                }
                 "portalErrorLog" => {
                     let _ = st.db.update("portal_error_log", rid, &row! {"resolved"=>true,"dateresolved"=>web::now_str()}).await;
                     ctx.flash("Marked as resolved");

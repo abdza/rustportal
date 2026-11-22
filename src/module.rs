@@ -981,8 +981,10 @@ pub async fn import_from_opts(st: &St, module: &str, dir: &Path, opts: &ImportOp
             d.insert("module".into(), json!(smod));
             let hr = sched_hour(x);
             if !hr.is_empty() {
-                d.insert("hour".into(), json!(hr));
+                d.insert("hour".into(), json!(hr.clone()));
+                d.insert("hour_of_day".into(), json!(hr));
             }
+            d.insert("last_updated".into(), json!(now_str()));
             if let Some(ex) = existing {
                 if opts.scheduler_choices.get(&key).map(|v| v.as_str()) == Some("import") {
                     if let Some(eid) = i(&ex, "id") {
