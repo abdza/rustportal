@@ -386,7 +386,8 @@ async fn index(ctx: Ctx) -> Response {
     let Some(u) = ctx.user.as_ref() else { return ctx.need_login().await };
     let is_admin = ctx.is_admin();
     let can_switch = is_switchable(&ctx).await && !ctx.sess.contains_key("adminlink");
-    if !is_admin && !can_switch && web::admin_list(db, u).await.is_empty() {
+    let has_admin_mods = if is_admin { true } else { !web::admin_list(db, u).await.is_empty() };
+    if !is_admin && !can_switch && !has_admin_mods {
         return ctx.status(StatusCode::FORBIDDEN, "You are not authorized to view this list").await;
     }
 
@@ -442,6 +443,9 @@ async fn index(ctx: Ctx) -> Response {
     );
     if is_admin {
         nav.push_str("<li><a class=\"create\" href=\"/user/create\">New User</a></li>\n");
+    }
+    if is_admin || has_admin_mods {
+        nav.push_str("<li><a class=\"list\" href=\"/userRole/index\">Roles</a></li>\n");
     }
     if has_um_admin {
         nav.push_str("<li><a class=\"list\" href=\"/view/user_management/dashboard\">User Management Dashboard</a></li>\n");
