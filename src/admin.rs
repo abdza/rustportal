@@ -383,14 +383,10 @@ async fn show_portal_page(mut ctx: Ctx, e: &Entity, r: &Row, id: i64) -> Respons
         None => esc(&m),
     };
     let content_raw = s(r, "content");
-    let content_cell = if runable {
-        if content_raw.is_empty() {
-            String::new()
-        } else {
-            format!("<pre class=\"code-view\">{}</pre>", esc(&content_raw))
-        }
+    let content_cell = if content_raw.is_empty() {
+        String::new()
     } else {
-        content_raw.replace('\r', "<br/>")
+        format!("<pre class=\"code-view\">{}</pre>", esc(&content_raw))
     };
     let pre_raw = s(r, "preprocess");
     let pre_cell = if pre_raw.is_empty() {
