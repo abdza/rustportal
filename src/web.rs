@@ -86,6 +86,8 @@ pub struct Config {
     pub user_profile: Option<String>,
     pub allow_registration: bool,
     pub session_hours: i64,
+    /// Optional session timeout in minutes (overrides `session_hours` when set).
+    pub session_minutes: Option<i64>,
     pub app_name: String,
     pub mail: MailCfg,
     pub google_oauth: GoogleOAuthCfg,
@@ -116,6 +118,7 @@ impl Default for Config {
             user_profile: None,
             allow_registration: false,
             session_hours: 12,
+            session_minutes: None,
             app_name: "Portal".into(),
             mail: MailCfg::default(),
             google_oauth: GoogleOAuthCfg::default(),
@@ -241,6 +244,7 @@ pub struct Ctx {
     pub sid: String,
     pub sess: Row,
     sess_orig: String,
+    sess_touch: bool,
     pub user: Option<Row>,
     pub params: Row,
     pub files: HashMap<String, Upload>,
@@ -412,12 +416,13 @@ impl FromRequest<St> for Ctx {
         }
         let mut sess = Row::new();
         let mut sess_orig = String::new();
+        let mut sess_touch = false;
         if !sid.is_empty() {
-            if let Ok(Some(r)) = st.db.first("select data from portal_session where id=:id", &row! {"id"=>sid.clone()}).await {
-                sess_orig = s(&r, "data");
-                if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(&sess_orig) {
-                    sess = o;
-                }
+            let ttl_mins = session_timeout_minutes(&st.db, &st.cfg).await;
+            if let Some((raw, obj, stale)) = load_session(&st.db, &sid, ttl_mins).await {
+                sess_orig = raw;
+                sess = obj;
+                sess_touch = stale;
             } else {
                 sid.clear();
             }
@@ -432,7 +437,7 @@ impl FromRequest<St> for Ctx {
                 sess.remove("userid");
             }
         }
-        let ctx = Ctx { st: st.clone(), sid, sess, sess_orig, user, params, files, method, path, query, headers, ip, body, start, side_menu: None, module: None, slug: None };
+        let ctx = Ctx { st: st.clone(), sid, sess, sess_orig, sess_touch, user, params, files, method, path, query, headers, ip, body, start, side_menu: None, module: None, slug: None };
         if ctx.method == "POST" && !is_svc {
             let sent = {
                 let mut p = s(&ctx.params, "csrf_token");
@@ -453,6 +458,59 @@ impl FromRequest<St> for Ctx {
         }
         Ok(ctx)
     }
+}
+
+/// Effective session inactivity timeout in minutes.
+/// Priority: `portal.session_minutes` in `portal_setting` (if > 0),
+/// else `session_minutes` in config.toml, else `session_hours * 60` (min 1 minute).
+pub async fn session_timeout_minutes(db: &Db, cfg: &Config) -> i64 {
+    if let Some(v) = setting(db, "portal.session_minutes").await {
+        let parsed = match &v {
+            Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f.round() as i64)),
+            Value::String(x) => x.trim().parse::<i64>().ok(),
+            _ => None,
+        };
+        if let Some(m) = parsed.filter(|&m| m > 0) {
+            return m;
+        }
+    }
+    if let Some(m) = cfg.session_minutes {
+        return m.max(1);
+    }
+    cfg.session_hours.max(1) * 60
+}
+
+/// Load a non-expired session by id; deletes the row and returns `None` if expired.
+/// The boolean indicates whether `updated` should be refreshed to slide the inactivity window.
+async fn load_session(db: &Db, sid: &str, ttl_mins: i64) -> Option<(String, Row, bool)> {
+    let ttl = ttl_mins.max(1);
+    let touch_secs = (ttl * 60 / 4).clamp(15, 60);
+    let q = format!(
+        "select data, (updated is not null and updated >= now() - interval '{} minutes') as alive, (updated < now() - interval '{} seconds') as stale from portal_session where id=:id",
+        ttl, touch_secs
+    );
+    let r = db.first(&q, &row! {"id"=>sid}).await.ok().flatten()?;
+    if !b(&r, "alive") {
+        let _ = db.exec("delete from portal_session where id=:id", &row! {"id"=>sid}).await;
+        return None;
+    }
+    let raw = s(&r, "data");
+    let obj = match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Object(o)) => o,
+        _ => Row::new(),
+    };
+    Some((raw, obj, b(&r, "stale")))
+}
+
+/// Remove expired rows from `portal_session`.
+pub async fn prune_sessions(db: &Db, ttl_mins: i64) {
+    let ttl = ttl_mins.max(1);
+    let _ = db
+        .exec(
+            &format!("delete from portal_session where updated is null or updated < now() - interval '{} minutes'", ttl),
+            &Row::new(),
+        )
+        .await;
 }
 
 /// Load a user row for use by pages and scripts. Secrets are stripped and
@@ -690,6 +748,11 @@ impl Ctx {
                     "insert into portal_session (id,data,updated) values (:id,:d,now()) on conflict (id) do update set data=excluded.data, updated=now()",
                     &row! {"id"=>self.sid.clone(),"d"=>data},
                 )
+                .await;
+        } else if self.sess_touch && self.user.is_some() {
+            let _ = self
+                .db()
+                .exec("update portal_session set updated=now() where id=:id", &row! {"id"=>self.sid.clone()})
                 .await;
         }
         if let Ok(v) = HeaderValue::from_str(&format!("RPSESSION={}; Path=/; HttpOnly; SameSite=Lax", self.sid)) {
@@ -1060,6 +1123,84 @@ mod csrf_tests {
         assert!(!inject_csrf("<header>x</header><body>", "t").starts_with("<header><script>"));
         assert_eq!(inject_csrf("{\"status\":\"Voting\"}", "t"), "{\"status\":\"Voting\"}");
         assert!(inject_csrf("<div><form method=post></form></div>", "t").ends_with("</script>"));
+    }
+
+    #[tokio::test]
+    async fn session_expires_on_load_and_prune() {
+        let db = Db::connect("sqlite::memory:", 1, None).await.expect("connect sqlite");
+        crate::entity::sync_schema(&db, &crate::entity::entities()).await.expect("sync schema");
+
+        // Timeout resolution: default session_hours -> config session_minutes -> portal_setting override
+        let mut cfg = Config::default();
+        assert_eq!(session_timeout_minutes(&db, &cfg).await, 12 * 60);
+        cfg.session_minutes = Some(30);
+        assert_eq!(session_timeout_minutes(&db, &cfg).await, 30);
+        db.insert(
+            "portal_setting",
+            &row! {"module"=>"portal","name"=>"session_minutes","type"=>"Text","text"=>"45"},
+        )
+        .await
+        .unwrap();
+        assert_eq!(session_timeout_minutes(&db, &cfg).await, 45);
+
+        // Fresh session loads cleanly and doesn't need immediate touch
+        db.exec(
+            "insert into portal_session (id,data,updated) values ('fresh','{\"userid\":1}',now())",
+            &db::no_params(),
+        )
+        .await
+        .unwrap();
+        let (_, obj, stale) = load_session(&db, "fresh", 30).await.expect("fresh session");
+        assert_eq!(i(&obj, "userid"), Some(1));
+        assert!(!stale);
+
+        // Active session older than the touch throttle is alive and flagged for sliding refresh
+        db.exec(
+            "insert into portal_session (id,data,updated) values ('active','{\"userid\":1}',now() - interval '10 minutes')",
+            &db::no_params(),
+        )
+        .await
+        .unwrap();
+        let (_, _, stale) = load_session(&db, "active", 30).await.expect("active session");
+        assert!(stale);
+
+        // Session past 30-minute timeout is rejected on load and deleted from the database
+        db.exec(
+            "insert into portal_session (id,data,updated) values ('expired','{\"userid\":2}',now() - interval '31 minutes')",
+            &db::no_params(),
+        )
+        .await
+        .unwrap();
+        assert!(load_session(&db, "expired", 30).await.is_none());
+        assert_eq!(db.count("select count(*) from portal_session where id='expired'", &db::no_params()).await.unwrap(), 0);
+
+        // Session with null updated is also treated as expired and deleted
+        db.exec(
+            "insert into portal_session (id,data,updated) values ('nullts','{\"userid\":3}',null)",
+            &db::no_params(),
+        )
+        .await
+        .unwrap();
+        assert!(load_session(&db, "nullts", 30).await.is_none());
+        assert_eq!(db.count("select count(*) from portal_session where id='nullts'", &db::no_params()).await.unwrap(), 0);
+
+        // prune_sessions removes stale/null rows while keeping fresh/active ones
+        db.exec(
+            "insert into portal_session (id,data,updated) values ('stale1','{\"userid\":4}',now() - interval '40 minutes')",
+            &db::no_params(),
+        )
+        .await
+        .unwrap();
+        db.exec(
+            "insert into portal_session (id,data,updated) values ('stale2','{\"userid\":5}',null)",
+            &db::no_params(),
+        )
+        .await
+        .unwrap();
+        prune_sessions(&db, 30).await;
+        assert_eq!(db.count("select count(*) from portal_session", &db::no_params()).await.unwrap(), 2);
+        assert!(load_session(&db, "fresh", 30).await.is_some());
+        assert!(load_session(&db, "active", 30).await.is_some());
     }
 }
 

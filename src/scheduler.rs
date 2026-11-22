@@ -541,8 +541,16 @@ pub async fn run_scheduler(st: &St, sch: &Row, triggered_by: &str) {
 }
 
 pub fn spawn(st: St, run_jobs: bool) {
+    let st_sess = st.clone();
     tokio::spawn(async move {
-        let mut n: u64 = 0;
+        loop {
+            let ttl_mins = crate::web::session_timeout_minutes(&st_sess.db, &st_sess.cfg).await;
+            crate::web::prune_sessions(&st_sess.db, ttl_mins).await;
+            let wait_mins = ttl_mins.clamp(5, 30) as u64;
+            tokio::time::sleep(std::time::Duration::from_secs(wait_mins * 60)).await;
+        }
+    });
+    tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let st2 = st.clone();
@@ -567,10 +575,6 @@ pub fn spawn(st: St, run_jobs: bool) {
                 }
             })
             .await;
-            n += 1;
-            if n % 30 == 0 {
-                let _ = st.db.exec(&format!("delete from portal_session where updated < now() - interval '{} hours'", st.cfg.session_hours.max(1)), &Row::new()).await;
-            }
         }
     });
 }

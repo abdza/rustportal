@@ -41,6 +41,9 @@ app_name = "Portal"
 # credits_url = "https://example.com/"
 allow_registration = false
 session_hours = 12
+# Optional: session inactivity timeout in minutes (overrides session_hours;
+# can also be overridden live via Settings -> portal.session_minutes)
+# session_minutes = 30
 
 [mail]
 host = "127.0.0.1"

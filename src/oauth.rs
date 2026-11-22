@@ -192,6 +192,7 @@ pub async fn callback(mut ctx: Ctx) -> Response {
     };
 
     let back = s(&ctx.sess, "redirect_after_login");
+    let _ = ctx.db().exec("delete from portal_session where id=:id", &row! {"id"=>ctx.sid.clone()}).await;
     ctx.sid = web::token();
     ctx.sess = Row::new();
     ctx.sess.insert("userid".into(), json!(uid));

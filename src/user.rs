@@ -105,6 +105,7 @@ pub async fn login(mut ctx: Ctx) -> Response {
         let uid = i(&u, "id").unwrap_or(0);
         let back = s(&ctx.sess, "redirect_after_login");
         // fresh session on login
+        let _ = ctx.db().exec("delete from portal_session where id=:id", &row! {"id"=>ctx.sid.clone()}).await;
         ctx.sid = web::token();
         ctx.sess = Row::new();
         ctx.sess.insert("userid".into(), json!(uid));
