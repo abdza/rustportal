@@ -3,13 +3,15 @@
 //! selected node's details, its role holders (add / change / remove in a dialog),
 //! drag-and-drop moving, and New Node / Edit / Delete / Edit Domain buttons.
 
-use crate::db::{self, b, i, s, Row};
+use crate::db::{self, b, i, lit, s, Row};
 use crate::row;
 use crate::tree::{export_tree, import_tree, rebuild, ImportStats};
-use crate::web::{esc, Ctx};
+use crate::web::{self, enc, esc, Ctx};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 async fn tree_of(ctx: &Ctx, tree_id: i64) -> Option<Row> {
     ctx.db().get("portal_tree", tree_id).await.ok().flatten()
@@ -602,12 +604,182 @@ pub async fn node_action(ctx: Ctx, action: &str, id: Option<i64>) -> Response {
     }
 }
 
-/// /portalTree/create_root, exporttree, importtreeform, importtree
+fn fmt_tree_dt(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if let Some(dt) = crate::script::parse_dt(t) {
+        return dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    }
+    let norm = t.replace('T', " ");
+    let base = norm.split('.').next().unwrap_or(&norm).trim_end_matches('Z');
+    let base = if base.len() > 19 { &base[..19] } else { base };
+    match crate::script::parse_dt(base) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => t.to_string(),
+    }
+}
+
+fn tree_import_dir(ctx: &Ctx) -> PathBuf {
+    PathBuf::from(&ctx.st.cfg.module_dir).join("treeimports")
+}
+
+/// Simple colored unified diff HTML for tree import preview.
+fn diff_lines_html(old_text: &str, new_text: &str) -> (String, bool) {
+    let old_lines: Vec<&str> = if old_text.is_empty() { vec![] } else { old_text.lines().collect() };
+    let new_lines: Vec<&str> = new_text.lines().collect();
+    if old_lines == new_lines {
+        return (String::new(), false);
+    }
+    let mut out = String::from("<pre style=\"max-height:460px;overflow:auto;border:1px solid #ddd;padding:10px;background:#fff;font-size:12px;\">");
+    if old_lines.is_empty() {
+        out.push_str("<span style=\"color:#555;\">--- /dev/null\n+++ b/tree.json\n</span>");
+        for l in &new_lines {
+            out.push_str(&format!("<span style=\"color:#1a7f37;background:#dafbe1;display:block;\">+{}</span>", esc(l)));
+        }
+    } else {
+        out.push_str("<span style=\"color:#555;\">--- a/tree.json\n+++ b/tree.json\n</span>");
+        let (m, n) = (old_lines.len(), new_lines.len());
+        // LCS on reasonable sizes, else line-set fallback
+        if m * n <= 2_000_000 {
+            let mut dp = vec![vec![0u32; n + 1]; m + 1];
+            for r in (0..m).rev() {
+                for c in (0..n).rev() {
+                    dp[r][c] = if old_lines[r] == new_lines[c] {
+                        dp[r + 1][c + 1] + 1
+                    } else {
+                        dp[r + 1][c].max(dp[r][c + 1])
+                    };
+                }
+            }
+            let (mut r, mut c) = (0, 0);
+            let mut ops: Vec<(char, &str)> = vec![];
+            while r < m && c < n {
+                if old_lines[r] == new_lines[c] {
+                    ops.push((' ', old_lines[r]));
+                    r += 1;
+                    c += 1;
+                } else if dp[r + 1][c] >= dp[r][c + 1] {
+                    ops.push(('-', old_lines[r]));
+                    r += 1;
+                } else {
+                    ops.push(('+', new_lines[c]));
+                    c += 1;
+                }
+            }
+            while r < m { ops.push(('-', old_lines[r])); r += 1; }
+            while c < n { ops.push(('+', new_lines[c])); c += 1; }
+            // Show changed lines + 3 lines of context
+            let mut show = vec![false; ops.len()];
+            for (idx, (k, _)) in ops.iter().enumerate() {
+                if *k != ' ' {
+                    let lo = idx.saturating_sub(3);
+                    let hi = (idx + 3).min(ops.len().saturating_sub(1));
+                    for s_i in lo..=hi {
+                        show[s_i] = true;
+                    }
+                }
+            }
+            let mut skipped = false;
+            for (idx, (k, line)) in ops.iter().enumerate() {
+                if !show[idx] {
+                    if !skipped {
+                        out.push_str("<span style=\"color:#6e7781;display:block;\">@@ ... @@</span>");
+                        skipped = true;
+                    }
+                    continue;
+                }
+                skipped = false;
+                match k {
+                    '-' => out.push_str(&format!("<span style=\"color:#cf222e;background:#ffebe9;display:block;\">-{}</span>", esc(line))),
+                    '+' => out.push_str(&format!("<span style=\"color:#1a7f37;background:#dafbe1;display:block;\">+{}</span>", esc(line))),
+                    _ => out.push_str(&format!("<span style=\"color:#333;display:block;\"> {}</span>", esc(line))),
+                }
+            }
+        } else {
+            for l in &old_lines {
+                out.push_str(&format!("<span style=\"color:#cf222e;background:#ffebe9;display:block;\">-{}</span>", esc(l)));
+            }
+            for l in &new_lines {
+                out.push_str(&format!("<span style=\"color:#1a7f37;background:#dafbe1;display:block;\">+{}</span>", esc(l)));
+            }
+        }
+    }
+    out.push_str("</pre>");
+    (out, true)
+}
+
+fn normalize_tree_json(trees: &[Row], staff: bool) -> String {
+    fn clean_node(n: &Value, staff: bool) -> Value {
+        let Some(o) = n.as_object() else { return Value::Null };
+        let kids: Vec<Value> = o.get("nodes").and_then(|v| v.as_array()).map(|a| a.iter().map(|c| clean_node(c, staff)).collect()).unwrap_or_default();
+        let mut users = Value::Null;
+        if staff {
+            if let Some(u) = o.get("users").and_then(|v| v.as_array()) {
+                let mut sorted = u.clone();
+                sorted.sort_by(|a, b| {
+                    let ka = (a.get("userid").and_then(|x| x.as_str()).unwrap_or(""), a.get("role").and_then(|x| x.as_str()).unwrap_or(""));
+                    let kb = (b.get("userid").and_then(|x| x.as_str()).unwrap_or(""), b.get("role").and_then(|x| x.as_str()).unwrap_or(""));
+                    ka.cmp(&kb)
+                });
+                users = Value::Array(sorted);
+            } else {
+                users = Value::Array(vec![]);
+            }
+        }
+        json!({
+            "name": o.get("name").cloned().unwrap_or(Value::Null),
+            "slug": o.get("slug").cloned().unwrap_or(Value::Null),
+            "data": o.get("data").cloned().unwrap_or(Value::Null),
+            "domain": o.get("domain").cloned().unwrap_or(Value::Null),
+            "mainrole": o.get("mainrole").cloned().unwrap_or(Value::Null),
+            "hiderole": o.get("hiderole").cloned().unwrap_or(Value::Null),
+            "disabled": o.get("disabled").cloned().unwrap_or(json!(false)),
+            "users": users,
+            "nodes": kids
+        })
+    }
+    let arr: Vec<Value> = trees
+        .iter()
+        .map(|t| {
+            let kids: Vec<Value> = t.get("nodes").and_then(|v| v.as_array()).map(|a| a.iter().map(|c| clean_node(c, staff)).collect()).unwrap_or_default();
+            json!({
+                "module": t.get("module").cloned().unwrap_or(Value::Null),
+                "name": t.get("name").cloned().unwrap_or(Value::Null),
+                "root": t.get("root").cloned().unwrap_or(Value::Null),
+                "nodes": kids
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&Value::Array(arr)).unwrap_or_default()
+}
+
+/// Main dispatcher for `/portalTree/*` matching g6ikram's `PortalTreeController` + `views/portalTree/*.gsp`.
 pub async fn tree_action(mut ctx: Ctx, action: &str, id: Option<i64>) -> Response {
     if ctx.user.is_none() {
         return ctx.need_login().await;
     }
     match action {
+        "index" => tree_index(ctx).await,
+        "show" => match id {
+            Some(tid) => tree_show(ctx, tid).await,
+            None => ctx.status(StatusCode::NOT_FOUND, "Tree not found").await,
+        },
+        "create" => tree_create_or_edit(ctx, None).await,
+        "save" => tree_save(ctx).await,
+        "edit" => match id {
+            Some(tid) => tree_create_or_edit(ctx, Some(tid)).await,
+            None => ctx.status(StatusCode::NOT_FOUND, "Tree not found").await,
+        },
+        "update" => match id {
+            Some(tid) => tree_update(ctx, tid).await,
+            None => ctx.status(StatusCode::NOT_FOUND, "Tree not found").await,
+        },
+        "delete" => match id {
+            Some(tid) => tree_delete(ctx, tid).await,
+            None => ctx.status(StatusCode::NOT_FOUND, "Tree not found").await,
+        },
         "create_root" | "exporttree" => {
             let Some(tree) = tree_of(&ctx, id.unwrap_or(0)).await else { return ctx.status(StatusCode::NOT_FOUND, "Tree not found").await };
             if !ctx.can_admin(&s(&tree, "module")).await {
@@ -656,7 +828,7 @@ pub async fn tree_action(mut ctx: Ctx, action: &str, id: Option<i64>) -> Respons
                           </div>
                         </fieldset>
                         <fieldset class="buttons">
-                            <input type="submit" name="upload" class="save" value="Import" />
+                            <input type="submit" name="upload" class="save" value="Review Changes" />
                         </fieldset>
                     </form>"#);
             let h = page(&li("list", "/portalTree/index", "PortalTree List"), "create", "import-tree", "Import Tree", &flash, &body);
@@ -673,7 +845,7 @@ pub async fn tree_action(mut ctx: Ctx, action: &str, id: Option<i64>) -> Respons
             let text = String::from_utf8_lossy(&up.read_all().await.unwrap_or_default()).to_string();
             let trees: Vec<Row> = match serde_json::from_str::<Value>(&text) {
                 Ok(Value::Array(a)) => a.into_iter().filter_map(|v| v.as_object().cloned()).collect(),
-                Ok(Value::Object(o)) => vec![o], // a single tree object is accepted too
+                Ok(Value::Object(o)) => vec![o],
                 Ok(_) => vec![],
                 Err(e) => {
                     ctx.flash(&format!("Could not read that file as a tree export: {}", e));
@@ -696,31 +868,592 @@ pub async fn tree_action(mut ctx: Ctx, action: &str, id: Option<i64>) -> Respons
                 return ctx.redirect("/portalTree/importtreeform").await;
             }
             let staff = ctx.params.contains_key("staff");
+            let dir = tree_import_dir(&ctx);
+            let _ = std::fs::create_dir_all(&dir);
+            let stamp = chrono::Local::now().timestamp_millis();
+            let uid_s: String = ctx
+                .user
+                .as_ref()
+                .map(|u| s(u, "userid"))
+                .unwrap_or_else(|| "anon".into())
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            let fname = format!("{}_{}.json", stamp, if uid_s.is_empty() { "anon" } else { &uid_s });
+            if let Err(e) = tokio::fs::write(dir.join(&fname), text.as_bytes()).await {
+                ctx.flash(&format!("Could not stage upload: {}", e));
+                return ctx.redirect("/portalTree/importtreeform").await;
+            }
+            let staff_q = if staff { "&staff=on" } else { "" };
+            ctx.redirect(&format!("/portalTree/importtreepreview?parked={}{}", enc(&fname), staff_q)).await
+        }
+        "importtreepreview" => {
+            let parked_name = ctx.p("parked");
+            if parked_name.is_empty() || parked_name.contains('/') || parked_name.contains('\\') || parked_name.contains("..") {
+                ctx.flash("That upload is no longer available, please upload the file again");
+                return ctx.redirect("/portalTree/importtreeform").await;
+            }
+            let parked_path = tree_import_dir(&ctx).join(&parked_name);
+            let Ok(text) = tokio::fs::read_to_string(&parked_path).await else {
+                ctx.flash("That upload is no longer available, please upload the file again");
+                return ctx.redirect("/portalTree/importtreeform").await;
+            };
+            let trees: Vec<Row> = match serde_json::from_str::<Value>(&text) {
+                Ok(Value::Array(a)) => a.into_iter().filter_map(|v| v.as_object().cloned()).collect(),
+                Ok(Value::Object(o)) => vec![o],
+                _ => vec![],
+            };
+            let staff = ctx.params.contains_key("staff");
+            let mut list_items = String::new();
+            let mut cur_exports: Vec<Row> = vec![];
+            for t in &trees {
+                let m = { let x = s(t, "module"); if x.is_empty() { "portal".into() } else { x } };
+                if !ctx.can_admin(&m).await {
+                    ctx.flash(&format!("You need admin rights on module {m} to import that tree"));
+                    return ctx.redirect("/portalTree/importtreeform").await;
+                }
+                let nm = s(t, "name");
+                let existing = ctx
+                    .db()
+                    .first("select id from portal_tree where \"module\"=:m and name=:n", &row! {"m"=>m.clone(),"n"=>nm.clone()})
+                    .await
+                    .ok()
+                    .flatten();
+                let known = existing.is_some();
+                if let Some(ex) = existing {
+                    if let Ok(Value::Object(obj)) = export_tree(ctx.db(), i(&ex, "id").unwrap_or(0), staff).await {
+                        cur_exports.push(obj);
+                    }
+                }
+                list_items.push_str(&format!(
+                    "<li>{} / <strong>{}</strong> &mdash; {}</li>",
+                    esc(&m),
+                    esc(&nm),
+                    if known { "already here, will be updated in place" } else { "not on this server yet, will be created" }
+                ));
+            }
+            let old_json = if cur_exports.is_empty() { String::new() } else { normalize_tree_json(&cur_exports, staff) };
+            let new_json = normalize_tree_json(&trees, staff);
+            let (diff_html, has_diff) = diff_lines_html(&old_json, &new_json);
+            let diff_block = if has_diff {
+                diff_html
+            } else {
+                "<div class=\"message\" role=\"status\">No changes detected between this server's tree and the uploaded file.</div>".into()
+            };
+            let csrf = ctx.csrf_field();
+            let flash = ctx.take_flash();
+            let staff_hidden = if staff { "<input type=\"hidden\" name=\"staff\" value=\"on\"/>" } else { "" };
+            let body = format!(
+                "<p>Lines starting with <span style=\"color:#cf222e;\">-</span> show what this server holds now, \
+                 lines starting with <span style=\"color:#1a7f37;\">+</span> show what the file brings. \
+                 Importing role holders: <strong>{}</strong>.</p>\
+                 <ul>{list_items}</ul>\
+                 {diff_block}\
+                 <form action=\"/portalTree/confirmimporttree\" method=\"post\">{csrf}\
+                   <input type=\"hidden\" name=\"parked\" value=\"{}\"/>{staff_hidden}\
+                   <fieldset class=\"buttons\">\
+                     <a class=\"edit\" href=\"/portalTree/index\">Cancel</a>\
+                     <input type=\"submit\" name=\"confirm\" class=\"save\" value=\"Import Tree\" onclick=\"return confirm('Import this tree?');\"/>\
+                   </fieldset>\
+                 </form>",
+                if staff { "Yes" } else { "No" },
+                esc(&parked_name)
+            );
+            let nav_extra = format!("{}{}", li("list", "/portalTree/index", "PortalTree List"), li("create", "/portalTree/importtreeform", "Upload another file"));
+            let h = page(&nav_extra, "show", "import-tree-preview", "Import Tree Preview", &flash, &body);
+            ctx.html("Import Tree Preview", h).await
+        }
+        "confirmimporttree" => {
+            if ctx.method != "POST" {
+                return ctx.redirect("/portalTree/importtreeform").await;
+            }
+            let parked_name = ctx.p("parked");
+            if parked_name.is_empty() || parked_name.contains('/') || parked_name.contains('\\') || parked_name.contains("..") {
+                ctx.flash("That upload is no longer available, please upload the file again");
+                return ctx.redirect("/portalTree/importtreeform").await;
+            }
+            let parked_path = tree_import_dir(&ctx).join(&parked_name);
+            let Ok(text) = tokio::fs::read_to_string(&parked_path).await else {
+                ctx.flash("That upload is no longer available, please upload the file again");
+                return ctx.redirect("/portalTree/importtreeform").await;
+            };
+            let trees: Vec<Row> = match serde_json::from_str::<Value>(&text) {
+                Ok(Value::Array(a)) => a.into_iter().filter_map(|v| v.as_object().cloned()).collect(),
+                Ok(Value::Object(o)) => vec![o],
+                _ => vec![],
+            };
+            for t in &trees {
+                let m = { let x = s(t, "module"); if x.is_empty() { "portal".into() } else { x } };
+                if !ctx.can_admin(&m).await {
+                    ctx.flash(&format!("You need admin rights on module {m} to import that tree"));
+                    return ctx.redirect("/portalTree/importtreeform").await;
+                }
+            }
+            let staff = ctx.params.contains_key("staff");
             let mut stats = ImportStats::default();
             let mut last = None;
             let mut errs = vec![];
             for t in &trees {
                 match import_tree(ctx.db(), t, None, staff, &mut stats).await {
-                    Ok(id) => last = Some(id),
+                    Ok(tid) => last = Some(tid),
                     Err(e) => errs.push(format!("{}: {}", s(t, "name"), e)),
                 }
             }
+            let _ = tokio::fs::remove_file(&parked_path).await;
             crate::cache::MENUS.clear();
-            let mut msg = format!("Tree import: {}", stats.summary());
+            let mut msg = format!("Tree imported ({})", stats.summary());
             if !errs.is_empty() {
                 msg.push_str(&format!(". Failed: {}", errs.join("; ")));
             }
             if !stats.users_skipped.is_empty() {
-                msg.push_str(&format!(". Skipped: {}", stats.users_skipped.iter().take(10).cloned().collect::<Vec<_>>().join("; ")));
+                msg.push_str(&format!(". Staff not found: {}", stats.users_skipped.iter().take(10).cloned().collect::<Vec<_>>().join(", ")));
             }
             ctx.flash(&msg);
-            match (trees.len(), last) {
-                (1, Some(id)) => ctx.redirect(&format!("/portalTree/show/{}", id)).await,
-                _ => ctx.redirect("/portalTree/index").await,
+            match last {
+                Some(tid) => ctx.redirect(&format!("/portalTree/show/{}", tid)).await,
+                None => ctx.redirect("/portalTree/index").await,
             }
         }
-        _ => ctx.status(StatusCode::NOT_FOUND, "Page not found").await,
+        "rebuild" => {
+            if ctx.method != "POST" {
+                return ctx.status(StatusCode::METHOD_NOT_ALLOWED, "POST required").await;
+            }
+            let tid = id.unwrap_or(0);
+            let Some(tree) = tree_of(&ctx, tid).await else {
+                return ctx.status(StatusCode::NOT_FOUND, "Tree not found").await;
+            };
+            if !ctx.can_admin(&s(&tree, "module")).await {
+                return ctx.status(StatusCode::FORBIDDEN, "Not allowed").await;
+            }
+            let _ = rebuild(ctx.db(), tid).await;
+            ctx.flash("Tree rebuilt");
+            ctx.redirect(&format!("/portalTree/show/{}", tid)).await
+        }
+        _ => tree_index(ctx).await,
     }
+}
+
+async fn tree_index(ctx: Ctx) -> Response {
+    let db = &ctx.st.db.clone();
+    let is_admin = ctx.is_admin();
+    let u = ctx.user.as_ref().unwrap();
+    let my_mods = if is_admin { vec![] } else { web::admin_list(db, u).await };
+    if !is_admin && my_mods.is_empty() {
+        return ctx.status(StatusCode::FORBIDDEN, "You are not authorized to view this list").await;
+    }
+
+    let q = ctx.p("q");
+    let m = ctx.p("module");
+    let mut cond: Vec<String> = vec![];
+    if !m.is_empty() && m != "All" {
+        if !is_admin && !my_mods.contains(&m) {
+            return ctx.status(StatusCode::FORBIDDEN, "You are not authorized to view this module").await;
+        }
+        cond.push(format!("t.\"module\"={}", lit(&json!(m))));
+    } else if !is_admin {
+        cond.push(format!("t.\"module\" in {}", lit(&json!(my_mods))));
+    }
+    if !q.trim().is_empty() {
+        let like = lit(&json!(format!("%{}%", q.trim())));
+        cond.push(format!("(t.name ilike {l} or t.\"module\" ilike {l})", l = like));
+    }
+    let wh = if cond.is_empty() { String::new() } else { format!(" where {}", cond.join(" and ")) };
+    let max = ctx.pi("max").unwrap_or(10).clamp(1, 500);
+    let offset = ctx.pi("offset").unwrap_or(0).max(0);
+    let sort_p = ctx.p("sort");
+    let order_dir = if ctx.p("order") == "desc" { "desc" } else { "asc" };
+    let order_sql = match sort_p.as_str() {
+        "module" => format!("t.\"module\" {}, t.id asc", order_dir),
+        "name" => format!("t.name {}, t.id asc", order_dir),
+        "root" | "root_id" => format!("r.name {}, t.id asc", order_dir),
+        "expire" => format!("t.expire {}, t.id asc", order_dir),
+        "valid" => format!("t.valid {}, t.id asc", order_dir),
+        _ => "t.\"module\" asc, t.name asc".to_string(),
+    };
+
+    let from_sql = "from portal_tree t left join portal_tree_node r on r.id=t.root_id";
+    let total = db.count(&format!("select count(*) {from_sql}{wh}"), &db::no_params()).await.unwrap_or(0);
+    let rows = db
+        .rows(
+            &format!("select t.*, r.name as root_name {from_sql}{wh} order by {order_sql} limit {max} offset {offset}"),
+            &db::no_params(),
+        )
+        .await
+        .unwrap_or_default();
+
+    // Fallback root lookup for trees whose root_id is null but have a top-level node
+    let mut fallback_roots: HashMap<i64, (i64, String)> = HashMap::new();
+    for r in &rows {
+        if i(r, "root_id").is_none() {
+            if let Some(tid) = i(r, "id") {
+                if let Ok(Some(rn)) = db.first("select id, name from portal_tree_node where tree_id=:t and parent_id is null order by lft nulls last, id limit 1", &row! {"t"=>tid}).await {
+                    if let Some(nid) = i(&rn, "id") {
+                        fallback_roots.insert(tid, (nid, s(&rn, "name")));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut mods: Vec<String> = if is_admin {
+        db.rows("select name from portal_module order by name", &db::no_params())
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| s(r, "name"))
+            .collect()
+    } else {
+        let mut ms = my_mods.clone();
+        ms.sort();
+        ms
+    };
+    if !m.is_empty() && m != "All" && !mods.contains(&m) {
+        mods.push(m.clone());
+    }
+    let mut mod_opts = String::from("<option value=\"All\">All</option>");
+    for x in &mods {
+        let sel = if *x == m { " selected=\"selected\"" } else { "" };
+        mod_opts.push_str(&format!("<option value=\"{}\"{sel}>{}</option>", esc(x), esc(x)));
+    }
+
+    const COLS: &[(&str, &str)] = &[("module", "Module"), ("name", "Name"), ("root", "Root"), ("expire", "Expire"), ("valid", "Valid")];
+    let qs_keep = web::qs(&ctx.params, &["sort", "order", "offset", "max"]);
+    let mut thead = String::new();
+    for (col, lbl) in COLS {
+        let sorted = sort_p == *col;
+        let next_ord = if sorted && order_dir == "asc" { "desc" } else { "asc" };
+        let cls = if sorted { format!("sortable sorted {}", order_dir) } else { "sortable".into() };
+        let extra_q = if qs_keep.is_empty() { String::new() } else { format!("&amp;{}", esc(&qs_keep)) };
+        thead.push_str(&format!(
+            "<th class=\"{cls}\"><a href=\"/portalTree/index?sort={col}&amp;max={max}&amp;order={next_ord}{extra_q}\">{lbl}</a></th>"
+        ));
+    }
+
+    let mut tbody = String::new();
+    for (rn, r) in rows.iter().enumerate() {
+        let tid = i(r, "id").unwrap_or(0);
+        let row_cls = if rn % 2 == 0 { "even" } else { "odd" };
+        let root_cell = match i(r, "root_id") {
+            Some(rid) => {
+                let rname = { let x = s(r, "root_name"); if x.is_empty() { format!("#{rid}") } else { x } };
+                format!("<a href=\"/portalTreeNode/show/{rid}\">{}</a>", esc(&rname))
+            }
+            None => match fallback_roots.get(&tid) {
+                Some((rid, rname)) => format!("<a href=\"/portalTreeNode/show/{rid}\">{}</a>", esc(rname)),
+                None => format!("<a href=\"/portalTree/create_root/{tid}\">Create root node</a>"),
+            },
+        };
+        let mod_txt = { let x = s(r, "module"); if x.is_empty() { format!("#{tid}") } else { x } };
+        tbody.push_str(&format!(
+            "<tr class=\"{row_cls}\">\
+             <td><a href=\"/portalTree/show/{tid}\">{}</a>&nbsp;</td>\
+             <td>{}&nbsp;</td>\
+             <td>{root_cell}&nbsp;</td>\
+             <td>{}&nbsp;</td>\
+             <td>{}&nbsp;</td>\
+             </tr>",
+            esc(&mod_txt),
+            esc(&s(r, "name")),
+            esc(&fmt_tree_dt(&s(r, "expire"))),
+            esc(&fmt_tree_dt(&s(r, "valid")))
+        ));
+    }
+
+    let pag = if total > max {
+        format!("<div class=\"pagination\">{}</div>", crate::tags::paginate("/portalTree/index", &ctx.params, total, max, offset))
+    } else {
+        String::new()
+    };
+    let flash = s(&ctx.sess, "flash");
+    let flash_html = if flash.is_empty() { String::new() } else { format!("<div class=\"message\" role=\"status\">{}</div>", esc(&flash)) };
+    let create_href = if !m.is_empty() && m != "All" {
+        format!("/portalTree/create?module={}", enc(&m))
+    } else {
+        "/portalTree/create".into()
+    };
+
+    let body = format!(
+        r##"<style>
+@media only screen and (max-width: 760px), (min-device-width: 768px) and (max-device-width: 1024px) {{
+  td:nth-of-type(1):before {{ content: "Module"; }}
+  td:nth-of-type(2):before {{ content: "Name"; }}
+  td:nth-of-type(3):before {{ content: "Root"; }}
+  td:nth-of-type(4):before {{ content: "Expire"; }}
+  td:nth-of-type(5):before {{ content: "Valid"; }}
+}}
+</style>
+<div id="content" role="main"><div class="container">
+<section class="row"><a href="#list-portalTree" class="skip" tabindex="-1">Skip to content&hellip;</a>
+<div class="nav" role="navigation"><ul>
+  <li><a class="home" href="/">Home</a></li>
+  <li><a class="create" href="{create_href}">New PortalTree</a></li>
+  <li><a class="create" href="/portalTreeNode/fixnodes">Fix Nodes</a></li>
+  <li><a class="create" href="/portalTree/importtreeform">Import Tree</a></li>
+</ul></div></section>
+<section class="row"><div id="list-portalTree" class="col-12 content scaffold-list" role="main">
+  <h1>PortalTree List</h1>
+  {flash_html}
+  <form action="/portalTree/index" method="get" name="searchform" id="searchform">
+    <fieldset class="form">
+      <div class="fieldcontain" id="tracksearch">
+        <label>Search:</label><input type="text" name="q" id="q" value="{q_val}"/><input id="dosearch" name="dosearch" type="submit" value="Search"/>
+      </div>
+      <div class="fieldcontain" id="listsearch">
+        <label>Module:</label>
+        <select name="module" id="module" class="module-select " onchange="this.form.submit()">{mod_opts}</select>
+      </div>
+    </fieldset>
+  </form>
+  <table class="responsive">
+    <thead><tr>{thead}</tr></thead>
+    <tbody>{tbody}</tbody>
+  </table>
+  {pag}
+</div></section></div></div>"##,
+        q_val = esc(&q)
+    );
+    ctx.html("PortalTree List", body).await
+}
+
+async fn tree_show(mut ctx: Ctx, id: i64) -> Response {
+    let db = &ctx.st.db.clone();
+    let Some(t) = tree_of(&ctx, id).await else {
+        return ctx.status(StatusCode::NOT_FOUND, "Tree not found").await;
+    };
+    if !ctx.can_admin(&s(&t, "module")).await {
+        return ctx.status(StatusCode::FORBIDDEN, "You are not authorized to view this").await;
+    }
+    let root_html = match root_id(&ctx, &t).await {
+        Some(rid) => {
+            let rname = db.get("portal_tree_node", rid).await.ok().flatten().map(|n| s(&n, "name")).filter(|x| !x.is_empty()).unwrap_or_else(|| format!("#{rid}"));
+            format!("<a href=\"/portalTreeNode/show/{rid}\">{}</a>", esc(&rname))
+        }
+        None => format!("<a href=\"/portalTree/create_root/{id}\">Create root node</a>"),
+    };
+    let csrf = ctx.csrf_field();
+    let flash = s(&ctx.sess, "flash");
+    let flash_html = if flash.is_empty() { String::new() } else { format!("<div class=\"message\" role=\"status\">{}</div>", esc(&flash)) };
+    let body = format!(
+        r##"<div id="content" role="main"><div class="container">
+<section class="row"><a href="#show-portalTree" class="skip" tabindex="-1">Skip to content&hellip;</a>
+<div class="nav" role="navigation"><ul>
+  <li><a class="home" href="/">Home</a></li>
+  <li><a class="list" href="/portalTree/index">PortalTree List</a></li>
+  <li><a class="create" href="/portalTree/create">New PortalTree</a></li>
+</ul></div></section>
+<section class="row"><div id="show-portalTree" class="col-12 content scaffold-show" role="main">
+  <h1>Show PortalTree</h1>
+  {flash_html}
+  <ol class="property-list portalTree">
+    <li class="fieldcontain"><span id="module-label" class="property-label">Module</span><div class="property-value" aria-labelledby="module-label">{module}</div></li>
+    <li class="fieldcontain"><span id="name-label" class="property-label">Name</span><div class="property-value" aria-labelledby="name-label">{name}</div></li>
+    <li class="fieldcontain"><span id="root-label" class="property-label">Root</span><div class="property-value" aria-labelledby="root-label">{root_html}</div></li>
+    <li class="fieldcontain"><span id="expire-label" class="property-label">Expire</span><div class="property-value" aria-labelledby="expire-label">{expire}</div></li>
+    <li class="fieldcontain"><span id="valid-label" class="property-label">Valid</span><div class="property-value" aria-labelledby="valid-label">{valid}</div></li>
+  </ol>
+  <form action="/portalTree/delete/{id}" method="post">
+    {csrf}
+    <fieldset class="buttons">
+      <a class="edit" href="/portalTree/edit/{id}">Edit</a>
+      <a class="save" href="/portalTree/exporttree/{id}">Export</a>
+      <a class="save" href="/portalTree/exporttree/{id}?staff=on">Export with Role Holders</a>
+      <a class="save" href="/portalTree/importtreeform">Import</a>
+      <input class="delete" type="submit" value="Delete" onclick="return confirm('Are you sure?');" />
+    </fieldset>
+  </form>
+</div></section></div></div>"##,
+        module = esc(&s(&t, "module")),
+        name = esc(&s(&t, "name")),
+        expire = esc(&fmt_tree_dt(&s(&t, "expire"))),
+        valid = esc(&fmt_tree_dt(&s(&t, "valid")))
+    );
+    ctx.html("Show PortalTree", body).await
+}
+
+async fn tree_create_or_edit(mut ctx: Ctx, id: Option<i64>) -> Response {
+    let db = &ctx.st.db.clone();
+    let is_admin = ctx.is_admin();
+    let my_mods = if is_admin { vec![] } else { web::admin_list(db, ctx.user.as_ref().unwrap()).await };
+    if !is_admin && my_mods.is_empty() {
+        return ctx.status(StatusCode::FORBIDDEN, "Not allowed").await;
+    }
+    let is_new = id.is_none();
+    let t = match id {
+        Some(tid) => match tree_of(&ctx, tid).await {
+            Some(row) => {
+                if !is_admin && !my_mods.contains(&s(&row, "module")) {
+                    return ctx.status(StatusCode::FORBIDDEN, "Not allowed").await;
+                }
+                row
+            }
+            None => return ctx.status(StatusCode::NOT_FOUND, "Tree not found").await,
+        },
+        None => {
+            let mut row = Row::new();
+            let m = ctx.p("module");
+            if !m.is_empty() {
+                row.insert("module".into(), json!(m));
+            }
+            row
+        }
+    };
+
+    let mut mods: Vec<String> = if is_admin {
+        db.rows("select name from portal_module order by name", &db::no_params()).await.unwrap_or_default().iter().map(|r| s(r, "name")).collect()
+    } else {
+        let mut ms = my_mods.clone();
+        ms.sort();
+        ms
+    };
+    let cur_mod = s(&t, "module");
+    if !cur_mod.is_empty() && !mods.contains(&cur_mod) {
+        mods.push(cur_mod.clone());
+    }
+    if mods.is_empty() {
+        mods.push("portal".into());
+    }
+    let mut mod_opts = String::new();
+    if cur_mod.is_empty() {
+        mod_opts.push_str("<option value=\"\">- choose a module -</option>");
+    }
+    for m in &mods {
+        let sel = if *m == cur_mod { " selected=\"selected\"" } else { "" };
+        mod_opts.push_str(&format!("<option value=\"{}\"{sel}>{}</option>", esc(m), esc(m)));
+    }
+
+    let extra_dates = if is_new {
+        String::new()
+    } else {
+        let dt_val = |col: &str| s(&t, col).replace(' ', "T").chars().take(16).collect::<String>();
+        format!(
+            "<div class=\"fieldcontain\"><label for=\"expire\">Expire</label><input type=\"datetime-local\" name=\"expire\" id=\"expire\" value=\"{}\"/></div>\
+             <div class=\"fieldcontain\"><label for=\"valid\">Valid</label><input type=\"datetime-local\" name=\"valid\" id=\"valid\" value=\"{}\"/></div>",
+            esc(&dt_val("expire")),
+            esc(&dt_val("valid"))
+        )
+    };
+
+    let csrf = ctx.csrf_field();
+    let flash = s(&ctx.sess, "flash");
+    let flash_html = if flash.is_empty() { String::new() } else { format!("<div class=\"message\" role=\"status\">{}</div>", esc(&flash)) };
+    let action = match id {
+        Some(tid) => format!("/portalTree/update/{tid}"),
+        None => "/portalTree/save".into(),
+    };
+    let kind = if is_new { "create" } else { "edit" };
+    let heading = if is_new { "Create PortalTree" } else { "Edit PortalTree" };
+    let btn = if is_new { "Create" } else { "Update" };
+    let new_li = if !is_new { "<li><a class=\"create\" href=\"/portalTree/create\">New PortalTree</a></li>" } else { "" };
+
+    let body = format!(
+        r##"<div id="content" role="main"><div class="container">
+<section class="row"><a href="#{kind}-portalTree" class="skip" tabindex="-1">Skip to content&hellip;</a>
+<div class="nav" role="navigation"><ul>
+  <li><a class="home" href="/">Home</a></li>
+  <li><a class="list" href="/portalTree/index">PortalTree List</a></li>
+  {new_li}
+</ul></div></section>
+<section class="row"><div id="{kind}-portalTree" class="col-12 content scaffold-{kind}" role="main">
+  <h1>{heading}</h1>
+  {flash_html}
+  <form action="{action}" method="post">
+    {csrf}
+    <fieldset class="form">
+      <div class="fieldcontain"><label for="module">Module</label><select name="module" id="module" class="module-select ">{mod_opts}</select></div>
+      <div class="fieldcontain required"><label for="name">Name<span class="required-indicator">*</span></label><input type="text" name="name" id="name" value="{name}" required="required"/></div>
+      {extra_dates}
+    </fieldset>
+    <fieldset class="buttons"><input class="save" type="submit" value="{btn}" /></fieldset>
+  </form>
+  {form_js}
+</div></section></div></div>"##,
+        name = esc(&s(&t, "name")),
+        form_js = crate::tags::form_js()
+    );
+    ctx.html(heading, body).await
+}
+
+async fn tree_save(mut ctx: Ctx) -> Response {
+    if ctx.method != "POST" {
+        return ctx.redirect("/portalTree/create").await;
+    }
+    let module = ctx.p("module").trim().to_string();
+    let name = ctx.p("name").trim().to_string();
+    if !ctx.can_admin(&module).await {
+        return ctx.status(StatusCode::FORBIDDEN, "Not allowed").await;
+    }
+    if name.is_empty() {
+        ctx.flash("Name is required");
+        return ctx.redirect("/portalTree/create").await;
+    }
+    match ctx.db().insert("portal_tree", &row! {"module"=>module,"name"=>name}).await {
+        Ok(tid) => {
+            crate::cache::MENUS.clear();
+            ctx.flash(&format!("PortalTree {tid} created"));
+            ctx.redirect(&format!("/portalTree/show/{tid}")).await
+        }
+        Err(e) => {
+            ctx.flash(&format!("Could not create PortalTree: {e}"));
+            ctx.redirect("/portalTree/create").await
+        }
+    }
+}
+
+async fn tree_update(mut ctx: Ctx, id: i64) -> Response {
+    if ctx.method != "POST" {
+        return ctx.redirect(&format!("/portalTree/edit/{id}")).await;
+    }
+    let Some(existing) = tree_of(&ctx, id).await else {
+        return ctx.status(StatusCode::NOT_FOUND, "Tree not found").await;
+    };
+    let module = ctx.p("module").trim().to_string();
+    let name = ctx.p("name").trim().to_string();
+    if !ctx.can_admin(&s(&existing, "module")).await || !ctx.can_admin(&module).await {
+        return ctx.status(StatusCode::FORBIDDEN, "Not allowed").await;
+    }
+    if name.is_empty() {
+        ctx.flash("Name is required");
+        return ctx.redirect(&format!("/portalTree/edit/{id}")).await;
+    }
+    let opt_dt = |k: &str| {
+        let v = ctx.p(k).trim().to_string();
+        if v.is_empty() { Value::Null } else { json!(v.replace('T', " ")) }
+    };
+    match ctx
+        .db()
+        .update("portal_tree", id, &row! {"module"=>module,"name"=>name,"expire"=>opt_dt("expire"),"valid"=>opt_dt("valid")})
+        .await
+    {
+        Ok(_) => {
+            crate::cache::MENUS.clear();
+            ctx.flash(&format!("PortalTree {id} updated"));
+            ctx.redirect(&format!("/portalTree/show/{id}")).await
+        }
+        Err(e) => {
+            ctx.flash(&format!("Could not update PortalTree: {e}"));
+            ctx.redirect(&format!("/portalTree/edit/{id}")).await
+        }
+    }
+}
+
+async fn tree_delete(mut ctx: Ctx, id: i64) -> Response {
+    if ctx.method != "POST" {
+        return ctx.status(StatusCode::METHOD_NOT_ALLOWED, "POST required").await;
+    }
+    let Some(existing) = tree_of(&ctx, id).await else {
+        return ctx.status(StatusCode::NOT_FOUND, "Tree not found").await;
+    };
+    if !ctx.can_admin(&s(&existing, "module")).await {
+        return ctx.status(StatusCode::FORBIDDEN, "Not allowed").await;
+    }
+    let db = ctx.db();
+    let _ = db.exec("update portal_tree set root_id=null where id=:id", &row! {"id"=>id}).await;
+    let _ = db.exec("delete from portal_tree_node_user where node_id in (select id from portal_tree_node where tree_id=:id)", &row! {"id"=>id}).await;
+    let _ = db.exec("delete from portal_tree_node where tree_id=:id", &row! {"id"=>id}).await;
+    let _ = db.delete("portal_tree", id).await;
+    crate::cache::MENUS.clear();
+    ctx.flash(&format!("PortalTree {id} deleted"));
+    ctx.redirect("/portalTree/index").await
 }
 
 /// /user/api_list?q= : users for the node-user picker (select2), for anyone who manages a module.
@@ -733,4 +1466,33 @@ pub async fn user_api_list(ctx: Ctx) -> Response {
     let like = format!("%{}%", q.trim());
     let rows = ctx.db().rows("select id, name, userid from portal_user where is_active is not false and (name ilike :q or userid ilike :q) order by name limit 30", &row! {"q"=>like}).await.unwrap_or_default();
     ctx.json(json!({"users": rows.iter().map(|r| json!({"id": i(r, "id"), "name": format!("{} ({})", s(r, "name"), s(r, "userid"))})).collect::<Vec<_>>()})).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_lines_html_detects_identical_new_and_changed() {
+        let (same_html, same_changed) = diff_lines_html("a\nb\n", "a\nb\n");
+        assert!(!same_changed);
+        assert!(same_html.is_empty());
+
+        let (new_html, new_changed) = diff_lines_html("", "line1\nline2");
+        assert!(new_changed);
+        assert!(new_html.contains("/dev/null"));
+        assert!(new_html.contains("+line1"));
+
+        let (chg_html, chg_changed) = diff_lines_html("keep\nold\nend", "keep\nnew\nend");
+        assert!(chg_changed);
+        assert!(chg_html.contains("-old"));
+        assert!(chg_html.contains("+new"));
+    }
+
+    #[test]
+    fn fmt_tree_dt_normalizes_iso_and_preserves_plain() {
+        assert_eq!(fmt_tree_dt(""), "");
+        assert_eq!(fmt_tree_dt("2026-11-22T07:50:00.123Z"), "2026-11-22 07:50:00");
+        assert_eq!(fmt_tree_dt("2026-11-22 07:50:00"), "2026-11-22 07:50:00");
+    }
 }

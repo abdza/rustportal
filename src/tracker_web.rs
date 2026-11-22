@@ -861,32 +861,6 @@ pub async fn api_list(mut ctx: Ctx) -> Response {
 
 // ---------------- admin actions on a tracker definition ----------------
 
-pub async fn workflow_graph(ctx: Ctx, t: &Tracker) -> Response {
-    let nodes: Vec<Value> = t.statuses.iter().map(|st| json!({"id": i(st, "id"), "label": s(st, "name"), "shape": "box", "color": if i(st, "id") == t.initial_status() { "#b6e3b6" } else { "#d2e5ff" }})).collect();
-    let mut edges: Vec<Value> = vec![];
-    let mut starts: Vec<Value> = vec![];
-    for tr in &t.transitions {
-        let label = if tr.roles.is_empty() { tr.label() } else { format!("{}\n[{}]", tr.label(), tr.roles.join(", ")) };
-        let Some(next) = tr.next else { continue };
-        if tr.prev.is_empty() {
-            starts.push(json!({"from": "start", "to": next, "label": label, "arrows": "to"}));
-        }
-        for p in &tr.prev {
-            edges.push(json!({"from": p, "to": next, "label": label, "arrows": "to", "font": {"align": "middle", "size": 11}}));
-        }
-    }
-    let mut all_nodes = nodes;
-    if !starts.is_empty() {
-        all_nodes.push(json!({"id": "start", "label": "Start", "shape": "ellipse", "color": "#eeeeee"}));
-        edges.extend(starts);
-    }
-    let h = format!(
-        "<div class='container-fluid'><div class='nav'><ul><li><a class='list' href='/portalTracker/show/{}'>Back to {}</a></li></ul></div><h1>Workflow: {}</h1><div id='graph' style='height:75vh;border:1px solid #ccc;background:#fff'></div></div><script src='/static/libs/vis-network/vis-network.min.js'></script><script>new vis.Network(document.getElementById('graph'),{{nodes:new vis.DataSet({}),edges:new vis.DataSet({})}},{{layout:{{hierarchical:{{direction:'LR',sortMethod:'directed',levelSeparation:260,nodeSpacing:120}}}},physics:false,edges:{{smooth:{{type:'cubicBezier'}}}}}});</script>",
-        t.id, esc(&t.name), esc(&t.name), Value::Array(all_nodes), Value::Array(edges)
-    );
-    ctx.html("Workflow", h).await
-}
-
 /// Give a new tracker a working workflow: Admin role, New/Delete statuses
 /// and New/Edit/Delete transitions over all of its fields.
 pub async fn create_defaults(db: &db::Db, t: &Tracker) -> anyhow::Result<()> {

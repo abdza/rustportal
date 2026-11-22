@@ -28,3 +28,86 @@ body.fullScreen {
   overflow: hidden;
   transform: none !important;
 }
+
+/* Client branding palette applied to page background and Bootstrap primary buttons/controls */
+body {
+  background-color: var(--brand-page-bg, #f6f9ff);
+}
+.btn-primary {
+  --bs-btn-color: var(--brand-primary-fg, #ffffff);
+  --bs-btn-bg: var(--brand-primary, #4154f1);
+  --bs-btn-border-color: var(--brand-primary, #4154f1);
+  --bs-btn-hover-color: var(--brand-primary-fg, #ffffff);
+  --bs-btn-hover-bg: var(--brand-primary-hover, #394ad4);
+  --bs-btn-hover-border-color: var(--brand-primary-hover, #394ad4);
+  --bs-btn-focus-shadow-rgb: var(--brand-primary-rgb, 65, 84, 241);
+  --bs-btn-active-color: var(--brand-primary-fg, #ffffff);
+  --bs-btn-active-bg: var(--brand-primary-active, #3545c5);
+  --bs-btn-active-border-color: var(--brand-primary-active, #3545c5);
+  --bs-btn-disabled-color: var(--brand-primary-fg, #ffffff);
+  --bs-btn-disabled-bg: var(--brand-primary, #4154f1);
+  --bs-btn-disabled-border-color: var(--brand-primary, #4154f1);
+}
+.btn-outline-primary {
+  --bs-btn-color: var(--brand-primary, #4154f1);
+  --bs-btn-border-color: var(--brand-primary, #4154f1);
+  --bs-btn-hover-color: var(--brand-primary-fg, #ffffff);
+  --bs-btn-hover-bg: var(--brand-primary, #4154f1);
+  --bs-btn-hover-border-color: var(--brand-primary, #4154f1);
+  --bs-btn-focus-shadow-rgb: var(--brand-primary-rgb, 65, 84, 241);
+  --bs-btn-active-color: var(--brand-primary-fg, #ffffff);
+  --bs-btn-active-bg: var(--brand-primary-active, #3545c5);
+  --bs-btn-active-border-color: var(--brand-primary-active, #3545c5);
+  --bs-btn-disabled-color: var(--brand-primary, #4154f1);
+  --bs-btn-disabled-bg: transparent;
+  --bs-btn-disabled-border-color: var(--brand-primary, #4154f1);
+}
+.btn-link {
+  --bs-btn-color: var(--brand-primary, #4154f1);
+  --bs-btn-hover-color: var(--brand-accent, #717ff5);
+  --bs-btn-active-color: var(--brand-accent, #717ff5);
+}
+.buttons a.btn-primary,
+.buttons input.btn-primary,
+.buttons button.btn-primary {
+  background-color: var(--brand-primary, #4154f1);
+  border: 1px solid var(--brand-primary, #4154f1);
+  color: var(--brand-primary-fg, #ffffff);
+}
+.buttons a.btn-primary:hover,
+.buttons input.btn-primary:hover,
+.buttons button.btn-primary:hover {
+  background-color: var(--brand-primary-hover, #394ad4);
+  border-color: var(--brand-primary-hover, #394ad4);
+  color: var(--brand-primary-fg, #ffffff);
+  text-shadow: none;
+}
+.nav-pills .nav-link.active,
+.nav-pills .show > .nav-link,
+.page-item.active .page-link,
+.active > .page-link,
+.dropdown-item.active,
+.dropdown-item:active {
+  background-color: var(--brand-primary, #4154f1);
+  border-color: var(--brand-primary, #4154f1);
+  color: var(--brand-primary-fg, #ffffff);
+}
+.form-check-input:hover {
+  border-color: var(--brand-primary, #4154f1);
+}
+.form-check-input:focus {
+  border-color: var(--brand-primary, #4154f1);
+  box-shadow: 0 0 0 0.2rem rgba(var(--brand-primary-rgb, 65, 84, 241), 0.25);
+}
+.form-check-input:checked {
+  background-color: var(--brand-primary, #4154f1);
+  border-color: var(--brand-primary, #4154f1);
+}
+input[type=checkbox]:not(.form-check-input),
+input[type=radio]:not(.form-check-input) {
+  accent-color: var(--brand-primary, #4154f1);
+}
+.back-to-top:hover,
+.contact .php-email-form button[type=submit]:hover {
+  background: var(--brand-primary-hover, var(--brand-accent, #717ff5));
+}

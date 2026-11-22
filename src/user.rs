@@ -1,11 +1,13 @@
-//! Authentication and the user's own account screens.
+//! Authentication, user administration, and the user's own account screens
+//! matching g6ikram's UserController + views/user/*.gsp.
 
-use crate::db::{b, i, s, Row};
+use crate::db::{self, b, i, lit, s, Db, Row};
 use crate::row;
-use crate::web::{self, esc, now_str, Ctx};
+use crate::web::{self, enc, esc, now_str, Ctx};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 const TOKEN_FILE: &str = "setup-token.txt";
 
@@ -227,56 +229,23 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<String>) -> Response {
         return ctx.need_login().await;
     }
     let uid = ctx.uid().unwrap_or(0);
+    let num_id = id.as_deref().and_then(|x| x.parse::<i64>().ok()).or_else(|| ctx.pi("id"));
     match act {
-        "my_profile" | "my_profile_save" => {
-            const EDITABLE: &[&str] = &["email", "handphone", "directline", "company_handphone", "address", "emergency_name", "emergency_contact"];
-            if ctx.method == "POST" {
-                let mut d = Row::new();
-                for k in EDITABLE {
-                    d.insert(k.to_string(), json!(ctx.p(k)));
-                }
-                d.insert("last_info_update".into(), json!(now_str()));
-                let _ = ctx.db().update("portal_user", uid, &d).await;
-                ctx.flash("Profile updated");
-                return ctx.redirect("/user/my_profile").await;
-            }
-            let u = ctx.user.clone().unwrap();
-            let roles = ctx.db().rows("select module, role from user_role where user_id=:u order by module, role", &row! {"u"=>uid}).await.unwrap_or_default();
-            let mut f = format!("<p><b>{}</b> &middot; {}</p><form method='post' action='/user/my_profile'>{}", esc(&s(&u, "name")), esc(&s(&u, "userid")), ctx.csrf_field());
-            for k in EDITABLE {
-                f.push_str(&format!("<label class='form-label'>{}</label><input class='form-control mb-2' name='{}' value='{}'/>", crate::entity::label_of(k), k, esc(&s(&u, k))));
-            }
-            f.push_str("<button class='btn btn-primary'>Save</button></form><h5 class='mt-4'>My roles</h5><ul>");
-            for r in roles {
-                f.push_str(&format!("<li>{}: {}</li>", esc(&s(&r, "module")), esc(&s(&r, "role"))));
-            }
-            f.push_str("</ul>");
-            ctx.html("My Profile", card("My Profile", &f)).await
-        }
-        "change_password" | "update_password" => {
-            if ctx.method == "POST" {
-                let full = ctx.db().get("portal_user", uid).await.ok().flatten().unwrap_or_default();
-                let new = ctx.p("password");
-                let msg = if !bcrypt::verify(ctx.p("current"), &s(&full, "password")).unwrap_or(false) {
-                    "The current password is not correct"
-                } else if new.len() < 8 {
-                    "The new password must be at least 8 characters"
-                } else if new != ctx.p("password2") {
-                    "The passwords do not match"
-                } else {
-                    let _ = ctx.db().update("portal_user", uid, &row! {"password"=>bcrypt::hash(&new, 12).unwrap_or_default(),"reset_password"=>false,"last_updated"=>now_str()}).await;
-                    web::user_log(ctx.db(), "password", "Password changed", Some(uid), None, &ctx.ip).await;
-                    ctx.flash("Password changed");
-                    return ctx.redirect("/").await;
-                };
-                ctx.flash(msg);
-                return ctx.redirect("/user/change_password").await;
-            }
-            let f = format!("<form method='post' action='/user/change_password'>{}<label class='form-label'>Current password</label><input type='password' class='form-control mb-2' name='current' required/><label class='form-label'>New password</label><input type='password' class='form-control mb-2' name='password' required minlength='8'/><label class='form-label'>Repeat new password</label><input type='password' class='form-control mb-3' name='password2' required/><button class='btn btn-primary'>Change password</button></form>", ctx.csrf_field());
-            ctx.html("Change Password", card("Change Password", &f)).await
-        }
+        "" | "index" | "list" => index(ctx).await,
+        "show" => show(ctx, num_id.unwrap_or(0)).await,
+        "create" => create_or_edit(ctx, None).await,
+        "edit" => create_or_edit(ctx, num_id).await,
+        "save" => save_user(ctx, None).await,
+        "update" => save_user(ctx, num_id).await,
+        "delete" => delete_user(ctx, num_id.unwrap_or(0)).await,
+        "clearsession" => clear_session(ctx, num_id.unwrap_or(0)).await,
+        "updatelanid" => update_lanid(ctx, num_id.unwrap_or(0)).await,
+        "completelist" => user_picker_list(ctx, false).await,
+        "activelist" => user_picker_list(ctx, true).await,
+        "my_profile" | "my_profile_save" => my_profile(ctx, uid).await,
+        "change_password" | "update_password" => change_password(ctx, uid).await,
         "switchuser" => {
-            if !ctx.is_admin() || ctx.sess.contains_key("adminlink") {
+            if !is_switchable(&ctx).await || ctx.sess.contains_key("adminlink") {
                 ctx.flash("Need to be a SuperUser to switch users (restore admin first if already switched)");
                 return ctx.redirect("/").await;
             }
@@ -313,5 +282,869 @@ pub async fn action(mut ctx: Ctx, act: &str, id: Option<String>) -> Response {
             ctx.redirect(&to).await
         }
         _ => ctx.status(StatusCode::NOT_FOUND, "Unknown action").await,
+    }
+}
+
+fn split_tokens(raw: &str) -> Vec<String> {
+    raw.replace(['[', ']', '\'', '"'], "")
+        .split([',', ';', ' ', '\t', '\r', '\n'])
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+/// Matches g6ikram's `User.switchable()` (admin or in `portal.switchusers`, unless in `portal.switch_blacklist`).
+pub async fn is_switchable(ctx: &Ctx) -> bool {
+    let Some(u) = ctx.user.as_ref() else { return false };
+    let uid_str = s(u, "userid").trim().to_string();
+    if let Some(bl) = web::setting_str(ctx.db(), "portal.switch_blacklist").await {
+        if split_tokens(&bl).iter().any(|x| x == &uid_str) {
+            return false;
+        }
+    }
+    if b(u, "is_admin") {
+        return true;
+    }
+    if let Some(sw) = web::setting_str(ctx.db(), "portal.switchusers").await {
+        return split_tokens(&sw).iter().any(|x| x == &uid_str);
+    }
+    false
+}
+
+fn user_label(field: &str) -> &'static str {
+    match field {
+        "userid" => "User ID",
+        "name" => "Name",
+        "email" => "Email",
+        "role" => "Role",
+        "roletargetid" => "Roletargetid",
+        "lastlogin" => "Lastlogin",
+        "date_joined" => "Datejoined",
+        "telegram_chat_id" => "Telegramchatid",
+        "telegram_username" => "Telegramusername",
+        "telegram_linked_at" => "Telegramlinkedat",
+        "telegram_link_token" => "Telegramlinktoken",
+        "telegram_token_expiry" => "Telegramtokenexpiry",
+        "is_active" => "Is Active",
+        "is_admin" => "Is Admin",
+        "reset_password" => "Reset Password",
+        "directline" => "Direct Line",
+        "handphone" => "Handphone",
+        "company_handphone" => "Company Handphone",
+        "emergency_contact" => "Emergency Contact Number",
+        "emergency_name" => "Emergency Contact Name",
+        "address" => "Home Address",
+        "state" => "State",
+        "lanid" => "Lanid",
+        "lanidexception" => "Lanidexception",
+        "resetexception" => "Resetexception",
+        "profile_id" => "Profile ID",
+        "password" => "Password",
+        "secretquestion" => "Secretquestion",
+        "secretanswer" => "Secretanswer",
+        _ => "",
+    }
+}
+
+fn fmt_user_dt(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if let Some(dt) = crate::script::parse_dt(t) {
+        return dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    }
+    // Strip fractional seconds / timezone suffix on ISO/Postgres timestamps (e.g. 2026-11-22T06:40:36.123456Z)
+    let norm = t.replace('T', " ");
+    let base = norm.split('.').next().unwrap_or(&norm);
+    let base = base.trim_end_matches('Z');
+    let base = if base.len() > 19 { &base[..19] } else { base };
+    match crate::script::parse_dt(base) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => t.to_string(),
+    }
+}
+
+async fn node_full_path(db: &Db, node_id: i64) -> String {
+    let mut parts = vec![];
+    let mut cur = Some(node_id);
+    let mut seen = HashSet::new();
+    while let Some(nid) = cur {
+        if !seen.insert(nid) || parts.len() > 20 {
+            break;
+        }
+        let Ok(Some(n)) = db.get("portal_tree_node", nid).await else { break };
+        parts.push(s(&n, "name"));
+        cur = i(&n, "parent_id");
+    }
+    parts.reverse();
+    parts.join(" / ")
+}
+
+async fn index(ctx: Ctx) -> Response {
+    let db = &ctx.st.db.clone();
+    let Some(u) = ctx.user.as_ref() else { return ctx.need_login().await };
+    let is_admin = ctx.is_admin();
+    let can_switch = is_switchable(&ctx).await && !ctx.sess.contains_key("adminlink");
+    if !is_admin && !can_switch && web::admin_list(db, u).await.is_empty() {
+        return ctx.status(StatusCode::FORBIDDEN, "You are not authorized to view this list").await;
+    }
+
+    let q = ctx.p("q");
+    let rolefilter = ctx.p("rolefilter");
+    let is_active_p = ctx.p("is_active");
+    let mut cond: Vec<String> = vec![];
+    if is_active_p == "0" {
+        cond.push("is_active is not true".into());
+    } else if is_active_p != "all" {
+        cond.push("is_active is true".into());
+    }
+    if !rolefilter.is_empty() && rolefilter != "All" {
+        cond.push(format!("id in (select user_id from portal_tree_node_user where role={})", lit(&json!(rolefilter))));
+    }
+    if !q.trim().is_empty() {
+        let like = lit(&json!(format!("%{}%", q.trim().replace(' ', "%"))));
+        cond.push(format!("(userid ilike {l} or name ilike {l} or email ilike {l} or lanid ilike {l})", l = like));
+    }
+    let wh = if cond.is_empty() { String::new() } else { format!(" where {}", cond.join(" and ")) };
+    let max = ctx.pi("max").unwrap_or(10).clamp(1, 500);
+    let offset = ctx.pi("offset").unwrap_or(0).max(0);
+    let sort_p = ctx.p("sort");
+    let order_dir = if ctx.p("order") == "desc" { "desc" } else { "asc" };
+    let sort_col = match sort_p.as_str() {
+        "userID" | "userid" => "userid",
+        "name" => "name",
+        "email" => "email",
+        "role" => "role",
+        _ => "name",
+    };
+    let order_sql = format!("\"{}\" {}", sort_col, order_dir);
+
+    let total = db.count(&format!("select count(*) from portal_user{}", wh), &db::no_params()).await.unwrap_or(0);
+    let rows = db
+        .rows(&format!("select * from portal_user{} order by {} limit {} offset {}", wh, order_sql, max, offset), &db::no_params())
+        .await
+        .unwrap_or_default();
+
+    let rolelist: Vec<String> = db
+        .rows("select distinct role from portal_tree_node_user where role is not null and role != '' and role not like 'roleadmin%' order by role", &db::no_params())
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| s(&r, "role"))
+        .collect();
+
+    let has_um_admin = web::module_roles(db, u, "user_management").await.iter().any(|r| r == "Admin");
+
+    let mut nav = String::from(
+        "<div class=\"nav\" role=\"navigation\"><ul>\n\
+         <li><a class=\"home\" href=\"/user/index\">Home</a></li>\n",
+    );
+    if is_admin {
+        nav.push_str("<li><a class=\"create\" href=\"/user/create\">New User</a></li>\n");
+    }
+    if has_um_admin {
+        nav.push_str("<li><a class=\"list\" href=\"/view/user_management/dashboard\">User Management Dashboard</a></li>\n");
+    }
+    nav.push_str("</ul></div>");
+
+    let mut role_opts = String::from("<option value=\"\">All</option>");
+    for r in &rolelist {
+        role_opts.push_str(&format!("<option value=\"{}\"{}>{}</option>", esc(r), if r == &rolefilter { " selected" } else { "" }, esc(r)));
+    }
+
+    let q_keep = web::qs(&ctx.params, &["sort", "order", "offset", "max"]);
+    let th_sort = |prop: &str, col: &str, label: &str| -> String {
+        let sorted = sort_p == prop || (sort_p.is_empty() && col == "name");
+        let next_ord = if sorted && order_dir == "asc" { "desc" } else { "asc" };
+        let cls = if sorted { format!(" sortable sorted {}", order_dir) } else { " sortable".into() };
+        let extra = if q_keep.is_empty() { String::new() } else { format!("&amp;{}", esc(&q_keep)) };
+        format!("<th class=\"{cls}\"><a href=\"/user/index?sort={prop}&amp;max={max}&amp;order={next_ord}{extra}\">{label}</a></th>")
+    };
+
+    let mut tbody = String::new();
+    for (idx, r) in rows.iter().enumerate() {
+        let rid = i(r, "id").unwrap_or(0);
+        let uid_str = s(r, "userid");
+        let nm = esc(&s(r, "name"));
+        let name_cell = if can_switch && !uid_str.is_empty() {
+            format!("<a href=\"/user/switchuser/{}\">{nm}</a>", enc(&uid_str))
+        } else {
+            nm
+        };
+        let active = b(r, "is_active");
+        let row_cls = format!("{} {}", if idx % 2 == 0 { "even" } else { "odd" }, if active { "" } else { "inactive-user" });
+        tbody.push_str(&format!(
+            "<tr class=\"{row_cls}\">\
+             <td><a href=\"/user/show/{rid}\">{}</a>&nbsp;</td>\
+             <td>{name_cell}&nbsp;</td>\
+             <td>{}&nbsp;</td>\
+             <td>{}&nbsp;</td></tr>\n",
+            esc(&uid_str),
+            esc(&s(r, "email")),
+            esc(&s(r, "role"))
+        ));
+    }
+
+    let flash = s(&ctx.sess, "flash");
+    let flash_html = if flash.is_empty() { String::new() } else { format!("<div class=\"message\" role=\"status\">{}</div>", esc(&flash)) };
+    let pag = if total > max {
+        format!("<div class=\"pagination\">{}</div>", crate::tags::paginate("/user/index", &ctx.params, total, max, offset))
+    } else {
+        String::new()
+    };
+
+    let sel_all = if is_active_p == "all" { " selected" } else { "" };
+    let sel_true = if is_active_p.is_empty() || is_active_p == "1" { " selected" } else { "" };
+    let sel_false = if is_active_p == "0" { " selected" } else { "" };
+
+    let body = format!(
+        r##"<style>tr.inactive-user td {{ background-color: #f8d7da; color: #58151c; }}</style>
+<div id="content" role="main"><div class="container">
+<section class="row"><a href="#list-user" class="skip" tabindex="-1">Skip to content&hellip;</a>{nav}</section>
+<section class="row"><div id="list-user" class="col-12 content scaffold-list" role="main">
+  <h1>User List</h1>
+  {flash_html}
+  <form name="searchform" id="searchform" action="/user/index" method="get">
+    <fieldset class="form">
+      <div class="fieldcontain" id="listrole">
+        <label>Role:</label><select name="rolefilter" id="rolefilter">{role_opts}</select>
+      </div>
+      <div class="fieldcontain" id="isactivediv">
+        <label>Is Active:</label>
+        <select name="is_active" id="is_active">
+          <option value="all"{sel_all}>All</option>
+          <option value="1"{sel_true}>True</option>
+          <option value="0"{sel_false}>False</option>
+        </select>
+      </div>
+      <div class="fieldcontain" id="listsearch">
+        <label>Search:</label><input type="text" name="q" id="q" value="{q}"/><input id="dosearch" name="dosearch" type="submit" value="Search"/>
+      </div>
+    </fieldset>
+  </form>
+  <table class="responsive">
+    <thead><tr>{th1}{th2}{th3}{th4}</tr></thead>
+    <tbody>{tbody}</tbody>
+  </table>
+  {pag}
+</div></section></div></div>
+<script>$('#is_active,#rolefilter').on('change', function(){{ $('#searchform').submit(); }});</script>"##,
+        q = esc(&q),
+        th1 = th_sort("userID", "userid", "User ID"),
+        th2 = th_sort("name", "name", "Name"),
+        th3 = th_sort("email", "email", "Email"),
+        th4 = th_sort("role", "role", "Role"),
+    );
+    ctx.html("User List", body).await
+}
+
+async fn show(mut ctx: Ctx, id: i64) -> Response {
+    let db = &ctx.st.db.clone();
+    let Ok(Some(u)) = db.get("portal_user", id).await else {
+        return ctx.status(StatusCode::NOT_FOUND, "Not found").await;
+    };
+    let is_admin = ctx.is_admin();
+    let is_self = ctx.uid() == Some(id);
+    let can_switch = is_switchable(&ctx).await && !ctx.sess.contains_key("adminlink");
+    if !is_admin && !is_self && !can_switch {
+        return ctx.status(StatusCode::FORBIDDEN, "You are not authorized to view this user").await;
+    }
+
+    let csrf = ctx.csrf_field();
+    let uid_str = s(&u, "userid");
+    let has_session_lock = !s(&u, "active_session_id").trim().is_empty();
+
+    let mut nav = String::from(
+        "<div class=\"nav\" role=\"navigation\"><ul>\n\
+         <li><a class=\"home\" href=\"/\">Home</a></li>\n\
+         <li><a class=\"list\" href=\"/user/index\">User List</a></li>\n",
+    );
+    if is_admin {
+        nav.push_str(&format!(
+            "<li><a class=\"create\" href=\"/user/create\">New User</a></li>\n\
+             <li><a class=\"list\" href=\"/user/updatelanid/{id}\">Update LAN ID</a></li>\n"
+        ));
+    }
+    if is_admin && has_session_lock {
+        nav.push_str(&format!(
+            "<li><form action=\"/user/clearsession/{id}\" method=\"post\" style=\"display:inline\">{csrf}<input type=\"submit\" class=\"list\" value=\"Clear Session Lock\"/></form></li>\n"
+        ));
+    }
+    if can_switch && !uid_str.is_empty() {
+        nav.push_str(&format!("<li><a class=\"list\" href=\"/user/switchuser/{}\">Switch</a></li>\n", enc(&uid_str)));
+    }
+    nav.push_str("</ul></div>");
+
+    let prop_li = |field: &str, val_html: String| -> String {
+        let lbl = user_label(field);
+        format!(
+            "    <li class=\"fieldcontain\">\n        <span id=\"{field}-label\" class=\"property-label\">{lbl}</span>\n        <div class=\"property-value\" aria-labelledby=\"{field}-label\">{val_html}</div>\n    </li>\n"
+        )
+    };
+
+    // Block 1: public/summary fields (matching g6ikram user/show.gsp first <f:display>)
+    let name_val = if can_switch && !uid_str.is_empty() {
+        format!("<a href=\"/user/switchuser/{}\">{}</a>", enc(&uid_str), esc(&s(&u, "name")))
+    } else {
+        esc(&s(&u, "name"))
+    };
+    let is_active_val = if b(&u, "is_active") { "True" } else { "False" }.to_string();
+    let mut ol1 = String::from("<ol class=\"property-list user\">\n");
+    ol1.push_str(&prop_li("userid", esc(&uid_str)));
+    ol1.push_str(&prop_li("name", name_val));
+    ol1.push_str(&prop_li("email", esc(&s(&u, "email"))));
+    ol1.push_str(&prop_li("role", esc(&s(&u, "role"))));
+    ol1.push_str(&prop_li("lastlogin", esc(&fmt_user_dt(&s(&u, "lastlogin")))));
+    ol1.push_str(&prop_li("date_joined", esc(&fmt_user_dt(&s(&u, "date_joined")))));
+    ol1.push_str(&prop_li("telegram_chat_id", esc(&s(&u, "telegram_chat_id"))));
+    ol1.push_str(&prop_li("telegram_username", esc(&s(&u, "telegram_username"))));
+    ol1.push_str(&prop_li("telegram_linked_at", esc(&fmt_user_dt(&s(&u, "telegram_linked_at")))));
+    ol1.push_str(&prop_li("telegram_link_token", esc(&s(&u, "telegram_link_token"))));
+    ol1.push_str(&prop_li("telegram_token_expiry", esc(&fmt_user_dt(&s(&u, "telegram_token_expiry")))));
+    ol1.push_str(&prop_li("is_active", is_active_val));
+    ol1.push_str("</ol>\n");
+
+    // Block 2: private contact fields (admin or self, matching second <f:display>)
+    let mut ol2 = String::new();
+    if is_admin || is_self {
+        ol2.push_str("<ol class=\"property-list user\">\n");
+        ol2.push_str(&prop_li("directline", esc(&s(&u, "directline"))));
+        ol2.push_str(&prop_li("handphone", esc(&s(&u, "handphone"))));
+        ol2.push_str(&prop_li("company_handphone", esc(&s(&u, "company_handphone"))));
+        ol2.push_str(&prop_li("emergency_contact", esc(&s(&u, "emergency_contact"))));
+        ol2.push_str(&prop_li("emergency_name", esc(&s(&u, "emergency_name"))));
+        ol2.push_str(&prop_li("address", esc(&s(&u, "address")).replace('\n', "<br/>")));
+        ol2.push_str(&prop_li("state", esc(&s(&u, "state"))));
+        ol2.push_str(&prop_li("lanid", esc(&s(&u, "lanid"))));
+        ol2.push_str("</ol>\n");
+    }
+
+    // Tree Roles & Module Roles (matching g6ikram user/show.gsp lines 47-60)
+    let mut roles_html = String::new();
+    if can_switch {
+        let troles = db
+            .rows(
+                "select tnu.id, tnu.role, n.id as nid, n.name as nname, t.root_id \
+                 from portal_tree_node_user tnu \
+                 join portal_tree_node n on n.id=tnu.node_id \
+                 join portal_tree t on t.id=n.tree_id \
+                 where tnu.user_id=:u order by tnu.id",
+                &row! {"u"=>id},
+            )
+            .await
+            .unwrap_or_default();
+        roles_html.push_str("<h3>Tree Roles</h3><ol>");
+        for tr in &troles {
+            let nid = i(tr, "nid").unwrap_or(0);
+            let root_id = i(tr, "root_id").unwrap_or(nid);
+            let full = node_full_path(db, nid).await;
+            let label = format!("{} - {}", s(tr, "nname"), s(tr, "role"));
+            roles_html.push_str(&format!(
+                "<li><a href=\"/portalTreeNode/show/{root_id}?nodeid={nid}\">{}</a> - {}</li>",
+                esc(&label),
+                esc(&full)
+            ));
+        }
+        roles_html.push_str("</ol>");
+
+        let mroles = db
+            .rows("select id, module, role from user_role where user_id=:u order by module, role", &row! {"u"=>id})
+            .await
+            .unwrap_or_default();
+        roles_html.push_str("<h3>Module Roles</h3><ol>");
+        for mr in &mroles {
+            roles_html.push_str(&format!(
+                "<li><a href=\"/userRole/show/{}\">{} - {}</a></li>",
+                i(mr, "id").unwrap_or(0),
+                esc(&s(mr, "module")),
+                esc(&s(mr, "role"))
+            ));
+        }
+        roles_html.push_str("</ol>");
+    }
+
+    let buttons = if is_admin {
+        format!(
+            "<form action=\"/user/delete/{id}\" method=\"post\">{csrf}\
+             <fieldset class=\"buttons\">\
+             <a class=\"edit\" href=\"/user/edit/{id}\">Edit</a>\
+             <input class=\"delete\" type=\"submit\" value=\"Delete\" onclick=\"return confirm('Are you sure?');\" />\
+             </fieldset></form>"
+        )
+    } else {
+        String::new()
+    };
+
+    let flash = s(&ctx.sess, "flash");
+    let flash_html = if flash.is_empty() { String::new() } else { format!("<div class=\"message\" role=\"status\">{}</div>", esc(&flash)) };
+
+    let body = format!(
+        r##"<div id="content" role="main"><div class="container">
+<section class="row"><a href="#show-user" class="skip" tabindex="-1">Skip to content&hellip;</a>{nav}</section>
+<section class="row"><div id="show-user" class="col-12 content scaffold-show" role="main">
+  <h1>Show User</h1>
+  {flash_html}
+  {ol1}{ol2}{roles_html}{buttons}
+</div></section></div></div>"##
+    );
+    ctx.html("Show User", body).await
+}
+
+async fn create_or_edit(mut ctx: Ctx, id: Option<i64>) -> Response {
+    let db = &ctx.st.db.clone();
+    let is_admin = ctx.is_admin();
+    let is_new = id.is_none();
+    if is_new {
+        if !is_admin && web::admin_list(db, ctx.user.as_ref().unwrap()).await.is_empty() {
+            return ctx.status(StatusCode::FORBIDDEN, "Not allowed").await;
+        }
+    } else if !is_admin {
+        return ctx.status(StatusCode::FORBIDDEN, "Administrator rights required").await;
+    }
+
+    let u = match id {
+        Some(uid) => match db.get("portal_user", uid).await {
+            Ok(Some(r)) => r,
+            _ => return ctx.status(StatusCode::NOT_FOUND, "Not found").await,
+        },
+        None => Row::new(),
+    };
+
+    let txt = |name: &str, req: bool| -> String {
+        let lbl = user_label(name);
+        let req_cls = if req { " required" } else { "" };
+        let req_star = if req { "<span class=\"required-indicator\">*</span>" } else { "" };
+        let req_attr = if req { " required=\"required\"" } else { "" };
+        format!(
+            "<div class=\"fieldcontain{req_cls}\"><label for=\"{name}\">{lbl}{req_star}</label><input type=\"text\" name=\"{name}\" id=\"{name}\" value=\"{}\"{req_attr}/></div>",
+            esc(&s(&u, name))
+        )
+    };
+    let chk = |name: &str| -> String {
+        let lbl = user_label(name);
+        let checked = if b(&u, name) { " checked=\"checked\"" } else { "" };
+        format!(
+            "<div class=\"fieldcontain\"><label for=\"{name}\">{lbl}</label><input type=\"hidden\" name=\"_{name}\" /><input type=\"checkbox\" name=\"{name}\" id=\"{name}\"{checked}/></div>"
+        )
+    };
+    let num = |name: &str| -> String {
+        let lbl = user_label(name);
+        format!(
+            "<div class=\"fieldcontain\"><label for=\"{name}\">{lbl}</label><input type=\"number\" name=\"{name}\" id=\"{name}\" value=\"{}\"/></div>",
+            esc(&s(&u, name))
+        )
+    };
+    let area = |name: &str| -> String {
+        let lbl = user_label(name);
+        format!(
+            "<div class=\"fieldcontain\"><label for=\"{name}\">{lbl}</label><textarea name=\"{name}\" id=\"{name}\">{}</textarea></div>",
+            esc(&s(&u, name))
+        )
+    };
+
+    let mut fields = String::new();
+    fields.push_str(&txt("userid", true));
+    fields.push_str(&txt("name", true));
+    fields.push_str(&txt("email", false));
+    if is_new {
+        fields.push_str("<div class=\"fieldcontain required\"><label for=\"password\">Password<span class=\"required-indicator\">*</span></label><input type=\"password\" name=\"password\" id=\"password\" autocomplete=\"new-password\" required=\"required\"/></div>");
+    } else {
+        fields.push_str("<div class=\"fieldcontain\"><label for=\"password\">Password</label><input type=\"password\" name=\"password\" id=\"password\" autocomplete=\"new-password\" placeholder=\"leave blank to keep current password\"/></div>");
+        fields.push_str(&txt("role", false));
+        fields.push_str(&num("roletargetid"));
+        fields.push_str(&chk("is_admin"));
+        fields.push_str(&chk("is_active"));
+        fields.push_str(&chk("reset_password"));
+        fields.push_str(&chk("lanidexception"));
+        fields.push_str(&chk("resetexception"));
+    }
+    fields.push_str(&txt("directline", false));
+    fields.push_str(&txt("handphone", false));
+    fields.push_str(&txt("company_handphone", false));
+    fields.push_str(&txt("emergency_contact", false));
+    fields.push_str(&txt("emergency_name", false));
+    fields.push_str(&area("address"));
+    fields.push_str(&txt("state", false));
+    fields.push_str(&txt("lanid", false));
+    fields.push_str(&num("profile_id"));
+    if !is_new {
+        fields.push_str(&txt("telegram_chat_id", false));
+        fields.push_str(&txt("telegram_username", false));
+    }
+
+    let csrf = ctx.csrf_field();
+    let flash = s(&ctx.sess, "flash");
+    let flash_html = if flash.is_empty() { String::new() } else { format!("<div class=\"message\" role=\"status\">{}</div>", esc(&flash)) };
+    let action = match id {
+        Some(uid) => format!("/user/update/{uid}"),
+        None => "/user/save".into(),
+    };
+    let kind = if is_new { "create" } else { "edit" };
+    let heading = if is_new { "Create User" } else { "Edit User" };
+    let btn = if is_new { "Create" } else { "Update" };
+    let new_li = if !is_new && is_admin { "<li><a class=\"create\" href=\"/user/create\">New User</a></li>" } else { "" };
+
+    let body = format!(
+        r##"<div id="content" role="main"><div class="container">
+<section class="row"><a href="#{kind}-user" class="skip" tabindex="-1">Skip to content&hellip;</a>
+<div class="nav" role="navigation"><ul>
+  <li><a class="home" href="/">Home</a></li>
+  <li><a class="list" href="/user/index">User List</a></li>
+  {new_li}
+</ul></div></section>
+<section class="row"><div id="{kind}-user" class="col-12 content scaffold-{kind}" role="main">
+  <h1>{heading}</h1>
+  {flash_html}
+  <form action="{action}" method="post">
+    {csrf}
+    <fieldset class="form">{fields}</fieldset>
+    <fieldset class="buttons"><input class="save" type="submit" value="{btn}" /></fieldset>
+  </form>
+</div></section></div></div>"##
+    );
+    ctx.html(heading, body).await
+}
+
+async fn save_user(mut ctx: Ctx, id: Option<i64>) -> Response {
+    if ctx.method != "POST" {
+        return ctx.status(StatusCode::FORBIDDEN, "POST required").await;
+    }
+    let db = &ctx.st.db.clone();
+    let is_admin = ctx.is_admin();
+    if id.is_none() {
+        if !is_admin && web::admin_list(db, ctx.user.as_ref().unwrap()).await.is_empty() {
+            return ctx.status(StatusCode::FORBIDDEN, "Not allowed").await;
+        }
+    } else if !is_admin {
+        return ctx.status(StatusCode::FORBIDDEN, "Administrator rights required").await;
+    }
+
+    let uid_str = { let x = ctx.p("userid"); if x.trim().is_empty() { ctx.p("userID") } else { x } }.trim().to_string();
+    let name = ctx.p("name").trim().to_string();
+    if uid_str.len() < 3 || !uid_str.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        ctx.flash("User ID must be at least 3 letters, numbers, dots, underscores or dashes");
+        return ctx.redirect(&id.map(|x| format!("/user/edit/{x}")).unwrap_or_else(|| "/user/create".into())).await;
+    }
+    if name.is_empty() {
+        ctx.flash("Name is required");
+        return ctx.redirect(&id.map(|x| format!("/user/edit/{x}")).unwrap_or_else(|| "/user/create".into())).await;
+    }
+    let dup = db
+        .count("select count(*) from portal_user where userid=:s and id!=:id", &row! {"s"=>uid_str.clone(),"id"=>id.unwrap_or(0)})
+        .await
+        .unwrap_or(0);
+    if dup > 0 {
+        ctx.flash("That user ID is already in use");
+        return ctx.redirect(&id.map(|x| format!("/user/edit/{x}")).unwrap_or_else(|| "/user/create".into())).await;
+    }
+
+    let mut d = Row::new();
+    d.insert("userid".into(), json!(uid_str));
+    d.insert("name".into(), json!(name.clone()));
+    for k in ["email", "directline", "handphone", "company_handphone", "emergency_contact", "emergency_name", "address", "state", "lanid"] {
+        let v = ctx.p(k);
+        d.insert(k.into(), if v.trim().is_empty() { Value::Null } else { json!(v.trim()) });
+    }
+    d.insert("profile_id".into(), ctx.pi("profile_id").map(|n| json!(n)).unwrap_or(Value::Null));
+
+    let pw = ctx.p("password");
+    if id.is_none() {
+        if pw.len() < 8 {
+            ctx.flash("A password of at least 8 characters is required for a new user");
+            return ctx.redirect("/user/create").await;
+        }
+        d.insert("password".into(), json!(bcrypt::hash(&pw, 12).unwrap_or_default()));
+        d.insert("is_admin".into(), json!(false));
+        d.insert("is_active".into(), json!(true));
+        d.insert("reset_password".into(), json!(false));
+        d.insert("date_joined".into(), json!(now_str()));
+    } else if !pw.is_empty() {
+        if pw.len() < 8 {
+            ctx.flash("Password must be at least 8 characters");
+            return ctx.redirect(&format!("/user/edit/{}", id.unwrap())).await;
+        }
+        d.insert("password".into(), json!(bcrypt::hash(&pw, 12).unwrap_or_default()));
+    }
+
+    let mut extra_note = String::new();
+    if let Some(uid) = id {
+        if is_admin {
+            if ctx.params.contains_key("_is_admin") {
+                d.insert("is_admin".into(), json!(ctx.params.contains_key("is_admin")));
+            }
+            if ctx.params.contains_key("_is_active") {
+                d.insert("is_active".into(), json!(ctx.params.contains_key("is_active")));
+            }
+            if ctx.params.contains_key("_reset_password") {
+                d.insert("reset_password".into(), json!(ctx.params.contains_key("reset_password")));
+            }
+            if ctx.params.contains_key("_lanidexception") {
+                d.insert("lanidexception".into(), json!(ctx.params.contains_key("lanidexception")));
+            }
+            if ctx.params.contains_key("_resetexception") {
+                d.insert("resetexception".into(), json!(ctx.params.contains_key("resetexception")));
+            }
+            let role_v = ctx.p("role");
+            d.insert("role".into(), if role_v.trim().is_empty() { Value::Null } else { json!(role_v.trim()) });
+            for tk in ["telegram_chat_id", "telegram_username"] {
+                if ctx.params.contains_key(tk) {
+                    let v = ctx.p(tk);
+                    d.insert(tk.into(), if v.trim().is_empty() { Value::Null } else { json!(v.trim()) });
+                }
+            }
+            if ctx.params.contains_key("roletargetid") {
+                match ctx.pi("roletargetid") {
+                    None => {
+                        d.insert("roletargetid".into(), Value::Null);
+                    }
+                    Some(wanted) => {
+                        let holder = db.first("select user_id from portal_tree_node_user where id=:id", &row! {"id"=>wanted}).await.ok().flatten().and_then(|r| i(&r, "user_id"));
+                        if holder == Some(uid) {
+                            d.insert("roletargetid".into(), json!(wanted));
+                        } else {
+                            extra_note = format!(" Role target {} is not one of {}'s tree positions - left unchanged.", wanted, name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    d.insert("last_updated".into(), json!(now_str()));
+
+    let res = match id {
+        Some(uid) => db.update("portal_user", uid, &d).await.map(|_| uid),
+        None => db.insert("portal_user", &d).await,
+    };
+    match res {
+        Ok(rid) => {
+            crate::cache::USERS.clear();
+            web::user_log(db, "user", if id.is_some() { "User updated" } else { "User created" }, ctx.uid(), Some(rid), &ctx.ip).await;
+            ctx.flash(&format!("User {}{}", if id.is_some() { "updated" } else { "created" }, extra_note));
+            ctx.redirect(&format!("/user/show/{rid}")).await
+        }
+        Err(e) => {
+            ctx.flash(&format!("Could not save: {}", e));
+            ctx.redirect("/user/index").await
+        }
+    }
+}
+
+/// Matches g6ikram's UserController.delete: soft-deactivates the user (`is_active = false`).
+async fn delete_user(mut ctx: Ctx, id: i64) -> Response {
+    if ctx.method != "POST" || !ctx.is_admin() {
+        return ctx.status(StatusCode::FORBIDDEN, "Administrator rights required").await;
+    }
+    let db = &ctx.st.db.clone();
+    if let Ok(Some(_)) = db.get("portal_user", id).await {
+        let _ = db.update("portal_user", id, &row! {"is_active"=>false,"last_updated"=>now_str()}).await;
+        crate::cache::USERS.clear();
+        web::user_log(db, "user", "User deactivated", ctx.uid(), Some(id), &ctx.ip).await;
+        ctx.flash(&format!("User {} deleted", id));
+    }
+    ctx.redirect("/user/index").await
+}
+
+async fn clear_session(mut ctx: Ctx, id: i64) -> Response {
+    if ctx.method != "POST" || !ctx.is_admin() {
+        ctx.flash("Need to be admin");
+        return ctx.redirect("/").await;
+    }
+    let db = &ctx.st.db.clone();
+    if let Ok(Some(u)) = db.get("portal_user", id).await {
+        let _ = db.update("portal_user", id, &row! {"active_session_id"=>Value::Null,"active_session_updated"=>Value::Null}).await;
+        ctx.flash(&format!("Session lock cleared for {}", s(&u, "name")));
+    }
+    ctx.redirect(&format!("/user/show/{id}")).await
+}
+
+async fn update_lanid(mut ctx: Ctx, id: i64) -> Response {
+    if !ctx.is_admin() {
+        return ctx.status(StatusCode::FORBIDDEN, "Administrator rights required").await;
+    }
+    let db = &ctx.st.db.clone();
+    if let Ok(Some(u)) = db.get("portal_user", id).await {
+        ctx.flash(&format!("LDAP LAN ID lookup is not configured for {}", s(&u, "name")));
+    }
+    ctx.redirect(&format!("/user/show/{id}")).await
+}
+
+async fn user_picker_list(ctx: Ctx, active_only: bool) -> Response {
+    let db = &ctx.st.db.clone();
+    let q = ctx.p("q");
+    let like = lit(&json!(format!("%{}%", q.trim().replace(' ', "%"))));
+    let mut cond = vec![format!("(name ilike {l} or userid ilike {l} or email ilike {l} or lanid ilike {l})", l = like)];
+    if active_only {
+        cond.push("is_active is true".into());
+    }
+    let role_p = ctx.p("role");
+    if !role_p.trim().is_empty() {
+        let roles: Vec<String> = role_p.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+        if !roles.is_empty() {
+            cond.push(format!("id in (select user_id from portal_tree_node_user where role in {})", lit(&json!(roles))));
+        }
+    }
+    let lim = if active_only { 20 } else { 9 };
+    let mut rows = db
+        .rows(&format!("select id, name from portal_user where {} order by name limit {}", cond.join(" and "), lim), &db::no_params())
+        .await
+        .unwrap_or_default();
+    if let Some(vid) = ctx.pi("value") {
+        if !rows.iter().any(|r| i(r, "id") == Some(vid)) {
+            if let Ok(Some(cur)) = db.get("portal_user", vid).await {
+                rows.insert(0, cur);
+            }
+        }
+    }
+    let list: Vec<Value> = rows.iter().map(|r| json!({"id": i(r, "id"), "value": i(r, "id"), "name": s(r, "name")})).collect();
+    ctx.json(json!({"users": list})).await
+}
+
+async fn my_profile(mut ctx: Ctx, uid: i64) -> Response {
+    let db = &ctx.st.db.clone();
+    const EDITABLE: &[&str] = &["name", "email", "directline", "handphone", "company_handphone", "emergency_contact", "emergency_name", "address", "state"];
+    if ctx.method == "POST" {
+        let mut d = Row::new();
+        for k in EDITABLE {
+            if ctx.params.contains_key(*k) {
+                let v = ctx.p(k);
+                d.insert((*k).to_string(), if v.trim().is_empty() { Value::Null } else { json!(v.trim()) });
+            }
+        }
+        d.insert("last_info_update".into(), json!(now_str()));
+        let _ = db.update("portal_user", uid, &d).await;
+        crate::cache::USERS.clear();
+        ctx.flash("Your profile has been updated");
+        return ctx.redirect("/user/my_profile").await;
+    }
+    let u = db.get("portal_user", uid).await.ok().flatten().unwrap_or_else(|| ctx.user.clone().unwrap_or_default());
+    let roles = db.rows("select id, module, role from user_role where user_id=:u order by module, role", &row! {"u"=>uid}).await.unwrap_or_default();
+    let csrf = ctx.csrf_field();
+    let flash = s(&ctx.sess, "flash");
+    let flash_html = if flash.is_empty() { String::new() } else { format!("<div class=\"message\" role=\"status\">{}</div>", esc(&flash)) };
+
+    let mut fields = format!(
+        "<div class=\"fieldcontain\"><label for=\"userid\">User ID</label><input type=\"text\" id=\"userid\" value=\"{}\" readonly/></div>",
+        esc(&s(&u, "userid"))
+    );
+    for k in EDITABLE {
+        let lbl = user_label(k);
+        if *k == "address" {
+            fields.push_str(&format!("<div class=\"fieldcontain\"><label for=\"{k}\">{lbl}</label><textarea name=\"{k}\" id=\"{k}\">{}</textarea></div>", esc(&s(&u, k))));
+        } else {
+            fields.push_str(&format!("<div class=\"fieldcontain\"><label for=\"{k}\">{lbl}</label><input type=\"text\" name=\"{k}\" id=\"{k}\" value=\"{}\"/></div>", esc(&s(&u, k))));
+        }
+    }
+    let roles_sec = if !roles.is_empty() {
+        let mut rrows = String::new();
+        for r in &roles {
+            rrows.push_str(&format!(
+                "<tr><td>{}</td><td><a href=\"/userRole/show/{}\">{}</a></td></tr>",
+                esc(&s(r, "module")),
+                i(r, "id").unwrap_or(0),
+                esc(&s(r, "role"))
+            ));
+        }
+        format!(
+            "<h3>My Module Roles</h3>\
+             <p>These module roles apply automatically at all times and don't require switching, so they won't show up next to your name above.</p>\
+             <table class='table'><tr><th>Module</th><th>Role</th></tr>{rrows}</table>"
+        )
+    } else {
+        String::new()
+    };
+
+    let body = format!(
+        r##"<div id="content" role="main"><div class="container">
+<section class="row"><a href="#edit-user" class="skip" tabindex="-1">Skip to content&hellip;</a>
+<div class="nav" role="navigation"><ul><li><a class="home" href="/">Home</a></li></ul></div></section>
+<section class="row"><div id="edit-user" class="col-12 content scaffold-edit" role="main">
+  <h1>My Profile</h1>
+  {flash_html}
+  <form action="/user/my_profile_save" method="post">
+    {csrf}
+    <fieldset class="form">{fields}</fieldset>
+    <fieldset class="buttons"><input class="save" type="submit" value="Update" /></fieldset>
+  </form>
+  {roles_sec}
+</div></section></div></div>"##
+    );
+    ctx.html("My Profile", body).await
+}
+
+async fn change_password(mut ctx: Ctx, uid: i64) -> Response {
+    let db = &ctx.st.db.clone();
+    if ctx.method == "POST" {
+        let full = db.get("portal_user", uid).await.ok().flatten().unwrap_or_default();
+        let cur = { let a = ctx.p("currentPassword"); if a.is_empty() { ctx.p("current") } else { a } };
+        let new = { let a = ctx.p("newPassword"); if a.is_empty() { ctx.p("password") } else { a } };
+        let conf = { let a = ctx.p("confirmPassword"); if a.is_empty() { ctx.p("password2") } else { a } };
+        let msg = if !bcrypt::verify(&cur, &s(&full, "password")).unwrap_or(false) {
+            "Current password is incorrect"
+        } else if new.len() < 8 {
+            "Password must be at least 8 characters long"
+        } else if new != conf {
+            "New passwords do not match"
+        } else {
+            let _ = db
+                .update("portal_user", uid, &row! {"password"=>bcrypt::hash(&new, 12).unwrap_or_default(),"reset_password"=>false,"last_info_update"=>now_str(),"last_updated"=>now_str()})
+                .await;
+            web::user_log(db, "password", "Password changed", Some(uid), None, &ctx.ip).await;
+            ctx.flash("Password successfully changed");
+            return ctx.redirect("/").await;
+        };
+        ctx.flash(msg);
+        return ctx.redirect("/user/change_password").await;
+    }
+    let csrf = ctx.csrf_field();
+    let flash = s(&ctx.sess, "flash");
+    let flash_html = if flash.is_empty() { String::new() } else { format!("<div class=\"alert alert-primary\" role=\"status\">{}</div>", esc(&flash)) };
+    let body = format!(
+        r##"<div id="content" role="main"><div class="container"><section class="row">
+<div id="edit-user" class="col-12 content scaffold-edit" role="main">
+  <h1>Change Password</h1>
+  {flash_html}
+  <div class="card"><div class="card-body">
+    <form action="/user/update_password" method="post" class="row g-3">
+      {csrf}
+      <div class="col-12"><label for="currentPassword" class="form-label">Current Password:</label><input type="password" name="currentPassword" id="currentPassword" class="form-control" required/></div>
+      <div class="col-12"><label for="newPassword" class="form-label">New Password:</label><input type="password" name="newPassword" id="newPassword" class="form-control" required minlength="8"/>
+        <div class="form-text">Password must be at least 8 characters long.</div></div>
+      <div class="col-12"><label for="confirmPassword" class="form-label">Confirm New Password:</label><input type="password" name="confirmPassword" id="confirmPassword" class="form-control" required/></div>
+      <div class="col-12"><button type="submit" class="btn btn-primary">Change Password</button> <a href="/" class="btn btn-secondary">Cancel</a></div>
+    </form>
+  </div></div>
+</div></section></div></div>"##
+    );
+    ctx.html("Change Password", body).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_labels_match_g6ikram() {
+        assert_eq!(user_label("userid"), "User ID");
+        assert_eq!(user_label("is_active"), "Is Active");
+        assert_eq!(user_label("directline"), "Direct Line");
+        assert_eq!(user_label("company_handphone"), "Company Handphone");
+        assert_eq!(user_label("emergency_contact"), "Emergency Contact Number");
+        assert_eq!(user_label("emergency_name"), "Emergency Contact Name");
+        assert_eq!(user_label("address"), "Home Address");
+        assert_eq!(user_label("telegram_chat_id"), "Telegramchatid");
+    }
+
+    #[test]
+    fn split_tokens_handles_commas_and_spaces() {
+        assert_eq!(split_tokens("u1, u2; u3\nu4"), vec!["u1", "u2", "u3", "u4"]);
+        assert!(split_tokens("  , ; ").is_empty());
+    }
+
+    #[test]
+    fn fmt_user_dt_normalizes_iso_and_pg() {
+        assert_eq!(fmt_user_dt("2026-11-22T06:40:36.123456Z"), "2026-11-22 06:40:36");
+        assert_eq!(fmt_user_dt("2026-11-22 06:40:36+08"), "2026-11-22 06:40:36");
+        assert_eq!(fmt_user_dt(""), "");
     }
 }

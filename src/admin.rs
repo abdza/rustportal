@@ -211,7 +211,7 @@ async fn table(ctx: &Ctx, e: &Entity, rows: &[Row], skip: Option<&str>) -> Strin
     o
 }
 
-pub async fn index(mut ctx: Ctx, e: &Entity) -> Response {
+pub async fn index(ctx: Ctx, e: &Entity) -> Response {
     if ctx.user.is_none() {
         return ctx.need_login().await;
     }
@@ -301,159 +301,6 @@ pub async fn module_url(db: &Db, name: &str) -> Option<String> {
     Some(format!("/portalModule/show/{}", i(&r, "id")?))
 }
 
-fn human_size(n: i64) -> String {
-    let mut v = n as f64;
-    for u in ["B", "KB", "MB", "GB"] {
-        if v < 1024.0 {
-            return if u == "B" { format!("{} B", n) } else { format!("{:.1} {}", v, u) };
-        }
-        v /= 1024.0;
-    }
-    format!("{:.1} TB", v)
-}
-
-fn yesno(v: bool) -> &'static str {
-    if v { "<span class=\"badge bg-success\">Yes</span>" } else { "<span class=\"badge bg-secondary\">No</span>" }
-}
-
-/// A section of the module page, laid out like the Grails portal's (heading, links, table).
-fn section(title: &str, links: &[String], heads: &[&str], rows: Vec<Vec<String>>, empty: &str) -> String {
-    let mut h = format!("<h3>{}</h3>", title);
-    h.push_str(&format!("<div class=\"nav\" role=\"navigation\"><ul>{}</ul></div>", links.iter().map(|l| format!("<li>{}</li>", l)).collect::<String>()));
-    h.push_str("<table class='table js-collapse'><tr><th>#</th>");
-    for x in heads {
-        h.push_str(&format!("<th>{}</th>", x));
-    }
-    h.push_str("</tr>");
-    for (n, r) in rows.iter().enumerate() {
-        h.push_str(&format!("<tr><td>{}</td>{}</tr>", n + 1, r.iter().map(|c| format!("<td>{}</td>", c)).collect::<String>()));
-    }
-    if rows.is_empty() {
-        h.push_str(&format!("<tr><td colspan=\"{}\">{}</td></tr>", heads.len() + 1, empty));
-    }
-    h.push_str("</table><br/>");
-    h
-}
-
-/// Everything that belongs to a module, listed on its details page, each with an
-/// "Add" link that creates the item inside this module.
-async fn module_sections(ctx: &Ctx, m: &Row, csrf: &str) -> String {
-    let name = s(m, "name");
-    let (en, db, p) = (enc(&name), ctx.db(), row! {"m"=>name.clone()});
-    let Some(u) = ctx.user.as_ref() else { return String::new() };
-    let is_dev = ctx.is_admin() || web::developer_list(db, u).await.contains(&name);
-    let is_adm = is_dev || web::admin_list(db, u).await.contains(&name);
-    let add = |c: &str, l: &str| format!("<a class='create' href='/{}/create?module={}'>Add {}</a>", c, en, l);
-    let act = |links: Vec<Option<String>>| links.into_iter().flatten().collect::<Vec<_>>().join(" &nbsp; ");
-    let mut h = String::new();
-
-    // files
-    let fs = db.first("select count(*) as n, coalesce(sum(size),0) as total, count(*) filter (where size is null) as unsized from file_link where module=:m", &p).await.ok().flatten().unwrap_or_default();
-    h.push_str("<h3>Files</h3>");
-    if is_adm {
-        h.push_str(&format!("<div class='nav' role='navigation'><ul><li><a class='list' href='/fileLink/index?module={en}'>View files for this module</a></li><li><a class='create' href='/fileLink/upload?module={en}'>Upload file</a></li><li><a class='list' href='/portalFileManager/index?module={en}'>File managers</a></li></ul></div>"));
-    }
-    h.push_str(&format!(
-        "<table class='table'><tr><th>Total size on disk</th><th>Files</th><th>Size not recorded</th></tr><tr><td><strong>{}</strong></td><td>{}</td><td>{}</td></tr></table>",
-        human_size(i(&fs, "total").unwrap_or(0)), i(&fs, "n").unwrap_or(0), i(&fs, "unsized").unwrap_or(0)
-    ));
-
-    // trackers
-    let rows = db.rows("select t.*, (select count(*) from portal_tracker_field f where f.tracker_id=t.id) as nfields, (select count(*) from portal_tracker_transition x where x.tracker_id=t.id) as ntrans from portal_tracker t where t.module=:m order by t.slug", &p).await.unwrap_or_default();
-    let mut links = vec![];
-    if is_dev {
-        links.push(add("portalTracker", "Tracker"));
-        if !rows.is_empty() {
-            links.push(format!("<form method='post' action='/portalModule/updatedball/{}' style='display:inline;margin:0'><input type='hidden' name='csrf_token' value='{}'/><button class='btn btn-link p-0 save' title='Create any missing tables and columns for every tracker in this module'>Update DB (all {} trackers)</button></form>", i(m, "id").unwrap_or(0), esc(csrf), rows.len()));
-        }
-    }
-    let trs = rows.iter().map(|t| {
-        let id = i(t, "id").unwrap_or(0);
-        vec![esc(&s(t, "name")), esc(&s(t, "slug")), esc(&s(t, "tracker_type")), s(t, "nfields"), s(t, "ntrans"), act(vec![
-            Some(format!("<a href='/{}/{}/list'>List</a>", en, enc(&s(t, "slug")))),
-            is_dev.then(|| format!("<a href='/portalTracker/show/{id}'>Details</a>")),
-            is_dev.then(|| format!("<a href='/portalTracker/edit/{id}'>Edit</a>")),
-        ])]
-    }).collect();
-    h.push_str(&section("Trackers", &links, &["Title", "Slug", "Type", "Fields", "Transitions", "Action"], trs, "No trackers in this module."));
-
-    // pages
-    let rows = db.rows(&format!("select id, title, slug, runable, published from {} where module=:m order by slug", db::page_t()), &p).await.unwrap_or_default();
-    let prs = rows.iter().map(|g| {
-        let id = i(g, "id").unwrap_or(0);
-        let run = b(g, "runable");
-        vec![esc(&s(g, "title")), esc(&s(g, "slug")), if run { "Runable" } else { "Template" }.to_string(), yesno(b(g, "published")).to_string(), act(vec![
-            Some(format!("<a href='/{}/{}/{}'>{}</a>", if run { "run" } else { "view" }, en, enc(&s(g, "slug")), if run { "Run" } else { "View" })),
-            is_dev.then(|| format!("<a href='/portalPage/edit/{id}'>Edit</a>")),
-            is_dev.then(|| format!("<a href='/portalPage/show/{id}'>Details</a>")),
-        ])]
-    }).collect();
-    h.push_str(&section("Pages", &if is_dev { vec![add("portalPage", "Page")] } else { vec![] }, &["Title", "Slug", "Kind", "Published", "Action"], prs, "No pages in this module."));
-
-    // roles
-    let rows = db.rows("select r.id, r.role, u.name, u.userid from user_role r left join portal_user u on u.id=r.user_id where r.module=:m order by r.role, u.name", &p).await.unwrap_or_default();
-    let can_switch = ctx.is_admin();
-    let rrs = rows.iter().map(|r| {
-        let id = i(r, "id").unwrap_or(0);
-        let nm = esc(&s(r, "name"));
-        vec![if can_switch { format!("<a href='/user/switchuser/{}' title='Switch to this user'>{}</a>", enc(&s(r, "userid")), nm) } else { nm }, esc(&s(r, "userid")), esc(&s(r, "role")),
-            act(vec![is_adm.then(|| format!("<a href='/userRole/edit/{id}'>Edit</a>")), is_adm.then(|| format!("<a href='/userRole/show/{id}'>Details</a>"))])]
-    }).collect();
-    h.push_str(&section("Roles", &if is_adm { vec![add("userRole", "User Role")] } else { vec![] }, &["Name", "User ID", "Role", "Action"], rrs, "Nobody has a role in this module."));
-
-    // settings
-    let rows = db.rows("select * from portal_setting where module=:m order by name", &p).await.unwrap_or_default();
-    let srs = rows.iter().map(|r| {
-        let id = i(r, "id").unwrap_or(0);
-        let v = web::setting_value(r);
-        let mut txt = match &v { Value::String(x) => x.clone(), Value::Null => String::new(), x => x.to_string() };
-        if txt.chars().count() > 160 {
-            txt = format!("{}…", txt.chars().take(160).collect::<String>());
-        }
-        vec![esc(&s(r, "name")), esc(&s(r, "type")), esc(&txt), act(vec![is_adm.then(|| format!("<a href='/portalSetting/edit/{id}'>Edit</a>"))])]
-    }).collect();
-    h.push_str(&section("Settings", &if is_adm { vec![add("portalSetting", "Setting")] } else { vec![] }, &["Name", "Type", "Value", "Action"], srs, "No settings in this module."));
-
-    // schedules
-    let rows = db.rows("select * from portal_scheduler where module=:m order by name", &p).await.unwrap_or_default();
-    let crs = rows.iter().map(|r| {
-        let id = i(r, "id").unwrap_or(0);
-        vec![esc(&s(r, "name")), esc(&s(r, "slugs")), esc(&s(r, "hour")), esc(&s(r, "day_of_week")), esc(&s(r, "day_of_month")), yesno(b(r, "enabled")).to_string(),
-            esc(&s(r, "lastrun").chars().take(16).collect::<String>()),
-            act(vec![Some(format!("<a href='/portalScheduler/show/{id}'>View</a>")), is_dev.then(|| format!("<a href='/portalScheduler/edit/{id}'>Edit</a>"))])]
-    }).collect();
-    h.push_str(&section("Schedules", &if is_dev { vec![add("portalScheduler", "Schedule")] } else { vec![] }, &["Name", "Pages", "Hour", "Day of week", "Day of month", "Enabled", "Last run", "Action"], crs, "No schedules in this module."));
-
-    // trees
-    let rows = db.rows("select t.*, (select name from portal_tree_node n where n.id=t.root_id) as root_name, (select count(*) from portal_tree_node n where n.tree_id=t.id) as nodes from portal_tree t where t.module=:m order by t.name", &p).await.unwrap_or_default();
-    let ers = rows.iter().map(|r| {
-        let id = i(r, "id").unwrap_or(0);
-        vec![esc(&s(r, "name")), esc(&s(r, "root_name")), s(r, "nodes"), esc(&s(r, "valid").chars().take(10).collect::<String>()), esc(&s(r, "expire").chars().take(10).collect::<String>()),
-            act(vec![Some(format!("<a href='/portalTree/show/{id}'>View</a>")), is_adm.then(|| format!("<a href='/portalTree/edit/{id}'>Edit</a>"))])]
-    }).collect();
-    h.push_str(&section("Trees", &if is_adm { vec![add("portalTree", "Tree")] } else { vec![] }, &["Name", "Root", "Nodes", "Valid from", "Expires", "Action"], ers, "No trees in this module."));
-
-    // endpoints
-    let rows = db.rows("select * from portal_endpoint where module=:m order by slug", &p).await.unwrap_or_default();
-    let nrs = rows.iter().map(|r| {
-        let id = i(r, "id").unwrap_or(0);
-        vec![esc(&s(r, "name")), format!("<code>/svc/{}/{}</code>", esc(&name), esc(&s(r, "slug"))), esc(&s(r, "handler_type")), esc(&s(r, "auth_mode")), yesno(b(r, "enabled")).to_string(),
-            act(vec![Some(format!("<a href='/portalEndpoint/show/{id}'>View</a>")), is_dev.then(|| format!("<a href='/portalEndpoint/edit/{id}'>Edit</a>"))])]
-    }).collect();
-    h.push_str(&section("Endpoints", &if is_dev { vec![add("portalEndpoint", "Endpoint")] } else { vec![] }, &["Name", "URL", "Type", "Auth", "Enabled", "Action"], nrs, "No endpoints in this module."));
-
-    // import history
-    if is_dev {
-        let rows = db.rows("select * from portal_module_import_log where module=:m order by id desc limit 10", &p).await.unwrap_or_default();
-        let irs = rows.iter().map(|r| {
-            vec![esc(&s(r, "date_created").chars().take(16).collect::<String>()), esc(&format!("{} ({})", s(r, "staffname"), s(r, "staffid"))), esc(&s(r, "remarks")),
-                format!("<a href='/portalModuleImportLog/show/{}'>View</a>", i(r, "id").unwrap_or(0))]
-        }).collect();
-        h.push_str(&section("Import History", &[format!("<a class='list' href='/portalModuleImportLog/index?module={en}'>View all import logs</a>")], &["Date", "By", "Remarks", "Action"], irs, "This module has not been imported here."));
-    }
-    h
-}
-
 /// The logs share one sidebar entry ("Logs", opening the error log); each log
 /// list links to the others. All of them are portal-admin only.
 const LOGS: &[(&str, &str)] = &[("portalErrorLog", "Error Log"), ("portalAuditTrail", "Audit Trail"), ("userLog", "User Log"), ("portalBackgroundTrail", "Background Jobs")];
@@ -464,13 +311,9 @@ fn li(class: &str, href: &str, label: &str) -> String {
 
 fn index_extras(e: &Entity, is_admin: bool) -> String {
     let mut o = match e.name {
-        "portalModule" => [li("list", "/portalModule/update_module_list", "Refresh module list"), li("create", "/portalModule/upload", "Import Zip"), li("list", "/portalModuleImportLog/index", "Import Logs")].concat(),
-        "fileLink" => li("create", "/fileLink/upload", "Upload file"),
         "portalErrorLog" => li("list", "/portalErrorLog/index?resolved=false", "Unresolved only"),
         "portalScheduler" if is_admin => li("list", "/portalSchedulerRun/index", "Scheduler Runs"),
         "portalSchedulerRun" => li("list", "/portalScheduler/index", "Scheduler List"),
-        "user" => li("list", "/userRole/index", "Roles"),
-        "portalTree" => [li("create", "/portalTreeNode/fixnodes", "Fix Nodes"), li("create", "/portalTree/importtreeform", "Import Tree")].concat(),
         "userRole" if is_admin => li("list", "/user/index", "User List"),
         _ => String::new(),
     };
@@ -493,46 +336,14 @@ async fn show_extras(ctx: &mut Ctx, e: &Entity, r: &Row) -> String {
     let id = i(r, "id").unwrap_or(0);
     let mut o = String::new();
     match e.name {
-        "portalTracker" => {
-            let (m, sl) = (s(r, "module"), s(r, "slug"));
-            o.push_str(&format!("<a class='btn btn-sm btn-success' href='/{}/{}/list'>Open list</a> ", m, sl));
-            o.push_str(&post_button(ctx, &format!("/portalTracker/updatedb/{}", id), "Update DB", "btn-outline-primary", None));
-            o.push_str(&post_button(ctx, &format!("/portalTracker/create_defaults/{}", id), "Create defaults", "btn-outline-primary", None));
-            o.push_str(&post_button(ctx, &format!("/portalTracker/create_default_pages/{}", id), "Create default pages", "btn-outline-primary", None));
-            o.push_str(&post_button(ctx, &format!("/portalTracker/from_table/{}", id), "Fields from table", "btn-outline-secondary", None));
-            o.push_str(&format!("<a class='btn btn-sm btn-outline-secondary' href='/portalTracker/workflow_graph/{}'>Workflow graph</a> ", id));
-            o.push_str(&format!("<a class='btn btn-sm btn-outline-secondary' href='/portalTrackerData/upload?tracker_id={}'>Upload data</a> ", id));
-            o.push_str(&format!("<a class='btn btn-sm btn-outline-secondary' href='/portalPage/index?module={}&q={}_'>Pages</a> ", enc(&m), enc(&sl)));
-            o.push_str(&post_button(ctx, &format!("/portalTracker/cleardb/{}", id), "Clear all data", "btn-outline-danger", Some("This deletes every record and its audit trail. Continue?")));
-        }
         "portalPage" => {
             let (m, sl) = (s(r, "module"), s(r, "slug"));
             o.push_str(&format!("<a class='btn btn-sm btn-success' href='/{}/{}/{}'>{}</a> ", if b(r, "runable") { "run" } else { "view" }, m, sl, if b(r, "runable") { "Run" } else { "View" }));
         }
-        "portalModule" => {
-            o.push_str(&post_button(ctx, &format!("/portalModule/export/{}", id), "Export", "btn-outline-primary", None));
-            o.push_str(&post_button(ctx, &format!("/portalModule/import/{}", id), "Import", "btn-outline-primary", Some("Import this module from the module folder? Existing definitions are overwritten.")));
-            o.push_str(&format!("<a class='btn btn-sm btn-outline-secondary' href='/portalModule/download/{}'>Download zip</a> ", id));
-            let n = enc(&s(r, "name"));
-            o.push_str(&format!("<a class='btn btn-sm btn-outline-success' href='/userRole/create?module={n}&role=Admin'>Add Admin</a> <a class='btn btn-sm btn-outline-success' href='/userRole/create?module={n}&role=Developer'>Add Developer</a> "));
-        }
-        "portalTrackerData" => {
-            o.push_str(&post_button(ctx, &format!("/portalTrackerData/process/{}", id), "Process again", "btn-outline-primary", None));
-            o.push_str(&post_button(ctx, &format!("/portalTrackerData/rollback/{}", id), "Roll back", "btn-outline-danger", Some("Remove the records this upload inserted?")));
-        }
-        "fileLink" => o.push_str(&format!("<a class='btn btn-sm btn-success' href='/fileLink/get/{}'>Download</a> ", id)),
-        "portalFileManager" => o.push_str(&format!("<a class='btn btn-sm btn-success' href='/portalFileManager/browse/{}'>Browse</a> ", id)),
-        "portalEmail" => o.push_str(&post_button(ctx, &format!("/portalEmail/resend/{}", id), "Send now", "btn-outline-primary", None)),
         "portalScheduler" => o.push_str(&post_button(ctx, &format!("/portalScheduler/run/{}", id), "Run now", "btn-outline-primary", None)),
-        "portalTree" => o.push_str(&format!("<a class=\"save\" href=\"/portalTree/exporttree/{id}\">Export</a> <a class=\"save\" href=\"/portalTree/exporttree/{id}?staff=on\">Export with Role Holders</a> <a class=\"save\" href=\"/portalTree/importtreeform\">Import</a> ")),
         "portalErrorLog" => o.push_str(&post_button(ctx, &format!("/portalErrorLog/resolve/{}", id), "Mark resolved", "btn-outline-primary", None)),
         "portalEndpoint" => o.push_str(&format!("<code>/svc/{}/{}</code> ", esc(&s(r, "module")), esc(&s(r, "slug")))),
         "portalModuleAccessReview" => o.push_str(&post_button(ctx, &format!("/portalModuleAccessReview/approve/{}", id), "Approve review", "btn-outline-success", Some("Confirm that the access list of this module is correct?"))),
-        "user" => {
-            if ctx.is_admin() {
-                o.push_str(&format!("<a class='btn btn-sm btn-outline-secondary' href='/user/switchuser/{}'>Switch to this user</a> ", enc(&s(r, "userid"))));
-            }
-        }
         _ => {}
     }
     o
@@ -584,26 +395,12 @@ pub async fn show(mut ctx: Ctx, e: &Entity, id: i64) -> Response {
             ctx.csrf_field(), n = e.name, id = id
         ));
     }
-    if e.name == "portalModule" {
-        let csrf = ctx.csrf();
-        h.push_str(&module_sections(&ctx, &r, &csrf).await);
-    }
-    if e.name == "portalTree" {
-        // as the Grails portal: the nodes are browsed from the root node's page
-        let root = match i(&r, "root_id") {
-            Some(rid) => ctx.db().get("portal_tree_node", rid).await.ok().flatten().map(|n| format!("<a href=\"/portalTreeNode/show/{}\">{}</a>", rid, esc(&s(&n, "name")))),
-            None => None,
-        }
-        .unwrap_or_else(|| format!("<a href=\"/portalTree/create_root/{}\">Create root node</a>", id));
-        h = h.replacen(&format!("<ol class=\"property-list {}\">\n", e.name), &format!("<ol class=\"property-list {}\">\n    <li class=\"fieldcontain\">\n        <span id=\"root-label\" class=\"property-label\">Root</span>\n        <div class=\"property-value\" aria-labelledby=\"root-label\">{}</div>\n    </li>\n", e.name, root), 1);
-    } else {
-        for (child, fk) in e.children {
-            let Some(ce) = ctx.st.entity(child) else { continue };
-            let rows = ctx.db().rows(&format!("select * from \"{}\" where \"{}\"={} order by {} limit 500", ce.table, fk, id, ce.order), &db::no_params()).await.unwrap_or_default();
-            h.push_str(&format!("<h3>{}s</h3><div class=\"nav\" role=\"navigation\"><ul><li><a class=\"create\" href=\"/{}/create?{}={}\">Add {}</a></li></ul></div>", ce.label, ce.name, fk, id, ce.label));
-            h.push_str(&table(&ctx, ce, &rows, Some(fk)).await);
-            h.push_str("<br/>");
-        }
+    for (child, fk) in e.children {
+        let Some(ce) = ctx.st.entity(child) else { continue };
+        let rows = ctx.db().rows(&format!("select * from \"{}\" where \"{}\"={} order by {} limit 500", ce.table, fk, id, ce.order), &db::no_params()).await.unwrap_or_default();
+        h.push_str(&format!("<h3>{}s</h3><div class=\"nav\" role=\"navigation\"><ul><li><a class=\"create\" href=\"/{}/create?{}={}\">Add {}</a></li></ul></div>", ce.label, ce.name, fk, id, ce.label));
+        h.push_str(&table(&ctx, ce, &rows, Some(fk)).await);
+        h.push_str("<br/>");
     }
     let flash = s(&ctx.sess, "flash");
     let page = frame(e, "show", &nav(e, ""), &format!("Show {}", ename(e)), &flash, &h);

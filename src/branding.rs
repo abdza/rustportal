@@ -39,15 +39,41 @@ fn expand_hex(hex: &str) -> String {
     }
 }
 
+fn rgb_channels(hex: &str) -> (u8, u8, u8) {
+    let h = expand_hex(hex);
+    let parse = |a: &str| u8::from_str_radix(a, 16).unwrap_or(0);
+    (parse(&h[1..3]), parse(&h[3..5]), parse(&h[5..7]))
+}
+
 /// Blend a hex colour 8% over white (matching BrandingService.tint).
 pub fn tint(hex: &str) -> String {
     if !valid_color(hex) {
         return "#4154f1".into();
     }
-    let h = expand_hex(hex);
-    let parse = |a: &str| u8::from_str_radix(a, 16).unwrap_or(0) as f64;
-    let wash = |c: f64| (255.0 - (255.0 - c) * 0.08).round().clamp(0.0, 255.0) as u8;
-    format!("#{:02x}{:02x}{:02x}", wash(parse(&h[1..3])), wash(parse(&h[3..5])), wash(parse(&h[5..7])))
+    let (r, g, b) = rgb_channels(hex);
+    let wash = |c: u8| (255.0 - (255.0 - c as f64) * 0.08).round().clamp(0.0, 255.0) as u8;
+    format!("#{:02x}{:02x}{:02x}", wash(r), wash(g), wash(b))
+}
+
+/// Darken a hex colour by `amount` (0.0..1.0) for button hover/active states.
+pub fn darken(hex: &str, amount: f64) -> String {
+    if !valid_color(hex) {
+        return "#3545c8".into();
+    }
+    let (r, g, b) = rgb_channels(hex);
+    let k = (1.0 - amount).clamp(0.0, 1.0);
+    let d = |c: u8| ((c as f64) * k).round().clamp(0.0, 255.0) as u8;
+    format!("#{:02x}{:02x}{:02x}", d(r), d(g), d(b))
+}
+
+/// Choose white or dark text for readable contrast on a solid button of colour `hex`.
+pub fn contrast_fg(hex: &str) -> &'static str {
+    if !valid_color(hex) {
+        return "#ffffff";
+    }
+    let (r, g, b) = rgb_channels(hex);
+    let luma = 0.299 * (r as f64) + 0.587 * (g as f64) + 0.114 * (b as f64);
+    if luma > 186.0 { "#212529" } else { "#ffffff" }
 }
 
 /// Build the :root CSS declarations for colours that differ from stock NiceAdmin defaults.
@@ -56,7 +82,23 @@ pub fn css_variables(brand: &Value) -> String {
     for (key, fallback, _, _) in COLOR_DEFAULTS {
         let val = brand[key].as_str().unwrap_or("");
         if !val.is_empty() && !val.eq_ignore_ascii_case(fallback) && valid_color(val) {
-            parts.push(format!("--brand-{}:{}", key.replace('_', "-"), val.to_ascii_lowercase()));
+            let low = val.to_ascii_lowercase();
+            parts.push(format!("--brand-{}:{}", key.replace('_', "-"), low));
+            if *key == "primary" {
+                let (r, g, b) = rgb_channels(&low);
+                parts.push(format!("--brand-primary-hover:{}", darken(&low, 0.12)));
+                parts.push(format!("--brand-primary-active:{}", darken(&low, 0.18)));
+                parts.push(format!("--brand-primary-rgb:{},{},{}", r, g, b));
+                parts.push(format!("--brand-primary-fg:{}", contrast_fg(&low)));
+                parts.push(format!("--bs-primary:{}", low));
+                parts.push(format!("--bs-primary-rgb:{},{},{}", r, g, b));
+                parts.push(format!("--bs-link-color:{}", low));
+                parts.push(format!("--bs-link-color-rgb:{},{},{}", r, g, b));
+            } else if *key == "accent" {
+                let (r, g, b) = rgb_channels(&low);
+                parts.push(format!("--bs-link-hover-color:{}", low));
+                parts.push(format!("--bs-link-hover-color-rgb:{},{},{}", r, g, b));
+            }
         }
     }
     let stock_tint = tint("#4154f1");
@@ -430,7 +472,12 @@ async fn index(mut ctx: Ctx) -> Response {
     preview.querySelector('.pv-main').style.background = pageBg;
     preview.querySelector('[data-pv="heading"]').style.color = heading;
     preview.querySelector('[data-pv="link"]').style.color = primary;
-    preview.querySelector('[data-pv="btn"]').style.background = primary;
+    var pvBtn = preview.querySelector('[data-pv="btn"]');
+    pvBtn.style.background = primary;
+    if (/^#[0-9a-fA-F]{{6}}$/.test(primary)) {{
+      var r = parseInt(primary.slice(1, 3), 16), g = parseInt(primary.slice(3, 5), 16), b = parseInt(primary.slice(5, 7), 16);
+      pvBtn.style.color = (0.299 * r + 0.587 * g + 0.114 * b > 186) ? '#212529' : '#ffffff';
+    }}
     var active = preview.querySelector('[data-pv="nav-active"]');
     active.style.background = pageBg;
     active.style.color = primary;
@@ -478,6 +525,13 @@ mod tests {
         let custom = json!({"primary":"#1b5e20","accent":"#717ff5","heading":"#012970","page_bg":"#f6f9ff","header_bg":"#ffffff","sidebar_bg":"#ffffff","primary_tint":tint("#1b5e20")});
         let css = css_variables(&custom);
         assert!(css.contains("--brand-primary:#1b5e20"));
+        assert!(css.contains("--brand-primary-hover:"));
+        assert!(css.contains("--brand-primary-active:"));
+        assert!(css.contains("--brand-primary-rgb:27,94,32"));
+        assert!(css.contains("--brand-primary-fg:#ffffff"));
+        assert!(css.contains("--bs-primary:#1b5e20"));
         assert!(css.contains("--brand-primary-tint:"));
+        assert_eq!(contrast_fg("#ffd54f"), "#212529");
+        assert_eq!(contrast_fg("#1b5e20"), "#ffffff");
     }
 }

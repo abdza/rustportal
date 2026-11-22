@@ -3,18 +3,21 @@
 
 #[macro_use]
 mod db;
+mod access_review;
 mod audit;
 mod branding;
 mod cache;
 mod admin;
 mod endpoint;
 mod entity;
+mod file_manager;
 mod files;
 mod groovy;
 mod gsp;
 mod xlsxstream;
 mod mail;
 mod module;
+mod module_web;
 mod oauth;
 mod page;
 mod scheduler;
@@ -23,12 +26,15 @@ mod sqlite_compat;
 mod tags;
 mod telegram;
 mod tracker;
+mod tracker_admin;
+mod tracker_data_web;
 mod tracker_web;
 mod tree;
 mod tree_web;
 mod upload;
 mod user;
 mod web;
+mod workflow_builder;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::response::Response;
@@ -59,10 +65,12 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
     let id = idtxt.as_deref().and_then(|x| x.parse::<i64>().ok()).or_else(|| ctx.pi("id"));
     let st = ctx.st.clone();
     match (c, action) {
-        ("user", "login" | "authenticate" | "logout" | "register" | "my_profile" | "my_profile_save" | "change_password" | "update_password" | "switchuser" | "restoreadmin" | "changerole") => {
-            return user::action(ctx, action, idtxt).await
-        }
+        ("user", "lookup") => {}
+        ("user", "api_list") => return tree_web::user_api_list(ctx).await,
+        ("user", _) => return user::action(ctx, action, idtxt).await,
         ("branding", _) => return branding::action(ctx, action).await,
+        ("accessReview", _) => return access_review::action(ctx, action, id).await,
+        ("portalModule", _) => return module_web::controller(ctx, action, id).await,
         ("googleOAuth", "initiate") => return oauth::initiate(ctx).await,
         ("googleOAuth", "callback") => return oauth::callback(ctx).await,
         ("portalPage", "home") => return page::display(ctx, "portal", "home", vec![]).await,
@@ -73,8 +81,8 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
         }
         ("portalSearch", _) => return admin::search(ctx).await,
         ("portalTreeNode", _) => return tree_web::node_action(ctx, action, id).await,
-        ("portalTree", "create_root" | "exporttree" | "importtreeform" | "importtree") => return tree_web::tree_action(ctx, action, id).await,
-        ("user", "api_list") => return tree_web::user_api_list(ctx).await,
+        ("portalTree", "lookup") => {}
+        ("portalTree", _) => return tree_web::tree_action(ctx, action, id).await,
         // Grails pages also link a transition as /portalTracker/transition?module=..&slug=..&transition=..[&id=..]
         ("portalTracker", "transition" | "transition_submit") => {
             let (m, sl, tr) = (ctx.p("module"), ctx.p("slug"), ctx.p("transition"));
@@ -97,106 +105,52 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
         ("portalTracker", "dropdownlist") => return tracker_web::dropdownlist(ctx).await,
         ("portalTracker", "api_list") => return tracker_web::api_list(ctx).await,
         ("portalTrackerField", "onchange") => return tracker_web::onchange(ctx).await,
+        ("portalTrackerField", "updateDb" | "createIndex" | "fromTable" | "multifields" | "excelTemplate" | "excelTemplateFields" | "submitExcelTemplate") => {
+            return tracker_admin::field_action(ctx, action, id).await;
+        }
+        ("portalTracker", "index") => return tracker_admin::index(ctx).await,
+        ("portalTracker", "show") => {
+            if let Some(tid) = id {
+                return tracker_admin::show(ctx, tid).await;
+            }
+            return ctx.status(axum::http::StatusCode::NOT_FOUND, "Not found").await;
+        }
         ("portalTracker", "workflow_graph") => {
             return match tracker_by_id_admin(&ctx, id).await {
-                Some(t) => tracker_web::workflow_graph(ctx, &t).await,
+                Some(t) => workflow_builder::workflow_graph(ctx, &t).await,
                 None => ctx.status(axum::http::StatusCode::FORBIDDEN, "Not allowed").await,
             }
         }
-        ("portalTracker", "updatedb" | "create_defaults" | "create_default_pages" | "from_table" | "cleardb") => {
-            let Some(t) = tracker_by_id_admin(&ctx, id).await else { return ctx.status(axum::http::StatusCode::FORBIDDEN, "Not allowed").await };
-            if ctx.method != "POST" {
-                return ctx.status(axum::http::StatusCode::METHOD_NOT_ALLOWED, "POST required").await;
-            }
-            let res: anyhow::Result<String> = async {
-                Ok(match action {
-                    "updatedb" => {
-                        t.updatedb(&st.db).await?;
-                        t.create_index(&st.db).await?;
-                        "Database tables updated".to_string()
-                    }
-                    "create_defaults" => {
-                        tracker_web::create_defaults(&st.db, &t).await?;
-                        if let Some(t2) = Tracker::by_id(&st.db, t.id).await {
-                            t2.updatedb(&st.db).await?;
-                        }
-                        "Default role, statuses and transitions created".to_string()
-                    }
-                    "create_default_pages" => format!("{} default pages created", tracker_web::create_default_pages(&st.db, &t).await?),
-                    "from_table" => format!("{} fields created from table columns", t.from_table(&st.db).await?),
-                    _ => {
-                        t.cleardb(&st.db).await?;
-                        "All data cleared".to_string()
-                    }
-                })
-            }
-            .await;
-            match res {
-                Ok(m) => ctx.flash(&m),
-                Err(e) => ctx.flash(&format!("Failed: {}", e)),
-            }
-            return ctx.redirect(&format!("/portalTracker/show/{}", t.id)).await;
+        (
+            "portalTracker",
+            "builder_add_fields"
+            | "builder_add_roles"
+            | "builder_save_field_group"
+            | "builder_save_field_order"
+            | "builder_save_tracker_lists"
+            | "builder_save_status"
+            | "builder_delete_status"
+            | "builder_save_transition"
+            | "builder_delete_transition",
+        ) => {
+            return workflow_builder::builder_action(ctx, action).await;
         }
-        ("portalTrackerData", "upload") => return upload::upload(ctx).await,
-        ("portalTrackerData", "rollback") => return upload::rollback(ctx, id.unwrap_or(0)).await,
-        ("portalTrackerData", "process") => {
-            if !ctx.is_admin() || ctx.method != "POST" {
-                return ctx.status(axum::http::StatusCode::FORBIDDEN, "Not allowed").await;
-            }
-            match upload::process(&st, id.unwrap_or(0)).await {
-                Ok(m) => ctx.flash(&m),
-                Err(e) => ctx.flash(&format!("Failed: {}", e)),
-            }
-            return ctx.redirect(&format!("/portalTrackerData/show/{}", id.unwrap_or(0))).await;
+        ("portalTracker", "updatedb" | "create_defaults" | "create_default_pages" | "from_table" | "cleardb" | "delete_fields" | "fix_status" | "export_data" | "fix_file_links" | "fix_trail_file_links" | "convert_text_columns") => {
+            return tracker_admin::tracker_tool_action(ctx, action, id).await;
         }
-        ("portalModule", "updatedball") => {
-            let Ok(Some(m)) = st.db.get("portal_module", id.unwrap_or(0)).await else { return ctx.status(axum::http::StatusCode::NOT_FOUND, "Not found").await };
-            let name = s(&m, "name");
-            let ok = match &ctx.user {
-                Some(u) => ctx.is_admin() || web::developer_list(ctx.db(), u).await.contains(&name),
-                None => false,
-            };
-            if !ok || ctx.method != "POST" {
-                return ctx.status(axum::http::StatusCode::FORBIDDEN, "Not allowed").await;
-            }
-            let (mut done, mut errs) = (0, vec![]);
-            for r in st.db.rows("select id, slug from portal_tracker where module=:m order by slug", &row! {"m"=>name.clone()}).await.unwrap_or_default() {
-                let Some(t) = Tracker::by_id(&st.db, i(&r, "id").unwrap_or(0)).await else { continue };
-                let res: anyhow::Result<()> = async {
-                    t.updatedb(&st.db).await?;
-                    t.create_index(&st.db).await
-                }
-                .await;
-                match res {
-                    Ok(_) => done += 1,
-                    Err(e) => errs.push(format!("{}: {}", s(&r, "slug"), e)),
-                }
-            }
-            ctx.flash(&if errs.is_empty() { format!("Database updated for {} tracker(s)", done) } else { format!("Database updated for {} tracker(s); failed: {}", done, errs.join("; ")) });
-            return ctx.redirect(&format!("/portalModule/show/{}", id.unwrap_or(0))).await;
-        }
-        ("portalModule", "update_module_list" | "export" | "import" | "download" | "upload") => return module::action(ctx, action, id).await,
-        ("fileLink", "get") => return files::get(ctx, id.unwrap_or(0)).await,
-        ("fileLink", "download") => {
-            // ?id=N (as Grails pages link files), else ?slug=..[&module=..]
-            if let Some(fid) = id.or_else(|| ctx.p("id").parse::<i64>().ok()) {
-                return files::get(ctx, fid).await;
-            }
-            let (m, sl) = (ctx.p("module"), ctx.p("slug"));
-            return files::download(ctx, &m, &sl).await;
-        }
-        ("fileLink", "upload") => {
-            if ctx.method == "POST" {
-                return files::upload(ctx).await;
-            }
-            if ctx.user.is_none() {
-                return ctx.need_login().await;
-            }
-            let h = format!("<div class='container'><h1>Upload file</h1><form method='post' enctype='multipart/form-data' action='/fileLink/upload'>{}<label class='form-label'>File</label><input type='file' name='file' class='form-control mb-2' required/><label class='form-label'>Module</label><input name='module' class='form-control mb-2' value='{}'/><label class='form-label'>Slug (blank = from file name)</label><input name='slug' class='form-control mb-2'/><label class='form-label'>Allowed roles (blank = everyone)</label><input name='allowedroles' class='form-control mb-3'/><button class='btn btn-primary'>Upload</button></form></div>", ctx.csrf_field(), web::esc(&{ let m = ctx.p("module"); if m.is_empty() { "portal".to_string() } else { m } }));
-            return ctx.html("Upload file", h).await;
-        }
-        ("portalFileManager", "browse") => return files::browse(ctx, id.unwrap_or(0)).await,
-        ("portalEmail", "resend") | ("portalScheduler", "run") | ("portalTree", "rebuild") | ("portalErrorLog", "resolve") | ("portalModuleAccessReview" | "accessReview", "approve") => {
+        ("portalTrackerFlow", "lookup") => {}
+        ("portalTrackerFlow", _) => return tracker_admin::flow_controller(ctx, action, id).await,
+        ("portalTrackerIndex", "lookup") => {}
+        ("portalTrackerIndex", _) => return tracker_admin::index_controller(ctx, action, id).await,
+        ("portalTrackerData", "lookup") => {}
+        ("portalTrackerData", _) => return tracker_data_web::controller(ctx, action, id).await,
+        ("fileLink", "lookup") => {}
+        ("fileLink", _) => return files::controller(ctx, action, id).await,
+        ("portalFileManager", "lookup") => {}
+        ("portalFileManager", _) => return file_manager::controller(ctx, action, id).await,
+        ("portalEmail", "lookup") => {}
+        ("portalEmail", _) => return mail::controller(ctx, action, id).await,
+        ("portalScheduler", "run") | ("portalErrorLog", "resolve") | ("portalModuleAccessReview", "approve") => {
             let ename = if c == "accessReview" { "portalModuleAccessReview" } else { c };
             let rid = id.unwrap_or(0);
             let table = st.entity(ename).map(|e| e.table).unwrap_or("");
@@ -210,17 +164,9 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
                 return ctx.status(axum::http::StatusCode::FORBIDDEN, "Not allowed").await;
             }
             match ename {
-                "portalEmail" => match mail::send_queued(&st, rid).await {
-                    Ok(()) => ctx.flash("Email sent"),
-                    Err(e) => ctx.flash(&format!("Sending failed: {}", e)),
-                },
                 "portalScheduler" => {
                     scheduler::run_scheduler(&st, &r, &ctx.user.as_ref().map(|u| s(u, "userid")).unwrap_or_default()).await;
                     ctx.flash("Scheduler run finished; see Scheduler Runs for the result");
-                }
-                "portalTree" => {
-                    let _ = tree::rebuild(&st.db, rid).await;
-                    ctx.flash("Tree rebuilt");
                 }
                 "portalErrorLog" => {
                     let _ = st.db.update("portal_error_log", rid, &row! {"resolved"=>true,"dateresolved"=>web::now_str()}).await;

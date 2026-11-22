@@ -195,6 +195,31 @@ fn norm(x: &str) -> String {
     x.to_lowercase().chars().filter(|c| c.is_ascii_alphanumeric()).collect()
 }
 
+/// Read header columns from `header_start..=header_end` (1-based) for the column-mapping wizard.
+/// Returns `(col_index, normalized_name, display_text)` for each non-empty header column.
+pub fn extract_headers(path: &str, header_start: usize, header_end: usize) -> Result<Vec<(usize, String, String)>> {
+    let rows = read_sheet(path, 0)?;
+    let hs = header_start.max(1);
+    let he = header_end.max(hs);
+    let heads: Vec<&Vec<Value>> = rows.iter().enumerate().filter(|(idx, _)| { let rn = idx + 1; rn >= hs && rn <= he }).map(|(_, r)| r).collect();
+    let width = heads.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut out = vec![];
+    for c in 0..width {
+        let parts: Vec<String> = heads.iter().filter_map(|r| r.get(c)).map(vs).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let text = parts.join(" ");
+        let mut slug = text.to_lowercase().chars().map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' }).collect::<String>();
+        while slug.contains("__") {
+            slug = slug.replace("__", "_");
+        }
+        let slug = slug.trim_matches('_').to_string();
+        out.push((c, slug, text));
+    }
+    Ok(out)
+}
+
 /// Stream the rows of the first sheet into `tx` as (1-based row number, cells).
 /// .xlsx/.xlsm files are read cell by cell (never the whole sheet in memory); other
 /// formats (.xls, .ods, .csv) are read whole and then sent.
@@ -306,21 +331,26 @@ async fn insert_batch(db: &db::Db, t: &Tracker, target: &Target, batch: &mut Vec
     (ok, bad)
 }
 
-/// Process a portal_tracker_data row: map header columns to fields (by name or
-/// label) and write each data row. The sheet is streamed and new records are
-/// inserted BATCH_ROWS at a time, so memory stays flat whatever the file size.
-/// A column mapped to `id` updates the matching record instead of inserting,
-/// unless the upload was made with "id column: ignore".
+/// Process a portal_tracker_data row: map header columns to fields (either from
+/// explicit g6ikram `datasource_{field_id}`/`custom_{field_id}`/`update_{field_id}`
+/// savedparams, or automatically by header name/label) and write each data row.
 pub async fn process(st: &web::St, data_id: i64) -> Result<String> {
     let db = &st.db;
     let d = db.get("portal_tracker_data", data_id).await?.ok_or_else(|| anyhow!("Upload not found"))?;
     let t = Tracker::by_id(db, i(&d, "tracker_id").unwrap_or(0)).await.ok_or_else(|| anyhow!("Tracker not found"))?;
+    let _ = db.update("portal_tracker_data", data_id, &row! {"upload_status"=>-1i64}).await;
     let path = match i(&d, "file_link_id") {
-        Some(f) => db.get("file_link", f).await?.map(|f| s(&f, "path")).unwrap_or_default(),
+        Some(f) => db.get("file_link", f).await?.map(|f| s(&f, "path")).unwrap_or_else(|| s(&d, "path")),
         None => s(&d, "path"),
     };
+    if path.is_empty() || !std::path::Path::new(&path).exists() {
+        return Err(anyhow!("Uploaded file not found on disk"));
+    }
     let opts: Value = serde_json::from_str(&s(&d, "savedparams")).unwrap_or(Value::Null);
+    let opts_obj = opts.as_object();
     let ignore_id = opts.get("id_column").and_then(|v| v.as_str()) == Some("ignore");
+    let has_explicit_map = opts_obj.map(|o| o.keys().any(|k| k.starts_with("datasource_"))).unwrap_or(false);
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, Vec<Value>)>(2000);
     let path2 = path.clone();
     let reader = tokio::task::spawn_blocking(move || stream_sheet(&path2, tx));
@@ -342,36 +372,76 @@ pub async fn process(st: &web::St, data_id: i64) -> Result<String> {
         }
         heads.push(line);
     }
+
     let width = heads.iter().map(|r| r.len()).max().unwrap_or(0);
-    let mut map: Vec<Option<String>> = vec![None; width];
-    let rs_is_field = t.tracker_type == "DataStore" && t.field("record_status").is_some();
-    for c in 0..width {
-        let head: Vec<String> = heads.iter().filter_map(|x| x.get(c)).map(vs).filter(|x| !x.is_empty()).collect();
-        let h = norm(&head.join(" "));
-        let last = head.last().map(|x| norm(x)).unwrap_or_default();
-        if h.is_empty() {
-            continue;
-        }
-        if h == "id" {
-            if !ignore_id {
-                map[c] = Some("id".into());
-            }
-        } else if h == "recordstatus" || h == "status" && t.field("status").is_none() {
-            map[c] = Some("record_status".into());
-        } else if let Some(f) = t.fields.iter().find(|f| norm(&s(f, "name")) == h || norm(&s(f, "label")) == h || norm(&s(f, "name")) == last || norm(&s(f, "label")) == last) {
-            map[c] = Some(s(f, "name"));
-        }
-    }
+    // For each field: either mapped from a column index or a constant custom value
+    let mut col_bindings: Vec<(usize, String)> = vec![];
+    let mut custom_vals: Vec<(String, Value)> = vec![];
+    let mut key_fields: Vec<String> = vec![];
     let mut mapped: Vec<String> = vec![];
-    for m in map.iter().flatten() {
-        if !mapped.contains(m) {
-            mapped.push(m.clone());
+    let rs_is_field = t.tracker_type == "DataStore" && t.field("record_status").is_some();
+
+    if has_explicit_map {
+        let obj = opts_obj.unwrap();
+        for f in &t.fields {
+            let fid = i(f, "id").unwrap_or(0);
+            let fname = s(f, "name");
+            let ds_key = format!("datasource_{fid}");
+            let ds_val = obj.get(&ds_key).map(vs).unwrap_or_else(|| "ignore".into());
+            if ds_val.is_empty() || ds_val == "ignore" {
+                continue;
+            }
+            if ds_val == "custom" {
+                let cv = obj.get(&format!("custom_{fid}")).map(vs).unwrap_or_default();
+                custom_vals.push((fname.clone(), json!(cv)));
+                if !mapped.contains(&fname) {
+                    mapped.push(fname.clone());
+                }
+            } else if let Ok(cidx) = ds_val.parse::<usize>() {
+                col_bindings.push((cidx, fname.clone()));
+                if !mapped.contains(&fname) {
+                    mapped.push(fname.clone());
+                }
+            }
+            let upd_val = obj.get(&format!("update_{fid}")).map(vs).unwrap_or_default();
+            if !upd_val.is_empty() && upd_val != "false" && upd_val != "0" {
+                key_fields.push(fname);
+            }
+        }
+    } else {
+        for c in 0..width {
+            let head: Vec<String> = heads.iter().filter_map(|x| x.get(c)).map(vs).filter(|x| !x.is_empty()).collect();
+            let h = norm(&head.join(" "));
+            let last = head.last().map(|x| norm(x)).unwrap_or_default();
+            if h.is_empty() {
+                continue;
+            }
+            if h == "id" {
+                if !ignore_id {
+                    col_bindings.push((c, "id".into()));
+                    if !mapped.contains(&"id".to_string()) {
+                        mapped.push("id".into());
+                    }
+                }
+            } else if h == "recordstatus" || h == "status" && t.field("status").is_none() {
+                col_bindings.push((c, "record_status".into()));
+                if !mapped.contains(&"record_status".to_string()) {
+                    mapped.push("record_status".into());
+                }
+            } else if let Some(f) = t.fields.iter().find(|f| norm(&s(f, "name")) == h || norm(&s(f, "label")) == h || norm(&s(f, "name")) == last || norm(&s(f, "label")) == last) {
+                let fname = s(f, "name");
+                col_bindings.push((c, fname.clone()));
+                if !mapped.contains(&fname) {
+                    mapped.push(fname);
+                }
+            }
         }
     }
+
     if mapped.is_empty() {
         drop(rx);
         let _ = reader.await;
-        return Err(anyhow!("None of the header columns matched a field of {}", t.name));
+        return Err(anyhow!("None of the file's column headers matched a field of {}", t.name));
     }
     let initial = t.status_name(t.initial_status());
     let add_initial = t.tracker_type != "DataStore" && !initial.is_empty();
@@ -403,6 +473,7 @@ pub async fn process(st: &web::St, data_id: i64) -> Result<String> {
     let (mut ins, mut upd, mut skip, mut failed, mut errs) = (0usize, 0usize, 0usize, 0usize, vec![]);
     let mut batch: Vec<(usize, Row)> = Vec::with_capacity(BATCH_ROWS);
     let mut seen = 0usize;
+    let dt_ident = db::ident(&t.data_table())?;
     loop {
         let next = match pending.take() {
             Some(x) => Some(x),
@@ -416,18 +487,57 @@ pub async fn process(st: &web::St, data_id: i64) -> Result<String> {
             break;
         }
         let mut rec = Row::new();
-        for (c, m) in map.iter().enumerate() {
-            if let (Some(name), Some(v)) = (m, line.get(c)) {
+        let mut has_excel_cell = false;
+        for (c, name) in &col_bindings {
+            if let Some(v) = line.get(*c) {
                 if !v.is_null() && !vs(v).is_empty() {
                     rec.insert(name.clone(), v.clone());
+                    has_excel_cell = true;
                 }
+            }
+        }
+        if !has_excel_cell && !col_bindings.is_empty() {
+            skip += 1;
+            continue;
+        }
+        for (name, v) in &custom_vals {
+            if !rec.contains_key(name) && !vs(v).is_empty() {
+                rec.insert(name.clone(), v.clone());
             }
         }
         if rec.is_empty() || !validators.iter().all(|(n, re)| re.is_match(&s(&rec, n))) {
             skip += 1;
             continue;
         }
+        // Key Update upsert (g6ikram `update_{field_id}` checkboxes)
+        if !key_fields.is_empty() && i(&rec, "id").is_none() {
+            let mut kcond = vec![];
+            let mut all_present = true;
+            for kf in &key_fields {
+                if let Some(val) = rec.get(kf) {
+                    let coerced = match t.field(kf) {
+                        Some(f) => crate::tracker::coerce(f, val),
+                        None => val.clone(),
+                    };
+                    if coerced.is_null() {
+                        all_present = false;
+                    } else {
+                        kcond.push(format!("{}={}", db::qcol(kf), db::lit(&coerced)));
+                    }
+                } else {
+                    all_present = false;
+                }
+            }
+            if all_present && !kcond.is_empty() {
+                if let Ok(Some(found)) = db.first(&format!("select id from {} where {} order by id desc limit 1", dt_ident, kcond.join(" and ")), &db::no_params()).await {
+                    if let Some(existing_id) = i(&found, "id") {
+                        rec.insert("id".into(), json!(existing_id));
+                    }
+                }
+            }
+        }
         if i(&rec, "id").is_some() {
+            rec.insert("dataupdate_id".into(), json!(data_id));
             match t.save(db, &rec).await {
                 Ok(_) => upd += 1,
                 Err(e) => {
@@ -458,11 +568,24 @@ pub async fn process(st: &web::St, data_id: i64) -> Result<String> {
     failed += bad;
     drop(rx);
     reader.await.map_err(|e| anyhow!("{}", e))??;
-    let mut msg = format!("{} inserted, {} updated, {} skipped, {} rejected. Columns used: {}.", ins, upd, skip, failed, mapped.join(", "));
-    if !errs.is_empty() {
-        msg.push_str(&format!(" Errors: {}", errs.join(" | ")));
+    let total_recv = ins + upd + skip + failed;
+    let uploaded_cnt = ins + upd;
+    let fname = std::path::Path::new(&path).file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| "Unknown".into());
+    let mut msg = format!(
+        "File: {fname}\nStatus: Completed\nRecords Received: {total_recv}\nRecords Uploaded: {uploaded_cnt}"
+    );
+    if upd > 0 {
+        msg.push_str(&format!("\nRecords Inserted: {ins}\nRecords Updated: {upd}"));
     }
-    db.update("portal_tracker_data", data_id, &row! {"uploaded"=>true,"upload_status"=>if errs.is_empty() { 1 } else { 2 },"messages"=>msg.clone()}).await?;
+    if skip > 0 {
+        msg.push_str(&format!("\nRecords Skipped (non-data rows): {skip}"));
+    }
+    msg.push_str(&format!("\nRecords Rejected: {failed}"));
+    if !errs.is_empty() {
+        msg.push_str("\n\n=== Rejected Row Details ===\n");
+        msg.push_str(&errs.join("\n"));
+    }
+    db.update("portal_tracker_data", data_id, &row! {"uploaded"=>true,"upload_status"=>if failed == 0 { 1i64 } else { 2i64 },"messages"=>msg.clone()}).await?;
     Ok(msg)
 }
 
@@ -544,4 +667,404 @@ pub async fn rollback(mut ctx: Ctx, id: i64) -> Response {
     let _ = ctx.db().update("portal_tracker_data", id, &row! {"messages"=>format!("Rolled back: {} records removed", n),"uploaded"=>false}).await;
     ctx.flash(&format!("{} records removed", n));
     ctx.redirect(&format!("/portalTrackerData/show/{}", id)).await
+}
+
+// ---------------- module data dump (g6ikram PortalTrackerDataController.moduledump) ----------------
+
+struct DumpJob {
+    done: bool,
+    file: Option<std::path::PathBuf>,
+    error: Option<String>,
+    filename: String,
+}
+
+static DUMP_JOBS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, DumpJob>>> = std::sync::OnceLock::new();
+
+fn dump_jobs() -> &'static std::sync::Mutex<std::collections::HashMap<String, DumpJob>> {
+    DUMP_JOBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn dump_waiting_page(token: &str, label: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Preparing data dump&hellip;</title>
+<style>
+body{{font-family:Arial,Helvetica,sans-serif;text-align:center;padding:60px 20px;background:#f5f5f5;color:#333;}}
+.box{{background:#fff;border-radius:8px;padding:40px;display:inline-block;box-shadow:0 2px 8px rgba(0,0,0,.1);min-width:340px;}}
+h2{{margin:0 0 6px;font-size:20px;}}
+.sub{{color:#777;font-size:13px;margin:0 0 18px;}}
+#status{{color:#666;margin:16px 0 0;}}
+.spinner{{display:inline-block;width:40px;height:40px;border:4px solid #ddd;border-top-color:#0078d4;border-radius:50%;animation:spin .8s linear infinite;margin-bottom:16px;}}
+@keyframes spin{{to{{transform:rotate(360deg);}}}}
+.error{{color:#c00;}}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="spinner" id="spinner"></div>
+  <h2>Preparing data dump</h2>
+  <p class="sub">{label}</p>
+  <p id="status">Building the file on the server. A large tracker takes a minute or two &mdash; leave this tab open.</p>
+</div>
+<script>
+var token = '{token}';
+var baseUrl = window.location.href.split('?')[0];
+var checkUrl = baseUrl + '?async_token=' + token + '&async_status=1';
+var downloadUrl = baseUrl + '?async_token=' + token;
+var waited = 0;
+function check() {{
+    fetch(checkUrl, {{credentials:'same-origin'}})
+        .then(function(r){{ return r.json(); }})
+        .then(function(data){{
+            if(data.ready){{
+                document.getElementById('spinner').style.display='none';
+                document.getElementById('status').textContent='Ready \u2014 downloading\u2026';
+                var a=document.createElement('a');
+                a.href=downloadUrl; a.download='';
+                document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                document.getElementById('status').textContent='Download started. You can close this tab.';
+            }} else if(data.error){{
+                document.getElementById('spinner').style.display='none';
+                var st=document.getElementById('status'); st.textContent=data.error; st.className='error';
+            }} else {{
+                waited += 2;
+                if(waited % 30 === 0){{
+                    document.getElementById('status').textContent='Still building\u2026 ' + waited + 's so far.';
+                }}
+                setTimeout(check, 2000);
+            }}
+        }})
+        .catch(function(){{ setTimeout(check, 2000); }});
+}}
+setTimeout(check, 2000);
+</script>
+</body>
+</html>"#,
+        token = esc(token),
+        label = esc(label)
+    )
+}
+
+async fn build_tracker_forimport_xlsx(db: &db::Db, t: &Tracker, out_path: &std::path::Path) -> Result<usize> {
+    let mut ordered: Vec<&Row> = vec![];
+    let preferred = if !s(&t.row, "excelfields").trim().is_empty() {
+        db::csv(&s(&t.row, "excelfields"))
+    } else {
+        db::csv(&s(&t.row, "listfields"))
+    };
+    for name in &preferred {
+        if let Some(f) = t.field(name) {
+            if !ordered.iter().any(|x| s(x, "name") == s(f, "name")) {
+                ordered.push(f);
+            }
+        }
+    }
+    for f in &t.fields {
+        if !ordered.iter().any(|x| s(x, "name") == s(f, "name")) {
+            ordered.push(f);
+        }
+    }
+    // forimport=1: drop FieldGroup, HasMany, and computed field_query columns
+    ordered.retain(|f| {
+        let ft = s(f, "field_type");
+        ft != "FieldGroup" && ft != "HasMany" && s(f, "field_query").trim().is_empty()
+    });
+    let mut header: Vec<String> = ordered.iter().map(|f| s(f, "name")).collect();
+    let has_status = t.tracker_type != "DataStore" && !header.iter().any(|h| h == "record_status");
+    if has_status {
+        header.push("record_status".into());
+    }
+    let dt = db::ident(&t.data_table())?;
+    let rows = db.rows(&format!("select * from {} order by id", dt), &db::no_params()).await?;
+    let mut x = crate::xlsxstream::XlsxStream::create(out_path.to_str().unwrap_or(""), &t.name, header.clone())?;
+    for r in &rows {
+        let mut cells: Vec<Value> = Vec::with_capacity(header.len());
+        for f in &ordered {
+            let name = s(f, "name");
+            let ft = s(f, "field_type");
+            let v = r.get(&name).cloned().unwrap_or(Value::Null);
+            let cell = if v.is_null() {
+                Value::Null
+            } else {
+                match ft.as_str() {
+                    "Date" => {
+                        let txt = vs(&v);
+                        match crate::script::parse_dt(&txt) {
+                            Some(d) => json!(d.format("%Y-%m-%d").to_string()),
+                            None => json!(txt),
+                        }
+                    }
+                    "DateTime" => {
+                        let txt = vs(&v);
+                        match crate::script::parse_dt(&txt) {
+                            Some(d) => json!(d.format("%Y-%m-%d %H:%M:%S").to_string()),
+                            None => json!(txt),
+                        }
+                    }
+                    "User" | "Branch" | "BelongsTo" | "File" => {
+                        // Raw stored ID as text (never decimal float like "246.0")
+                        if let Some(n) = v.as_i64() {
+                            json!(n.to_string())
+                        } else if let Some(fl) = v.as_f64() {
+                            if fl.fract() == 0.0 { json!((fl as i64).to_string()) } else { json!(fl.to_string()) }
+                        } else {
+                            json!(vs(&v))
+                        }
+                    }
+                    "Checkbox" => v,
+                    _ => {
+                        let txt = vs(&v);
+                        if matches!(txt.chars().next(), Some('=' | '+' | '-' | '@')) {
+                            json!(format!(" {}", txt))
+                        } else {
+                            v
+                        }
+                    }
+                }
+            };
+            cells.push(cell);
+        }
+        if has_status {
+            cells.push(r.get("record_status").cloned().unwrap_or(Value::Null));
+        }
+        x.write_row(&cells)?;
+    }
+    x.finish()?;
+    Ok(rows.len())
+}
+
+/// GET /portalTrackerData/moduledump/{module_id} — zip of re-importable .xlsx files for every tracker in a module.
+pub async fn moduledump(mut ctx: Ctx, module_id: i64) -> Response {
+    if ctx.user.is_none() {
+        return ctx.need_login().await;
+    }
+    // Poll or download existing async dump job
+    let tok = ctx.p("async_token");
+    if !tok.is_empty() {
+        if !ctx.p("async_status").is_empty() {
+            let state = dump_jobs().lock().unwrap().get(&tok).map(|j| (j.done, j.file.is_some(), j.error.clone()));
+            return match state {
+                Some((true, true, None)) => ctx.json(json!({"ready": true})).await,
+                Some((true, _, Some(err))) => ctx.json(json!({"ready": false, "error": err})).await,
+                Some(_) => ctx.json(json!({"ready": false})).await,
+                None => ctx.json(json!({"ready": false, "error": "Dump job expired or not found."})).await,
+            };
+        }
+        let job = dump_jobs().lock().unwrap().remove(&tok);
+        return match job {
+            Some(DumpJob { file: Some(path), filename, .. }) => {
+                let bytes = tokio::fs::read(&path).await.unwrap_or_default();
+                let _ = tokio::fs::remove_file(&path).await;
+                ctx.bytes("application/zip", Some(&filename), bytes, false).await
+            }
+            Some(DumpJob { error: Some(e), .. }) => ctx.status(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &e).await,
+            _ => ctx.status(axum::http::StatusCode::NOT_FOUND, "Dump file not found").await,
+        };
+    }
+
+    let Ok(Some(m)) = ctx.db().get("portal_module", module_id).await else {
+        return ctx.status(axum::http::StatusCode::NOT_FOUND, "Module not found").await;
+    };
+    let mname = s(&m, "name");
+    let ok = match &ctx.user {
+        Some(u) => ctx.is_admin() || web::admin_list(ctx.db(), u).await.contains(&mname) || web::developer_list(ctx.db(), u).await.contains(&mname),
+        None => false,
+    };
+    if !ok {
+        ctx.flash(&format!("Only an admin or developer of {} can dump its data.", mname));
+        return ctx.redirect(&format!("/portalModule/show/{}", module_id)).await;
+    }
+
+    let trackers = ctx
+        .db()
+        .rows("select id, slug, name from portal_tracker where module=:m order by slug", &row! {"m"=>mname.clone()})
+        .await
+        .unwrap_or_default();
+    let token = uuid::Uuid::new_v4().to_string();
+    let label = format!("{}_forimport_{}", mname, chrono::Local::now().format("%Y%m%d_%H%M"));
+    let filename = format!("{}.zip", label);
+    let count = trackers.len();
+    dump_jobs().lock().unwrap().insert(
+        token.clone(),
+        DumpJob { done: false, file: None, error: None, filename: filename.clone() },
+    );
+
+    let st = ctx.st.clone();
+    let uid = ctx.uid();
+    let userid = ctx.user.as_ref().map(|u| s(u, "userid")).unwrap_or_default();
+    let mname2 = mname.clone();
+    let tok2 = token.clone();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let start = now_str();
+        let dir = std::path::PathBuf::from(&st.cfg.upload_dir).join("tmp");
+        let _ = std::fs::create_dir_all(&dir);
+        let zip_path = dir.join(format!("moduledump_{}.zip", tok2));
+        let res: Result<()> = async {
+            let mut report = vec![
+                format!("Data dump (for re-import) of module {}", mname2),
+                format!("Built {} for {}", now_str(), userid),
+                String::new(),
+            ];
+            let mut failed = 0usize;
+            let zf = std::fs::File::create(&zip_path)?;
+            let mut zw = zip::ZipWriter::new(zf);
+            let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            for tr in &trackers {
+                let tid = i(tr, "id").unwrap_or(0);
+                let tslug = s(tr, "slug");
+                let tname = s(tr, "name");
+                let tmp_xlsx = dir.join(format!("dump_{}_{}.xlsx", tok2, tid));
+                let entry_name = format!("{}_forimport.xlsx", tslug);
+                match Tracker::by_id(&st.db, tid).await {
+                    Some(tk) => match build_tracker_forimport_xlsx(&st.db, &tk, &tmp_xlsx).await {
+                        Ok(nrows) => {
+                            let data = std::fs::read(&tmp_xlsx)?;
+                            use std::io::Write;
+                            zw.start_file(&entry_name, opts)?;
+                            zw.write_all(&data)?;
+                            report.push(format!("OK      {}  ({} - {} rows)", entry_name, tname, nrows));
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            report.push(format!("FAILED  {}  ({}): {}", tslug, tname, e));
+                            web::log_error(&st.db, "portalTrackerData", "moduledump", &e.to_string(), Some(&mname2), Some(&tslug), uid).await;
+                        }
+                    },
+                    None => {
+                        failed += 1;
+                        report.push(format!("FAILED  {}  ({}): tracker not found", tslug, tname));
+                    }
+                }
+                let _ = std::fs::remove_file(&tmp_xlsx);
+            }
+            report.push(String::new());
+            report.push(format!(
+                "{} of {} tracker(s) dumped{}.",
+                trackers.len().saturating_sub(failed),
+                trackers.len(),
+                if failed > 0 { format!(", {} failed", failed) } else { String::new() }
+            ));
+            use std::io::Write;
+            zw.start_file("dump_report.txt", opts)?;
+            zw.write_all(report.join("\r\n").as_bytes())?;
+            zw.finish()?;
+            Ok(())
+        }
+        .await;
+
+        let _ = st
+            .db
+            .insert(
+                "portal_background_trail",
+                &row! {
+                    "name"=>"portalTrackerData.moduledump",
+                    "details"=>format!("module {} ({} trackers)", mname2, count),
+                    "user_id"=>uid,
+                    "start_date"=>start,
+                    "duration_ms"=>started.elapsed().as_millis() as i64,
+                    "success"=>res.is_ok(),
+                    "error"=>res.as_ref().err().map(|e| e.to_string().chars().take(1000).collect::<String>())
+                },
+            )
+            .await;
+
+        let mut map = dump_jobs().lock().unwrap();
+        if let Some(j) = map.get_mut(&tok2) {
+            j.done = true;
+            match res {
+                Ok(()) => j.file = Some(zip_path),
+                Err(e) => j.error = Some(format!("Dump failed: {}", e)),
+            }
+        }
+    });
+
+    ctx.text("text/html; charset=utf-8", dump_waiting_page(&token, &format!("{} - all {} tracker(s)", mname, count))).await
+}
+
+/// GET /portalTrackerData/datadump/{tracker_id}[?forimport=1] — async single-tracker .xlsx dump.
+pub async fn datadump(ctx: Ctx, tracker_id: i64) -> Response {
+    if ctx.user.is_none() {
+        return ctx.need_login().await;
+    }
+    let tok = ctx.p("async_token");
+    if !tok.is_empty() {
+        if !ctx.p("async_status").is_empty() {
+            let state = dump_jobs().lock().unwrap().get(&tok).map(|j| (j.done, j.file.is_some(), j.error.clone()));
+            return match state {
+                Some((true, true, None)) => ctx.json(json!({"ready": true})).await,
+                Some((true, _, Some(err))) => ctx.json(json!({"ready": false, "error": err})).await,
+                Some(_) => ctx.json(json!({"ready": false})).await,
+                None => ctx.json(json!({"ready": false, "error": "Job not found or expired"})).await,
+            };
+        }
+        let job = dump_jobs().lock().unwrap().remove(&tok);
+        return match job {
+            Some(DumpJob { file: Some(path), filename, .. }) => {
+                let bytes = tokio::fs::read(&path).await.unwrap_or_default();
+                let _ = tokio::fs::remove_file(&path).await;
+                ctx.bytes("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", Some(&filename), bytes, false).await
+            }
+            Some(DumpJob { error: Some(e), .. }) => ctx.status(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &e).await,
+            _ => ctx.status(axum::http::StatusCode::NOT_FOUND, "Dump not ready or expired").await,
+        };
+    }
+
+    let Some(t) = Tracker::by_id(ctx.db(), tracker_id).await else {
+        return ctx.status(axum::http::StatusCode::NOT_FOUND, "Tracker not found").await;
+    };
+    if !ctx.can_admin(&t.module).await {
+        return ctx.status(axum::http::StatusCode::FORBIDDEN, "Not allowed").await;
+    }
+
+    let forimport = ctx.p("forimport") == "1";
+    let label = format!("{}{}", t.slug, if forimport { "_forimport" } else { "" });
+    let filename = format!("{label}.xlsx");
+    let token = uuid::Uuid::new_v4().to_string();
+    dump_jobs().lock().unwrap().insert(
+        token.clone(),
+        DumpJob { done: false, file: None, error: None, filename },
+    );
+
+    let st = ctx.st.clone();
+    let uid = ctx.uid();
+    let tok2 = token.clone();
+    let tname = t.name.clone();
+    let label2 = label.clone();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let start = now_str();
+        let dir = std::path::PathBuf::from(&st.cfg.upload_dir).join("tmp");
+        let _ = std::fs::create_dir_all(&dir);
+        let out_path = dir.join(format!("datadump_{}.xlsx", tok2));
+        let res = build_tracker_forimport_xlsx(&st.db, &t, &out_path).await;
+        let _ = st
+            .db
+            .insert(
+                "portal_background_trail",
+                &row! {
+                    "name"=>"portalTrackerData.datadump",
+                    "details"=>format!("tracker {} {}", tracker_id, label2),
+                    "user_id"=>uid,
+                    "start_date"=>start,
+                    "duration_ms"=>started.elapsed().as_millis() as i64,
+                    "success"=>res.is_ok(),
+                    "error"=>res.as_ref().err().map(|e| e.to_string().chars().take(1000).collect::<String>())
+                },
+            )
+            .await;
+        let mut map = dump_jobs().lock().unwrap();
+        if let Some(j) = map.get_mut(&tok2) {
+            j.done = true;
+            match res {
+                Ok(_) => j.file = Some(out_path),
+                Err(e) => j.error = Some(format!("Dump failed: {}", e)),
+            }
+        }
+    });
+
+    ctx.text("text/html; charset=utf-8", dump_waiting_page(&token, &tname)).await
 }

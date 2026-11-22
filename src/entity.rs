@@ -205,15 +205,15 @@ pub fn entities() -> Vec<Entity> {
                 ("data_row", Int), ("data_end", Int), ("send_email", Bool)])
             .h(&[("path", Str), ("date_created", Date), ("uploaded", Bool), ("sent_email_date", Date), ("messages", Text), ("savedparams", Text),
                 ("upload_status", Int), ("uploader_id", Ref("user")), ("excel_password", Str), ("is_tracker_deleting", Bool)])
-            .list(&["tracker_id", "date_created", "uploader_id", "upload_status", "messages"]),
+            .list(&["tracker_id", "module", "upload_status", "path", "header_start", "header_end", "data_row"]),
         Entity::new("portalModule", "portal_module", "Module", "name", Module("name"))
             .f(&[("name", Str), ("title", Str), ("description", Text), ("benefit", Text),
-                ("status", Choice(&["", "Development", "UAT", "Production", "Retired"])), ("department", Str), ("category", Str)])
+                ("status", Choice(&["", "Active", "Inactive", "Retired"])), ("department", Str), ("category", Str)])
             .list(&["name", "title", "status", "category"])
             .children(&[("portalModuleContact", "module_id"), ("portalModuleAccessReview", "module_id")])
             .order("id"),
         Entity::new("portalModuleContact", "portal_module_contact", "Module Contact", "role", Via("module_id", "portalModule"))
-            .f(&[("module_id", Ref("portalModule")), ("user_id", Ref("user")), ("role", Choice(&["Owner", "Deputy", "Developer", "Support"]))])
+            .f(&[("module_id", Ref("portalModule")), ("user_id", Ref("user")), ("role", Choice(&["Owner", "Maintainer"]))])
             .h(&[("date_created", Date), ("last_updated", Date)])
             .list(&["module_id", "user_id", "role"]),
         Entity::new("portalModuleAccessReview", "portal_module_access_review", "Access Review", "period", Via("module_id", "portalModule"))
@@ -232,16 +232,19 @@ pub fn entities() -> Vec<Entity> {
             .list(&["date_created", "module", "staffid", "staffname", "remarks"])
             .readonly(),
         Entity::new("fileLink", "file_link", "File", "name", Module("module"))
-            .f(&[("name", Str), ("slug", Str), ("module", Str), ("path", Str), ("allowedroles", Str), ("filegroup", Str), ("sortnum", Int)])
+            .f(&[("name", Str), ("module", Str), ("slug", Str), ("allowedroles", Str), ("filegroup", Str), ("sortnum", Int), ("path", Str)])
             .h(&[("tracker_slug", Str), ("tracker_data_id", Int), ("size", Int), ("last_updated", Date), ("last_access", Date)])
-            .list(&["module", "slug", "name", "size", "last_access"]),
+            .list(&["name", "module", "slug", "size", "filegroup", "sortnum", "allowedroles", "path"])
+            .order("sortnum asc, id asc"),
         Entity::new("portalFileManager", "portal_file_manager", "File Manager", "name", Module("module"))
             .f(&[("name", Str), ("module", Str), ("path", Str)])
-            .list(&["module", "name", "path"]),
+            .list(&["name", "module", "path"])
+            .order("id asc"),
         Entity::new("portalEmail", "portal_email", "Email", "title", Module("module"))
-            .f(&[("title", Str), ("module", Str), ("emailto", Text), ("emailcc", Text), ("body", Code), ("delivery_time", Date)])
-            .h(&[("time_sent", Date), ("email_sent", Bool), ("error", Text)])
-            .list(&["module", "title", "emailto", "delivery_time", "email_sent", "time_sent"]),
+            .f(&[("title", Str), ("module", Str), ("emailto", Text), ("emailcc", Text), ("body", Code), ("delivery_time", Date), ("email_sent", Bool), ("time_sent", Date)])
+            .h(&[("error", Text)])
+            .list(&["title", "module", "emailto", "emailcc", "body", "delivery_time", "email_sent", "time_sent"])
+            .order("delivery_time desc, id desc"),
         Entity::new("portalScheduler", "portal_scheduler", "Scheduler", "name", Module("module"))
             .f(&[("module", Str), ("name", Str), ("slugs", Text), ("hour", Str), ("day_of_week", Str), ("day_of_month", Str), ("enabled", Bool), ("catch_up", Bool)])
             .h(&[("lastrun", Date), ("last_updated", Date)])
@@ -276,7 +279,7 @@ pub fn entities() -> Vec<Entity> {
         Entity::new("portalTree", "portal_tree", "Tree", "name", Module("module"))
             .f(&[("module", Str), ("name", Str), ("valid", Date), ("expire", Date)])
             .h(&[("root_id", Ref("portalTreeNode"))])
-            .list(&["module", "name"])
+            .list(&["module", "name", "root_id", "expire", "valid"])
             .order("module,name"),
         Entity::new("portalTreeNode", "portal_tree_node", "Tree Node", "name", Via("tree_id", "portalTree"))
             .f(&[("tree_id", Ref("portalTree")), ("parent_id", Ref("portalTreeNode")), ("name", Str), ("slug", Str), ("domain", Str),

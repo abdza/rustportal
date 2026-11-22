@@ -11,11 +11,107 @@ use anyhow::{anyhow, Result};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde_json::{json, Value};
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-fn folder(st: &St, module: &str) -> PathBuf {
+pub fn folder(st: &St, module: &str) -> PathBuf {
     PathBuf::from(&st.cfg.module_dir).join(module)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExportOpts {
+    pub files: bool,
+    pub roles: bool,
+    pub trees: bool,
+    pub menus: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImportOpts {
+    pub files: bool,
+    pub roles: bool,
+    pub trees: bool,
+    pub menus: bool,
+    pub endpoints: bool,
+    pub setting_choices: HashMap<String, String>,
+    pub scheduler_choices: HashMap<String, String>,
+}
+
+impl Default for ImportOpts {
+    fn default() -> Self {
+        ImportOpts {
+            files: true,
+            roles: false,
+            trees: true,
+            menus: true,
+            endpoints: true,
+            setting_choices: HashMap::new(),
+            scheduler_choices: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingPreview {
+    pub key: String,
+    pub module: String,
+    pub name: String,
+    pub status: &'static str, // "changed" | "new" | "same"
+    pub current: String,
+    pub incoming: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SchedulerPreview {
+    pub key: String,
+    pub module: String,
+    pub name: String,
+    pub status: &'static str, // "changed" | "new" | "same"
+    pub current: String,
+    pub incoming: String,
+    pub lastrun: String,
+}
+
+pub fn setting_key(module: &str, name: &str) -> String {
+    format!("{}::{}", module, name)
+}
+
+pub fn scheduler_key(module: &str, name: &str) -> String {
+    format!("{}::{}", module, name)
+}
+
+fn setting_canon(typ: &str, text: &str, number: &str, date_val: &str, datum_type: &str) -> String {
+    format!("{}\x01{}\x01{}\x01{}\x01{}", typ, text, number, date_val, datum_type)
+}
+
+fn setting_display(typ: &str, text: &str, number: &str, date_val: &str) -> String {
+    match typ {
+        "Number" => number.to_string(),
+        "Date" => date_val.to_string(),
+        _ => text.to_string(),
+    }
+}
+
+fn sched_hour(r: &Row) -> String {
+    let h = s(r, "hour");
+    if h.trim().is_empty() { s(r, "hour_of_day") } else { h }
+}
+
+fn sched_canon(slugs: &str, hour: &str, dow: &str, dom: &str, enabled: bool, catch_up: bool) -> String {
+    format!("{}\x01{}\x01{}\x01{}\x01{}\x01{}", slugs, hour, dow, dom, if enabled { "1" } else { "0" }, if catch_up { "1" } else { "0" })
+}
+
+fn sched_display(slugs: &str, hour: &str, dow: &str, dom: &str, enabled: bool, catch_up: bool) -> String {
+    format!(
+        "{} | hour {}, day of week {}, day of month {} | {}{}",
+        slugs,
+        hour,
+        dow,
+        dom,
+        if enabled { "enabled" } else { "disabled" },
+        if catch_up { ", catches up missed runs" } else { "" }
+    )
 }
 
 fn pick(r: &Row, keys: &[&str]) -> Row {
@@ -69,8 +165,158 @@ async fn page_slug(db: &Db, id: Option<i64>) -> Value {
 }
 
 pub async fn export(st: &St, module: &str, with_roles: bool) -> Result<PathBuf> {
-    let db = &st.db;
     let dir = folder(st, module);
+    export_to(st, module, &dir, ExportOpts { files: false, roles: with_roles, trees: true, menus: false }).await?;
+    Ok(dir)
+}
+
+fn node_data_get(data: &str, key: &str) -> Option<String> {
+    for pair in data.split(';') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(key) {
+                let val = v.trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn owns_menu_node(node: &Row, module: &str) -> bool {
+    node_data_get(&s(node, "data"), "module").as_deref() == Some(module)
+}
+
+fn menu_stamp(module: &str, icon: Option<&str>, existing: &str) -> String {
+    let kept: Vec<String> = existing
+        .split(';')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            let kl = k.trim().to_ascii_lowercase();
+            if kl == "module" || kl == "icon" {
+                None
+            } else {
+                Some(format!("{}={}", k.trim(), v.trim()))
+            }
+        })
+        .collect();
+    let mut parts = vec![format!("module={}", module)];
+    if let Some(ic) = icon.filter(|x| !x.trim().is_empty()) {
+        parts.push(format!("icon={}", ic.trim()));
+    }
+    parts.extend(kept);
+    parts.join(";")
+}
+
+async fn export_filelinks(db: &Db, module: &str, dir: &Path) -> Result<()> {
+    let filelinks = db
+        .rows("select * from file_link where module=:m order by slug, name, id", &row! {"m"=>module})
+        .await?;
+    let path = dir.join("filelinklist.json");
+    if filelinks.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+    let files_dir = dir.join("files");
+    std::fs::create_dir_all(&files_dir)?;
+    let mut arr = vec![];
+    for fl in &filelinks {
+        let src = PathBuf::from(s(fl, "path"));
+        if !src.is_file() {
+            continue;
+        }
+        let fid = i(fl, "id").unwrap_or(0);
+        let name = s(fl, "name");
+        let dst_name = format!("fl_{}_{}", fid, name.replace(' ', "_"));
+        let dst = files_dir.join(&dst_name);
+        let _ = std::fs::copy(&src, &dst);
+        arr.push(json!({
+            "id": fid,
+            "module": s(fl, "module"),
+            "slug": s(fl, "slug"),
+            "name": name,
+            "path": s(fl, "path"),
+            "exportpath": dst.to_string_lossy().to_string(),
+            "allowedroles": fl.get("allowedroles").cloned().unwrap_or(Value::Null),
+            "filegroup": fl.get("filegroup").cloned().unwrap_or(Value::Null),
+            "sortnum": fl.get("sortnum").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    write_json(&path, &Value::Array(arr))
+}
+
+async fn export_menu(db: &Db, module: &str, dir: &Path) -> Result<()> {
+    let path = dir.join("menulist.json");
+    let tree_name = format!("{}_menu", module);
+    let Some(tree) = db
+        .first("select id, root_id from portal_tree where module='portal' and name=:n limit 1", &row! {"n"=>tree_name})
+        .await?
+    else {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    };
+    let Some(root_id) = i(&tree, "root_id") else {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    };
+    let Some(root) = db.get("portal_tree_node", root_id).await? else {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    };
+    let top_nodes = db
+        .rows("select * from portal_tree_node where parent_id=:p order by lft, id", &row! {"p"=>root_id})
+        .await?;
+    let mut items = vec![];
+    for node in &top_nodes {
+        if !owns_menu_node(node, module) {
+            continue;
+        }
+        let nid = i(node, "id").unwrap_or(0);
+        let children = db
+            .rows("select * from portal_tree_node where parent_id=:p order by lft, id", &row! {"p"=>nid})
+            .await?;
+        if !children.is_empty() {
+            for ch in &children {
+                if !owns_menu_node(ch, module) {
+                    continue;
+                }
+                items.push(json!({
+                    "name": s(ch, "name"),
+                    "link": ch.get("slug").cloned().unwrap_or(Value::Null),
+                    "icon": node_data_get(&s(ch, "data"), "icon"),
+                    "group": s(node, "name"),
+                    "mainrole": ch.get("mainrole").cloned().unwrap_or(Value::Null),
+                    "hiderole": ch.get("hiderole").cloned().unwrap_or(Value::Null),
+                }));
+            }
+        } else {
+            items.push(json!({
+                "name": s(node, "name"),
+                "link": node.get("slug").cloned().unwrap_or(Value::Null),
+                "icon": node_data_get(&s(node, "data"), "icon"),
+                "group": Value::Null,
+                "mainrole": node.get("mainrole").cloned().unwrap_or(Value::Null),
+                "hiderole": node.get("hiderole").cloned().unwrap_or(Value::Null),
+            }));
+        }
+    }
+    if items.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+    write_json(
+        &path,
+        &json!({
+            "label": s(&root, "name"),
+            "icon": node_data_get(&s(&root, "data"), "icon"),
+            "items": items
+        }),
+    )
+}
+
+pub async fn export_to(st: &St, module: &str, dir: &Path, opts: ExportOpts) -> Result<()> {
+    let db = &st.db;
     std::fs::create_dir_all(dir.join("pages"))?;
     // pages
     let pages = db.rows(&format!("select * from {} where module=:m order by slug", db::page_t()), &row! {"m"=>module}).await?;
@@ -94,7 +340,11 @@ pub async fn export(st: &St, module: &str, with_roles: bool) -> Result<PathBuf> 
         }
         plist.push(Value::Object(o));
     }
-    write_json(&dir.join("pagelist.json"), &Value::Array(plist))?;
+    if !plist.is_empty() {
+        write_json(&dir.join("pagelist.json"), &Value::Array(plist))?;
+    } else {
+        let _ = std::fs::remove_file(dir.join("pagelist.json"));
+    }
     // trackers
     let trows = db.rows("select * from portal_tracker where module=:m order by slug", &row! {"m"=>module}).await?;
     let mut tlist = vec![];
@@ -149,25 +399,86 @@ pub async fn export(st: &St, module: &str, with_roles: bool) -> Result<PathBuf> 
         o.insert("indexes".into(), Value::Array(idx.into_iter().map(Value::Object).collect()));
         tlist.push(Value::Object(o));
     }
-    write_json(&dir.join("trackerlist.json"), &Value::Array(tlist))?;
+    if !tlist.is_empty() {
+        write_json(&dir.join("trackerlist.json"), &Value::Array(tlist))?;
+    } else {
+        let _ = std::fs::remove_file(dir.join("trackerlist.json"));
+    }
     let settings = db.rows("select * from portal_setting where module=:m order by name", &row! {"m"=>module}).await?;
-    write_json(&dir.join("settinglist.json"), &Value::Array(settings.iter().map(|x| Value::Object(pick(x, SETTING_KEYS))).collect()))?;
+    if !settings.is_empty() {
+        write_json(&dir.join("settinglist.json"), &Value::Array(settings.iter().map(|x| Value::Object(pick(x, SETTING_KEYS))).collect()))?;
+    } else {
+        let _ = std::fs::remove_file(dir.join("settinglist.json"));
+    }
     let scheds = db.rows("select * from portal_scheduler where module=:m order by name", &row! {"m"=>module}).await?;
-    write_json(&dir.join("schedulerlist.json"), &Value::Array(scheds.iter().map(|x| Value::Object(pick(x, SCHED_KEYS))).collect()))?;
+    if !scheds.is_empty() {
+        let sarr: Vec<Value> = scheds
+            .iter()
+            .map(|x| {
+                let mut o = pick(x, SCHED_KEYS);
+                let hr = sched_hour(x);
+                o.insert("hour".into(), json!(hr));
+                o.insert("hour_of_day".into(), json!(hr));
+                Value::Object(o)
+            })
+            .collect();
+        write_json(&dir.join("schedulerlist.json"), &Value::Array(sarr))?;
+    } else {
+        let _ = std::fs::remove_file(dir.join("schedulerlist.json"));
+    }
     let eps = db.rows("select * from portal_endpoint where module=:m order by slug", &row! {"m"=>module}).await?;
-    write_json(&dir.join("endpointlist.json"), &Value::Array(eps.iter().map(|x| Value::Object(pick(x, ENDPOINT_KEYS))).collect()))?;
-    let trees = db.rows("select * from portal_tree where module=:m order by name", &row! {"m"=>module}).await?;
-    let mut tl = vec![];
-    for t in trees {
-        // the Grails portal's nested format, so the zip imports there too
-        tl.push(crate::tree::export_tree(db, i(&t, "id").unwrap_or(0), with_roles).await?);
+    if !eps.is_empty() {
+        let earr: Vec<Value> = eps
+            .iter()
+            .map(|x| {
+                let mut o = pick(x, ENDPOINT_KEYS);
+                o.insert("had_auth_token".into(), json!(!s(x, "auth_token").is_empty()));
+                Value::Object(o)
+            })
+            .collect();
+        write_json(&dir.join("endpointlist.json"), &Value::Array(earr))?;
+    } else {
+        let _ = std::fs::remove_file(dir.join("endpointlist.json"));
     }
-    write_json(&dir.join("treelist.json"), &Value::Array(tl))?;
-    if with_roles {
-        let roles = db.rows("select u.userid as staffid, u.userid, r.role from user_role r join portal_user u on u.id=r.user_id where r.module=:m order by u.userid, r.role", &row! {"m"=>module}).await?;
-        write_json(&dir.join("userroles.json"), &Value::Array(roles.into_iter().map(Value::Object).collect()))?;
+    if opts.trees {
+        let trees = db.rows("select * from portal_tree where module=:m order by name", &row! {"m"=>module}).await?;
+        if !trees.is_empty() {
+            let mut tl = vec![];
+            for t in trees {
+                tl.push(crate::tree::export_tree(db, i(&t, "id").unwrap_or(0), opts.roles).await?);
+            }
+            write_json(&dir.join("treelist.json"), &Value::Array(tl))?;
+        } else {
+            let _ = std::fs::remove_file(dir.join("treelist.json"));
+        }
+    } else {
+        let _ = std::fs::remove_file(dir.join("treelist.json"));
     }
-    Ok(dir)
+    if opts.files {
+        export_filelinks(db, module, dir).await?;
+    } else {
+        let _ = std::fs::remove_file(dir.join("filelinklist.json"));
+    }
+    if opts.menus {
+        export_menu(db, module, dir).await?;
+    } else {
+        let _ = std::fs::remove_file(dir.join("menulist.json"));
+    }
+    if opts.roles {
+        let roles = db
+            .rows("select u.userid as user, u.userid as staffid, u.userid, r.module, r.role from user_role r join portal_user u on u.id=r.user_id where r.module=:m order by u.userid, r.role", &row! {"m"=>module})
+            .await?;
+        if !roles.is_empty() {
+            write_json(&dir.join("userrolelist.json"), &Value::Array(roles.into_iter().map(Value::Object).collect()))?;
+        } else {
+            let _ = std::fs::remove_file(dir.join("userrolelist.json"));
+        }
+        let _ = std::fs::remove_file(dir.join("userroles.json"));
+    } else {
+        let _ = std::fs::remove_file(dir.join("userrolelist.json"));
+        let _ = std::fs::remove_file(dir.join("userroles.json"));
+    }
+    Ok(())
 }
 
 /// Page source and whether it is a Grails (`.gsp`: GSP template or Groovy script) file.
@@ -216,6 +527,205 @@ pub async fn import(st: &St, module: &str, with_roles: bool) -> Result<(String, 
 /// sources) are accepted too: template pages are translated to MiniJinja,
 /// Groovy scripts are kept as comments for porting. Returns (summary, details).
 pub async fn import_from(st: &St, module: &str, dir: &Path, with_roles: bool) -> Result<(String, String)> {
+    let opts = ImportOpts {
+        files: true,
+        roles: with_roles,
+        trees: true,
+        menus: true,
+        endpoints: true,
+        setting_choices: HashMap::new(),
+        scheduler_choices: HashMap::new(),
+    };
+    import_from_opts(st, module, dir, &opts).await
+}
+
+async fn ensure_menu_tree(db: &Db, name: &str, label: &str, module: &str, icon: Option<&str>) -> Result<(i64, i64)> {
+    let tid = match db.first("select id, root_id from portal_tree where module='portal' and name=:n limit 1", &row! {"n"=>name}).await? {
+        Some(t) => {
+            let tid = i(&t, "id").unwrap_or(0);
+            if let Some(rid) = i(&t, "root_id") {
+                return Ok((tid, rid));
+            }
+            tid
+        }
+        None => db.insert("portal_tree", &row! {"module"=>"portal","name"=>name}).await?,
+    };
+    let root_id = match db
+        .first("select id from portal_tree_node where tree_id=:t and parent_id is null order by lft, id limit 1", &row! {"t"=>tid})
+        .await?
+    {
+        Some(r) => i(&r, "id").unwrap_or(0),
+        None => {
+            let data = if name == "main_menu" { String::new() } else { menu_stamp(module, icon, "") };
+            db.insert("portal_tree_node", &row! {"tree_id"=>tid,"name"=>label,"data"=>data,"lft"=>1,"rgt"=>2,"disabled"=>false}).await?
+        }
+    };
+    let _ = db.update("portal_tree", tid, &row! {"root_id"=>root_id}).await;
+    Ok((tid, root_id))
+}
+
+#[derive(Clone)]
+struct MenuNodeSpec {
+    name: String,
+    slug: Option<String>,
+    icon: Option<String>,
+    mainrole: Option<String>,
+    hiderole: Option<String>,
+    nodes: Vec<MenuNodeSpec>,
+}
+
+fn delete_menu_node<'a>(db: &'a Db, node_id: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        for ch in db.rows("select id from portal_tree_node where parent_id=:p", &row! {"p"=>node_id}).await.unwrap_or_default() {
+            if let Some(cid) = i(&ch, "id") {
+                delete_menu_node(db, cid).await;
+            }
+        }
+        let _ = db.delete("portal_tree_node", node_id).await;
+    })
+}
+
+fn sync_menu_nodes<'a>(
+    db: &'a Db,
+    tree_id: i64,
+    parent_id: i64,
+    wanted: &'a [MenuNodeSpec],
+    module: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        let siblings = db.rows("select * from portal_tree_node where parent_id=:p order by lft, id", &row! {"p"=>parent_id}).await.unwrap_or_default();
+        let mut spare: Vec<Row> = siblings.iter().filter(|n| owns_menu_node(n, module)).cloned().collect();
+        let may_reorder = siblings.len() == spare.len();
+        for (pos, w) in wanted.iter().enumerate() {
+            let key = w.slug.as_deref().filter(|x| !x.is_empty()).unwrap_or(&w.name);
+            let matched = spare.iter().position(|n| {
+                let nk = { let sl = s(n, "slug"); if sl.is_empty() { s(n, "name") } else { sl } };
+                nk == key
+            });
+            let (nid, existing_data) = if let Some(idx) = matched {
+                let row = spare.remove(idx);
+                (Some(i(&row, "id").unwrap_or(0)), s(&row, "data"))
+            } else {
+                (None, String::new())
+            };
+            let stamp = menu_stamp(module, w.icon.as_deref(), &existing_data);
+            let mut rec = row! {
+                "tree_id"=>tree_id,
+                "parent_id"=>parent_id,
+                "name"=>w.name.clone(),
+                "slug"=>w.slug.clone(),
+                "data"=>stamp,
+                "mainrole"=>w.mainrole.clone(),
+                "hiderole"=>w.hiderole.clone(),
+                "disabled"=>false
+            };
+            if may_reorder {
+                rec.insert("lft".into(), json!(pos as i64));
+            }
+            let saved_id = match nid {
+                Some(id) => {
+                    let _ = db.update("portal_tree_node", id, &rec).await;
+                    id
+                }
+                None => db.insert("portal_tree_node", &rec).await.unwrap_or(0),
+            };
+            if saved_id > 0 {
+                sync_menu_nodes(db, tree_id, saved_id, &w.nodes, module).await;
+            }
+        }
+        for stale in spare {
+            if let Some(sid) = i(&stale, "id") {
+                delete_menu_node(db, sid).await;
+            }
+        }
+    })
+}
+
+async fn import_menu(db: &Db, module: &str, dir: &Path) -> Result<()> {
+    let path = dir.join("menulist.json");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&path)?;
+    let val: Value = serde_json::from_str(&text)?;
+    let label = val.get("label").and_then(|v| v.as_str()).filter(|x| !x.is_empty()).unwrap_or(module).to_string();
+    let icon = val.get("icon").and_then(|v| v.as_str()).filter(|x| !x.is_empty()).map(String::from);
+    let items = val.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+    let mut ungrouped = vec![];
+    let mut group_order: Vec<String> = vec![];
+    let mut group_map: HashMap<String, Vec<MenuNodeSpec>> = HashMap::new();
+    for it in &items {
+        let spec = MenuNodeSpec {
+            name: it.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            slug: it.get("link").and_then(|v| v.as_str()).filter(|x| !x.is_empty()).map(String::from),
+            icon: it.get("icon").and_then(|v| v.as_str()).filter(|x| !x.is_empty()).map(String::from),
+            mainrole: it.get("mainrole").and_then(|v| v.as_str()).filter(|x| !x.is_empty()).map(String::from),
+            hiderole: it.get("hiderole").and_then(|v| v.as_str()).filter(|x| !x.is_empty()).map(String::from),
+            nodes: vec![],
+        };
+        if let Some(g) = it.get("group").and_then(|v| v.as_str()).filter(|x| !x.is_empty()) {
+            if !group_map.contains_key(g) {
+                group_order.push(g.to_string());
+            }
+            group_map.entry(g.to_string()).or_default().push(spec);
+        } else {
+            ungrouped.push(spec);
+        }
+    }
+    let groups: Vec<MenuNodeSpec> = group_order
+        .into_iter()
+        .map(|g| MenuNodeSpec {
+            name: g.clone(),
+            slug: None,
+            icon: None,
+            mainrole: None,
+            hiderole: None,
+            nodes: group_map.remove(&g).unwrap_or_default(),
+        })
+        .collect();
+
+    // portal/main_menu
+    if let Ok((main_tid, main_root)) = ensure_menu_tree(db, "main_menu", "Main Menu", module, icon.as_deref()).await {
+        let mut mgroups = vec![];
+        if !ungrouped.is_empty() {
+            mgroups.push(MenuNodeSpec {
+                name: label.clone(),
+                slug: None,
+                icon: None,
+                mainrole: None,
+                hiderole: None,
+                nodes: ungrouped.clone(),
+            });
+        }
+        mgroups.extend(groups.clone());
+        let wanted = if mgroups.is_empty() {
+            vec![]
+        } else {
+            vec![MenuNodeSpec {
+                name: label.clone(),
+                slug: None,
+                icon: icon.clone(),
+                mainrole: None,
+                hiderole: None,
+                nodes: mgroups,
+            }]
+        };
+        sync_menu_nodes(db, main_tid, main_root, &wanted, module).await;
+        let _ = crate::tree::rebuild(db, main_tid).await;
+    }
+
+    // portal/<module>_menu
+    if let Ok((side_tid, side_root)) = ensure_menu_tree(db, &format!("{}_menu", module), &label, module, icon.as_deref()).await {
+        let mut side_wanted = ungrouped;
+        side_wanted.extend(groups);
+        sync_menu_nodes(db, side_tid, side_root, &side_wanted, module).await;
+        let _ = crate::tree::rebuild(db, side_tid).await;
+    }
+    Ok(())
+}
+
+pub async fn import_from_opts(st: &St, module: &str, dir: &Path, opts: &ImportOpts) -> Result<(String, String)> {
     let db = &st.db;
     let dir = dir.to_path_buf();
     let mut detail: Vec<String> = vec![];
@@ -430,84 +940,123 @@ pub async fn import_from(st: &St, module: &str, dir: &Path, with_roles: bool) ->
         }
         log.push(format!("{} trackers", trackers.len()));
     }
-    // settings and schedulers: only add what is missing, never overwrite local values
+    // settings and schedulers: respect per-row choices from import preview
     if let Some(list) = read_json(&dir.join("settinglist.json")) {
         let mut added = 0;
+        let mut updated = 0;
         for x in &list {
             let name = s(x, "name");
-            if db.count("select count(*) from portal_setting where module=:m and name=:n", &row! {"m"=>module,"n"=>name}).await? == 0 {
+            let smod = { let m = s(x, "module"); if m.is_empty() { module.to_string() } else { m } };
+            let key = setting_key(&smod, &name);
+            let existing = db.first("select id from portal_setting where module=:m and name=:n", &row! {"m"=>smod.clone(),"n"=>name.clone()}).await?;
+            if let Some(ex) = existing {
+                if opts.setting_choices.get(&key).map(|v| v.as_str()) == Some("import") {
+                    let mut d = vals(x, SETTING_KEYS);
+                    d.insert("module".into(), json!(smod));
+                    if let Some(eid) = i(&ex, "id") {
+                        db.update("portal_setting", eid, &d).await?;
+                        updated += 1;
+                    }
+                }
+            } else {
                 let mut d = vals(x, SETTING_KEYS);
-                d.insert("module".into(), json!(module));
+                d.insert("module".into(), json!(smod));
                 db.insert("portal_setting", &d).await?;
                 added += 1;
             }
         }
-        log.push(format!("{} new settings", added));
+        if updated > 0 {
+            log.push(format!("{} new / {} updated settings", added, updated));
+        } else {
+            log.push(format!("{} new settings", added));
+        }
     }
     if let Some(list) = read_json(&dir.join("schedulerlist.json")) {
         for x in &list {
-            if db.count("select count(*) from portal_scheduler where module=:m and name=:n", &row! {"m"=>module,"n"=>s(x, "name")}).await? == 0 {
-                let mut d = vals(x, SCHED_KEYS);
-                d.insert("module".into(), json!(module));
+            let sname = s(x, "name");
+            let smod = { let m = s(x, "module"); if m.is_empty() { module.to_string() } else { m } };
+            let key = scheduler_key(&smod, &sname);
+            let existing = db.first("select id from portal_scheduler where module=:m and name=:n", &row! {"m"=>smod.clone(),"n"=>sname.clone()}).await?;
+            let mut d = vals(x, SCHED_KEYS);
+            d.insert("module".into(), json!(smod));
+            let hr = sched_hour(x);
+            if !hr.is_empty() {
+                d.insert("hour".into(), json!(hr));
+            }
+            if let Some(ex) = existing {
+                if opts.scheduler_choices.get(&key).map(|v| v.as_str()) == Some("import") {
+                    if let Some(eid) = i(&ex, "id") {
+                        db.update("portal_scheduler", eid, &d).await?;
+                    }
+                }
+            } else {
                 db.insert("portal_scheduler", &d).await?;
             }
         }
     }
-    if let Some(list) = read_json(&dir.join("endpointlist.json")) {
-        for x in &list {
-            let mut d = vals(x, ENDPOINT_KEYS);
-            d.insert("module".into(), json!(module));
-            d.insert("last_updated".into(), json!(now_str()));
-            upsert(db, "portal_endpoint", "module=:m and slug=:s", &row! {"m"=>module,"s"=>s(x, "slug")}, &d).await?;
-        }
-    }
-    if let Some(list) = read_json(&dir.join("treelist.json")) {
-        // nested (Grails portal / this portal now) or flat (this portal's older exports);
-        // merged into existing trees the way the Grails portal does - nothing is deleted
-        let mut stats = crate::tree::ImportStats::default();
-        for x in &list {
-            if let Err(e) = crate::tree::import_tree(db, x, Some(module), with_roles, &mut stats).await {
-                detail.push(format!("tree {}: {}", s(x, "name"), e));
+    if opts.endpoints {
+        if let Some(list) = read_json(&dir.join("endpointlist.json")) {
+            for x in &list {
+                let mut d = vals(x, ENDPOINT_KEYS);
+                d.insert("module".into(), json!(module));
+                d.insert("last_updated".into(), json!(now_str()));
+                upsert(db, "portal_endpoint", "module=:m and slug=:s", &row! {"m"=>module,"s"=>s(x, "slug")}, &d).await?;
             }
         }
-        for u in &stats.users_skipped {
-            detail.push(format!("tree role holder skipped, no such staff here: {}", u));
-        }
-        log.push(format!("{} trees ({})", list.len(), stats.summary()));
     }
-    // File links exported by the Grails portal: the file is in files/fl_{id}_{name}.
-    // It is always copied under upload_dir/{module}/ - the path stored in the zip
-    // belongs to the other server (often a Windows drive) and is not trusted.
-    if let Some(list) = read_json(&dir.join("filelinklist.json")) {
-        let (mut done, mut missing) = (0, 0);
-        let target_dir = PathBuf::from(&st.cfg.upload_dir).join(module).join("filelinks");
-        for x in &list {
-            let slug = s(x, "slug");
-            let name = s(x, "name");
-            if slug.is_empty() {
-                continue;
+    if opts.trees {
+        if let Some(list) = read_json(&dir.join("treelist.json")) {
+            let mut stats = crate::tree::ImportStats::default();
+            for x in &list {
+                if let Err(e) = crate::tree::import_tree(db, x, Some(module), opts.roles, &mut stats).await {
+                    detail.push(format!("tree {}: {}", s(x, "name"), e));
+                }
             }
-            let src = dir.join("files").join(format!("fl_{}_{}", s(x, "id"), name.replace(' ', "_")));
-            let mut d = vals(x, &["name", "slug", "allowedroles", "filegroup", "sortnum"]);
-            d.insert("module".into(), json!(module));
-            d.insert("last_updated".into(), json!(now_str()));
-            if src.is_file() {
-                std::fs::create_dir_all(&target_dir)?;
-                let fname = crate::files::sanitize_filename(&format!("{}_{}", slug, name));
-                let target = target_dir.join(if fname.is_empty() { slug.clone() } else { fname });
-                std::fs::copy(&src, &target)?;
-                d.insert("path".into(), json!(target.to_string_lossy().to_string()));
-                d.insert("size".into(), json!(std::fs::metadata(&target).map(|m| m.len() as i64).unwrap_or(0)));
-                done += 1;
-            } else {
-                missing += 1;
-                detail.push(format!("file link {}: {} is not in the zip - the link is created without a file", slug, src.strip_prefix(&dir).unwrap_or(&src).display()));
+            for u in &stats.users_skipped {
+                detail.push(format!("tree role holder skipped, no such staff here: {}", u));
             }
-            upsert(db, "file_link", "module=:m and slug=:s", &row! {"m"=>module,"s"=>slug}, &d).await?;
+            log.push(format!("{} trees ({})", list.len(), stats.summary()));
         }
-        log.push(if missing > 0 { format!("{} file links ({} without their file)", done + missing, missing) } else { format!("{} file links", done) });
     }
-    if with_roles {
+    if opts.menus && dir.join("menulist.json").is_file() {
+        if let Err(e) = import_menu(db, module, &dir).await {
+            detail.push(format!("menu: {}", e));
+        } else {
+            log.push("menu".into());
+        }
+    }
+    if opts.files {
+        if let Some(list) = read_json(&dir.join("filelinklist.json")) {
+            let (mut done, mut missing) = (0, 0);
+            let target_dir = PathBuf::from(&st.cfg.upload_dir).join(module).join("filelinks");
+            for x in &list {
+                let slug = s(x, "slug");
+                let name = s(x, "name");
+                if slug.is_empty() {
+                    continue;
+                }
+                let src = dir.join("files").join(format!("fl_{}_{}", s(x, "id"), name.replace(' ', "_")));
+                let mut d = vals(x, &["name", "slug", "allowedroles", "filegroup", "sortnum"]);
+                d.insert("module".into(), json!(module));
+                d.insert("last_updated".into(), json!(now_str()));
+                if src.is_file() {
+                    std::fs::create_dir_all(&target_dir)?;
+                    let fname = crate::files::sanitize_filename(&format!("{}_{}", slug, name));
+                    let target = target_dir.join(if fname.is_empty() { slug.clone() } else { fname });
+                    std::fs::copy(&src, &target)?;
+                    d.insert("path".into(), json!(target.to_string_lossy().to_string()));
+                    d.insert("size".into(), json!(std::fs::metadata(&target).map(|m| m.len() as i64).unwrap_or(0)));
+                    done += 1;
+                } else {
+                    missing += 1;
+                    detail.push(format!("file link {}: {} is not in the zip - the link is created without a file", slug, src.strip_prefix(&dir).unwrap_or(&src).display()));
+                }
+                upsert(db, "file_link", "module=:m and slug=:s", &row! {"m"=>module,"s"=>slug}, &d).await?;
+            }
+            log.push(if missing > 0 { format!("{} file links ({} without their file)", done + missing, missing) } else { format!("{} file links", done) });
+        }
+    }
+    if opts.roles {
         if let Some(list) = read_json(&dir.join("userroles.json")).or_else(|| read_json(&dir.join("userrolelist.json"))) {
             for x in &list {
                 let staffid = ["userid", "staffid", "user"].iter().map(|k| s(x, k)).find(|v| !v.is_empty()).unwrap_or_default();
@@ -530,7 +1079,241 @@ pub async fn import_from(st: &St, module: &str, dir: &Path, with_roles: bool) ->
     Ok((msg, detail.join("\n")))
 }
 
-fn zip_dir(dir: &Path) -> Result<Vec<u8>> {
+pub async fn preview_settings(db: &Db, module: &str, dir: &Path) -> Vec<SettingPreview> {
+    let Some(list) = read_json(&dir.join("settinglist.json")) else { return vec![] };
+    let mut out = vec![];
+    for x in &list {
+        let sname = s(x, "name");
+        let smod = { let m = s(x, "module"); if m.is_empty() { module.to_string() } else { m } };
+        let itype = s(x, "type");
+        let itext = s(x, "text");
+        let inum = s(x, "number");
+        let idate = s(x, "date_value");
+        let idatum = s(x, "datum_type");
+        let inc_canon = setting_canon(&itype, &itext, &inum, &idate, &idatum);
+        let cur = db
+            .first("select * from portal_setting where module=:m and name=:n limit 1", &row! {"m"=>smod.clone(),"n"=>sname.clone()})
+            .await
+            .ok()
+            .flatten();
+        let (status, cur_disp) = match cur {
+            None => ("new", String::new()),
+            Some(c) => {
+                let ct = s(&c, "type");
+                let ctx = s(&c, "text");
+                let cn = s(&c, "number");
+                let cd = s(&c, "date_value").replace(' ', "T").chars().take(19).collect::<String>();
+                let cdt = s(&c, "datum_type");
+                let cur_canon = setting_canon(&ct, &ctx, &cn, &cd, &cdt);
+                let st = if cur_canon == inc_canon { "same" } else { "changed" };
+                (st, setting_display(&ct, &ctx, &cn, &cd))
+            }
+        };
+        out.push(SettingPreview {
+            key: setting_key(&smod, &sname),
+            module: smod,
+            name: sname,
+            status,
+            current: cur_disp,
+            incoming: setting_display(&itype, &itext, &inum, &idate),
+        });
+    }
+    let rank = |st: &str| match st { "changed" => 0, "new" => 1, _ => 2 };
+    out.sort_by(|a, b| rank(a.status).cmp(&rank(b.status)).then(a.name.cmp(&b.name)));
+    out
+}
+
+pub async fn preview_schedulers(db: &Db, module: &str, dir: &Path) -> Vec<SchedulerPreview> {
+    let Some(list) = read_json(&dir.join("schedulerlist.json")) else { return vec![] };
+    let mut out = vec![];
+    for x in &list {
+        let sname = s(x, "name");
+        let smod = { let m = s(x, "module"); if m.is_empty() { module.to_string() } else { m } };
+        let islugs = s(x, "slugs");
+        let ihour = sched_hour(x);
+        let idow = s(x, "day_of_week");
+        let idom = s(x, "day_of_month");
+        let ien = b(x, "enabled");
+        let icu = b(x, "catch_up");
+        let inc_canon = sched_canon(&islugs, &ihour, &idow, &idom, ien, icu);
+        let cur = db
+            .first("select * from portal_scheduler where module=:m and name=:n limit 1", &row! {"m"=>smod.clone(),"n"=>sname.clone()})
+            .await
+            .ok()
+            .flatten();
+        let (status, cur_disp, lastrun) = match cur {
+            None => ("new", String::new(), String::new()),
+            Some(c) => {
+                let cs = s(&c, "slugs");
+                let ch = sched_hour(&c);
+                let cdw = s(&c, "day_of_week");
+                let cdm = s(&c, "day_of_month");
+                let cen = b(&c, "enabled");
+                let ccu = b(&c, "catch_up");
+                let cur_canon = sched_canon(&cs, &ch, &cdw, &cdm, cen, ccu);
+                let st = if cur_canon == inc_canon { "same" } else { "changed" };
+                (st, sched_display(&cs, &ch, &cdw, &cdm, cen, ccu), s(&c, "lastrun").chars().take(16).collect())
+            }
+        };
+        out.push(SchedulerPreview {
+            key: scheduler_key(&smod, &sname),
+            module: smod,
+            name: sname,
+            status,
+            current: cur_disp,
+            incoming: sched_display(&islugs, &ihour, &idow, &idom, ien, icu),
+            lastrun,
+        });
+    }
+    let rank = |st: &str| match st { "changed" => 0, "new" => 1, _ => 2 };
+    out.sort_by(|a, b| rank(a.status).cmp(&rank(b.status)).then(a.name.cmp(&b.name)));
+    out
+}
+
+fn walk_rel_files(root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(rel) = p.strip_prefix(root) {
+                out.insert(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    out
+}
+
+fn unified_diff_lines(a: &[&str], b: &[&str]) -> String {
+    // Simple LCS diff for moderate files; falls back to full hunk for very large files
+    let (n, m) = (a.len(), b.len());
+    if n * m > 2_000_000 {
+        let mut out = format!("@@ -1,{} +1,{} @@\n", n, m);
+        for l in a.iter().take(200) {
+            out.push('-');
+            out.push_str(l);
+            out.push('\n');
+        }
+        if n > 200 {
+            out.push_str(&format!("-... ({} more lines)\n", n - 200));
+        }
+        for l in b.iter().take(200) {
+            out.push('+');
+            out.push_str(l);
+            out.push('\n');
+        }
+        if m > 200 {
+            out.push_str(&format!("+... ({} more lines)\n", m - 200));
+        }
+        return out;
+    }
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] { dp[i + 1][j + 1] + 1 } else { dp[i + 1][j].max(dp[i][j + 1]) };
+        }
+    }
+    let mut ops: Vec<(char, &str)> = vec![];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            ops.push((' ', a[i]));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            ops.push(('-', a[i]));
+            i += 1;
+        } else {
+            ops.push(('+', b[j]));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push(('-', a[i]));
+        i += 1;
+    }
+    while j < m {
+        ops.push(('+', b[j]));
+        j += 1;
+    }
+    // Emit hunks with 3 lines of context
+    let ctx = 3usize;
+    let mut keep = vec![false; ops.len()];
+    for (idx, (tag, _)) in ops.iter().enumerate() {
+        if *tag != ' ' {
+            let lo = idx.saturating_sub(ctx);
+            let hi = (idx + ctx + 1).min(ops.len());
+            for k in lo..hi {
+                keep[k] = true;
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut k = 0;
+    let (mut la, mut lb) = (1usize, 1usize);
+    while k < ops.len() {
+        if !keep[k] {
+            match ops[k].0 {
+                ' ' => { la += 1; lb += 1; }
+                '-' => la += 1,
+                '+' => lb += 1,
+                _ => {}
+            }
+            k += 1;
+            continue;
+        }
+        let start_a = la;
+        let start_b = lb;
+        let mut hunk = String::new();
+        let (mut ca, mut cb) = (0usize, 0usize);
+        while k < ops.len() && keep[k] {
+            let (tag, line) = ops[k];
+            hunk.push(tag);
+            hunk.push_str(line);
+            hunk.push('\n');
+            match tag {
+                ' ' => { la += 1; lb += 1; ca += 1; cb += 1; }
+                '-' => { la += 1; ca += 1; }
+                '+' => { lb += 1; cb += 1; }
+                _ => {}
+            }
+            k += 1;
+        }
+        out.push_str(&format!("@@ -{},{} +{},{} @@\n{}", start_a, ca, start_b, cb, hunk));
+    }
+    out
+}
+
+pub fn diff_module_folders(old_dir: &Path, new_dir: &Path) -> String {
+    let mut all = walk_rel_files(old_dir);
+    all.extend(walk_rel_files(new_dir));
+    let mut out = String::new();
+    for rel in all {
+        let pa = old_dir.join(&rel);
+        let pb = new_dir.join(&rel);
+        let ba = std::fs::read(&pa).ok();
+        let bb = std::fs::read(&pb).ok();
+        if ba == bb {
+            continue;
+        }
+        let sa = ba.as_deref().map(|b| std::str::from_utf8(b).ok()).flatten();
+        let sb = bb.as_deref().map(|b| std::str::from_utf8(b).ok()).flatten();
+        if (ba.is_some() && sa.is_none()) || (bb.is_some() && sb.is_none()) {
+            out.push_str(&format!("Binary file {} differs\n", rel));
+            continue;
+        }
+        let la: Vec<&str> = sa.map(|t| t.lines().collect()).unwrap_or_default();
+        let lb: Vec<&str> = sb.map(|t| t.lines().collect()).unwrap_or_default();
+        out.push_str(&format!("--- current/{}\n+++ incoming/{}\n", rel, rel));
+        out.push_str(&unified_diff_lines(&la, &lb));
+    }
+    out
+}
+
+pub fn zip_dir(dir: &Path) -> Result<Vec<u8>> {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut zw = zip::ZipWriter::new(&mut buf);
@@ -574,7 +1357,7 @@ fn module_from_filename(filename: &str) -> String {
 ///   top of the zip, the module named after the zip file.
 /// The module folder is replaced as a whole, so page sources from an earlier
 /// export (which would win over the uploaded `.gsp` ones) do not linger.
-fn unzip_module(module_dir: &Path, filename: &str, bytes: &[u8]) -> Result<(String, bool)> {
+pub fn unzip_module(module_dir: &Path, filename: &str, bytes: &[u8]) -> Result<(String, bool)> {
     let mut za = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
     let defs = ["pagelist.json", "trackerlist.json", "settinglist.json", "treelist.json", "schedulerlist.json", "endpointlist.json", "filelinklist.json"];
     // (path parts, index) of every file worth keeping
@@ -814,6 +1597,29 @@ mod tests {
         let bad = make_zip(&[("readme.txt", "x"), ("a/b.txt", "y")]);
         assert!(unzip_module(&base, "x.zip", &bad).is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn menu_stamp_preserves_foreign_keys() {
+        assert_eq!(menu_stamp("ahli", Some("bi-people"), "adminonly=true;icon=old;module=other"), "module=ahli;icon=bi-people;adminonly=true");
+        assert_eq!(menu_stamp("ahli", None, ""), "module=ahli");
+    }
+
+    #[test]
+    fn diff_folders_detects_changes() {
+        let a = tmpdir("diff_a");
+        let b = tmpdir("diff_b");
+        std::fs::create_dir_all(a.join("pages")).unwrap();
+        std::fs::create_dir_all(b.join("pages")).unwrap();
+        std::fs::write(a.join("pages/content_home.html"), "<h1>Old</h1>\n<p>same</p>\n").unwrap();
+        std::fs::write(b.join("pages/content_home.html"), "<h1>New</h1>\n<p>same</p>\n").unwrap();
+        let d = diff_module_folders(&a, &b);
+        assert!(d.contains("--- current/pages/content_home.html"));
+        assert!(d.contains("+++ incoming/pages/content_home.html"));
+        assert!(d.contains("-<h1>Old</h1>"));
+        assert!(d.contains("+<h1>New</h1>"));
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]
