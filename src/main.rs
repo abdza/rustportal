@@ -4,6 +4,7 @@
 #[macro_use]
 mod db;
 mod access_review;
+mod ad;
 mod audit;
 mod branding;
 mod cache;
@@ -18,6 +19,7 @@ mod xlsxstream;
 mod mail;
 mod module;
 mod module_web;
+mod mssql_compat;
 mod oauth;
 mod page;
 mod scheduler;
@@ -479,15 +481,37 @@ async fn copy_pages(db: &db::Db, modules: &[String]) -> anyhow::Result<()> {
     let filter = if modules.is_empty() { String::new() } else { format!(" and module in {}", db::lit(&serde_json::json!(modules))) };
     if refresh {
         let sets: Vec<String> = pcols.split(", ").filter(|c| *c != "\"id\"").map(|c| format!("{c} = p.{c}")).collect();
-        let r = db.exec(&format!(
-            "update {pt} x set {s} from portal_page p where p.id = x.id and coalesce(x.content,'') not like '{{# rp-ported%' and coalesce(x.content,'') not like '// rp-ported%'{f}",
-            s = sets.join(", "), f = filter.replace(" module ", " p.module ")
-        ), &db::no_params()).await?;
-        let rd = db.exec(&format!("delete from {dt} d where d.page_id in (select x.id from {pt} x join portal_page p on p.id=x.id where coalesce(x.content,'') not like '{{# rp-ported%' and coalesce(x.content,'') not like '// rp-ported%'{f})", f = filter.replace(" module ", " p.module ")), &db::no_params()).await?;
+        let upd_sql = if db.is_mssql() {
+            format!(
+                "update x set {s} from {pt} x join portal_page p on p.id = x.id where coalesce(x.content,'') not like '{{# rp-ported%' and coalesce(x.content,'') not like '// rp-ported%'{f}",
+                s = sets.join(", "),
+                f = filter.replace(" module ", " p.module ")
+            )
+        } else {
+            format!(
+                "update {pt} x set {s} from portal_page p where p.id = x.id and coalesce(x.content,'') not like '{{# rp-ported%' and coalesce(x.content,'') not like '// rp-ported%'{f}",
+                s = sets.join(", "),
+                f = filter.replace(" module ", " p.module ")
+            )
+        };
+        let r = db.exec(&upd_sql, &db::no_params()).await?;
+        let del_sql = if db.is_mssql() {
+            format!("delete d from {dt} d where d.page_id in (select x.id from {pt} x join portal_page p on p.id=x.id where coalesce(x.content,'') not like '{{# rp-ported%' and coalesce(x.content,'') not like '// rp-ported%'{f})", f = filter.replace(" module ", " p.module "))
+        } else {
+            format!("delete from {dt} d where d.page_id in (select x.id from {pt} x join portal_page p on p.id=x.id where coalesce(x.content,'') not like '{{# rp-ported%' and coalesce(x.content,'') not like '// rp-ported%'{f})", f = filter.replace(" module ", " p.module "))
+        };
+        let rd = db.exec(&del_sql, &db::no_params()).await?;
         println!("refreshed {} page(s) from the other portal ({} data source(s) to copy again)", r, rd);
     }
-    let n = db.exec(&format!("insert into {pt} ({c}) select {c} from portal_page p where not exists (select 1 from {pt} x where x.id=p.id){f}", c = pcols, f = filter), &db::no_params()).await?;
-    let d = db.exec(&format!("insert into {dt} ({c}) select {c} from portal_page_data d where d.page_id in (select id from {pt}) and not exists (select 1 from {dt} x where x.id=d.id)", c = dcols), &db::no_params()).await?;
+    let (n, d) = if db.is_mssql() {
+        let n = db.exec(&format!("set identity_insert {pt} on; insert into {pt} ({c}) select {c} from portal_page p where not exists (select 1 from {pt} x where x.id=p.id){f}; set identity_insert {pt} off", c = pcols, f = filter), &db::no_params()).await?;
+        let d = db.exec(&format!("set identity_insert {dt} on; insert into {dt} ({c}) select {c} from portal_page_data d where d.page_id in (select id from {pt}) and not exists (select 1 from {dt} x where x.id=d.id); set identity_insert {dt} off", c = dcols), &db::no_params()).await?;
+        (n, d)
+    } else {
+        let n = db.exec(&format!("insert into {pt} ({c}) select {c} from portal_page p where not exists (select 1 from {pt} x where x.id=p.id){f}", c = pcols, f = filter), &db::no_params()).await?;
+        let d = db.exec(&format!("insert into {dt} ({c}) select {c} from portal_page_data d where d.page_id in (select id from {pt}) and not exists (select 1 from {dt} x where x.id=d.id)", c = dcols), &db::no_params()).await?;
+        (n, d)
+    };
     println!("copied {} page(s) and {} data source(s) into {} / {}", n, d, pt, dt);
     Ok(())
 }

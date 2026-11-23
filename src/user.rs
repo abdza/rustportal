@@ -87,18 +87,48 @@ pub async fn setup(mut ctx: Ctx) -> Response {
 pub async fn login(mut ctx: Ctx) -> Response {
     if ctx.method == "POST" {
         let sid = ["username", "userid", "staffid"].iter().map(|k| ctx.p(k)).find(|v| !v.is_empty()).unwrap_or_default();
-        let user = web::find_user_by_staffid(ctx.db(), sid.trim()).await;
-        let ok = match &user {
-            Some(u) => b(u, "is_active") && !s(u, "password").is_empty() && bcrypt::verify(ctx.p("password"), &s(u, "password")).unwrap_or(false),
-            None => {
-                // spend comparable time whether or not the account exists
+        let sid_trim = sid.trim().to_string();
+        let pw = ctx.p("password");
+        let user = web::find_user_for_login(ctx.db(), &sid_trim).await;
+        let outcome = match &user {
+            Some(u) if b(u, "is_active") => crate::ad::check_credentials(&ctx.st, u, &pw, "login").await,
+            _ => {
+                // spend comparable time whether or not the account exists or is inactive
                 let _ = bcrypt::verify("x", "$2b$12$C6UzMDM.H6dfI/f/IKcEeO7ZPp0vT8d8mB9pP1b6oQe5Yq3q9i0mW");
-                false
+                crate::ad::AuthOutcome {
+                    authenticated: false,
+                    via_ad: false,
+                    enforce_lanid_active: false,
+                }
             }
         };
-        if !ok {
-            web::user_log(ctx.db(), "login", &format!("Failed login for {}", sid.chars().take(40).collect::<String>()), None, user.as_ref().and_then(|u| i(u, "id")), &ctx.ip).await;
-            ctx.flash("Invalid username or password");
+        if !outcome.authenticated {
+            web::user_log(ctx.db(), "login", &format!("Failed login for {}", sid_trim.chars().take(40).collect::<String>()), None, user.as_ref().and_then(|u| i(u, "id")), &ctx.ip).await;
+            let tries = if s(&ctx.sess, "previd") == sid_trim {
+                i(&ctx.sess, "logintry").unwrap_or(0) + 1
+            } else {
+                1
+            };
+            ctx.sess.insert("logintry".into(), json!(tries));
+            ctx.sess.insert("previd".into(), json!(sid_trim.clone()));
+            if let Some(u) = &user {
+                if outcome.enforce_lanid_active {
+                    let lanid = s(u, "lanid");
+                    if tries < 4 {
+                        ctx.flash(&format!("Invalid username or password. Please login using your LAN ID ({}) password.", lanid));
+                    } else {
+                        ctx.flash(&format!("You have tried to login more than 3 times. Please make sure you are using the correct password for your LAN ID ({}).", lanid));
+                    }
+                    return ctx.redirect("/login").await;
+                }
+            }
+            if tries >= 4 {
+                ctx.sess.remove("logintry");
+                ctx.sess.remove("previd");
+                ctx.flash("Invalid username or password. You have tried to login more than 3 times.");
+            } else {
+                ctx.flash("Invalid username or password");
+            }
             return ctx.redirect("/login").await;
         }
         let u = user.unwrap();
@@ -111,8 +141,9 @@ pub async fn login(mut ctx: Ctx) -> Response {
         ctx.sess.insert("userid".into(), json!(uid));
         ctx.csrf();
         let _ = ctx.db().exec("update portal_user set lastlogin=now() where id=:id", &row! {"id"=>uid}).await;
-        web::user_log(ctx.db(), "login", "Logged in", Some(uid), None, &ctx.ip).await;
-        if b(&u, "reset_password") {
+        let log_msg = if outcome.via_ad { "Logged in via Active Directory" } else { "Logged in" };
+        web::user_log(ctx.db(), "login", log_msg, Some(uid), None, &ctx.ip).await;
+        if b(&u, "reset_password") && !outcome.via_ad {
             return ctx.redirect("/user/change_password").await;
         }
         let to = if back.starts_with('/') && !back.starts_with("//") { back } else { "/".to_string() };
@@ -969,7 +1000,17 @@ async fn update_lanid(mut ctx: Ctx, id: i64) -> Response {
     }
     let db = &ctx.st.db.clone();
     if let Ok(Some(u)) = db.get("portal_user", id).await {
-        ctx.flash(&format!("LDAP LAN ID lookup is not configured for {}", s(&u, "name")));
+        match crate::ad::update_user_lanid(&ctx.st, &u).await {
+            Ok(Some(new_lanid)) => {
+                ctx.flash(&format!("Updated user LAN ID to {}", new_lanid));
+            }
+            Ok(None) => {
+                ctx.flash(&format!("Failed to update the LAN ID for {} (not found in Active Directory)", s(&u, "name")));
+            }
+            Err(e) => {
+                ctx.flash(&format!("Failed to update LAN ID for {}: {}", s(&u, "name"), e));
+            }
+        }
     }
     ctx.redirect(&format!("/user/show/{id}")).await
 }

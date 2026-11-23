@@ -85,12 +85,16 @@ pub struct Config {
     /// user's member record (portal_user.profile_id), used by role rules
     pub user_profile: Option<String>,
     pub allow_registration: bool,
+    /// When true, Active Directory authentication is skipped completely and only
+    /// local bcrypt passwords are checked (matching g5portal's `server.disable_lanid`).
+    pub disable_lanid: bool,
     pub session_hours: i64,
     /// Optional session timeout in minutes (overrides `session_hours` when set).
     pub session_minutes: Option<i64>,
     pub app_name: String,
     pub mail: MailCfg,
     pub google_oauth: GoogleOAuthCfg,
+    pub active_directory: crate::ad::ActiveDirectoryCfg,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -117,11 +121,13 @@ impl Default for Config {
             content_security_policy: None,
             user_profile: None,
             allow_registration: false,
+            disable_lanid: false,
             session_hours: 12,
             session_minutes: None,
             app_name: "Portal".into(),
             mail: MailCfg::default(),
             google_oauth: GoogleOAuthCfg::default(),
+            active_directory: crate::ad::ActiveDirectoryCfg::default(),
         }
     }
 }
@@ -486,7 +492,7 @@ async fn load_session(db: &Db, sid: &str, ttl_mins: i64) -> Option<(String, Row,
     let ttl = ttl_mins.max(1);
     let touch_secs = (ttl * 60 / 4).clamp(15, 60);
     let q = format!(
-        "select data, (updated is not null and updated >= now() - interval '{} minutes') as alive, (updated < now() - interval '{} seconds') as stale from portal_session where id=:id",
+        "select data, case when updated is not null and updated >= now() - interval '{} minutes' then 1 else 0 end as alive, case when updated < now() - interval '{} seconds' then 1 else 0 end as stale from portal_session where id=:id",
         ttl, touch_secs
     );
     let r = db.first(&q, &row! {"id"=>sid}).await.ok().flatten()?;
@@ -558,6 +564,20 @@ pub fn clean_user(u: &mut Row) {
 
 pub async fn find_user_by_staffid(db: &Db, staffid: &str) -> Option<Row> {
     db.first("select * from portal_user where userid=:s order by id limit 1", &row! {"s"=>staffid}).await.ok().flatten()
+}
+
+/// Look up a user for login / Basic auth: matches `userid` first, then falls
+/// back to Active Directory `lanid` (case-insensitive), matching g5portal's
+/// `UserController.authenticate` and `PortalEndpointController`.
+pub async fn find_user_for_login(db: &Db, username: &str) -> Option<Row> {
+    let u = username.trim();
+    if u.is_empty() {
+        return None;
+    }
+    if let Some(r) = find_user_by_staffid(db, u).await {
+        return Some(r);
+    }
+    db.first("select * from portal_user where lower(lanid)=lower(:s) order by id limit 1", &row! {"s"=>u}).await.ok().flatten()
 }
 
 pub async fn setting(db: &Db, name: &str) -> Option<Value> {
@@ -742,13 +762,24 @@ impl Ctx {
     pub async fn finish(self, mut resp: Response) -> Response {
         let data = Value::Object(self.sess.clone()).to_string();
         if data != self.sess_orig {
-            let _ = self
-                .db()
-                .exec(
-                    "insert into portal_session (id,data,updated) values (:id,:d,now()) on conflict (id) do update set data=excluded.data, updated=now()",
-                    &row! {"id"=>self.sid.clone(),"d"=>data},
-                )
-                .await;
+            let p = row! {"id"=>self.sid.clone(),"d"=>data};
+            if self.db().is_mssql() {
+                let _ = self
+                    .db()
+                    .exec(
+                        "update portal_session set data=:d, updated=now() where id=:id; if @@rowcount = 0 insert into portal_session (id,data,updated) values (:id,:d,now())",
+                        &p,
+                    )
+                    .await;
+            } else {
+                let _ = self
+                    .db()
+                    .exec(
+                        "insert into portal_session (id,data,updated) values (:id,:d,now()) on conflict (id) do update set data=excluded.data, updated=now()",
+                        &p,
+                    )
+                    .await;
+            }
         } else if self.sess_touch && self.user.is_some() {
             let _ = self
                 .db()

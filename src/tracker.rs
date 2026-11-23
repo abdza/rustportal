@@ -44,6 +44,23 @@ pub struct Tracker {
 }
 
 pub fn sql_type(field_type: &str) -> Option<&'static str> {
+    sql_type_for(crate::db::Dialect::Postgres, field_type)
+}
+
+pub fn sql_type_for(dialect: crate::db::Dialect, field_type: &str) -> Option<&'static str> {
+    if dialect == crate::db::Dialect::Mssql {
+        return Some(match field_type {
+            "Text Area" => "nvarchar(max)",
+            "Date" => "date",
+            "DateTime" => "datetime2",
+            "Checkbox" => "bit",
+            "Integer" => "numeric(24,0)",
+            "Number" => "decimal(24,6)",
+            "Branch" | "User" | "File" | "BelongsTo" | "TreeNode" => "numeric(19,0)",
+            "HasMany" | "FieldGroup" => return None,
+            _ => "nvarchar(256)",
+        });
+    }
     Some(match field_type {
         "Text Area" => "text",
         "Date" => "date",
@@ -428,21 +445,48 @@ impl Tracker {
     // ---------------- schema ----------------
 
     pub async fn updatedb(&self, db: &Db) -> Result<()> {
-        let dt = ident(&self.data_table())?;
-        let id_col = if db.is_sqlite() { "id integer primary key autoincrement" } else { "id serial primary key" };
-        db.ddl(&format!("create table if not exists {} ({}, dataupdate_id numeric(19,0) null)", dt, id_col)).await?;
-        db.add_column_if_missing(&self.data_table(), "dataupdate_id", "numeric(19,0)").await?;
-        if self.tracker_type != "DataStore" {
-            db.add_column_if_missing(&self.data_table(), "record_status", "varchar(255)").await?;
-        }
-        if self.tracker_type == "Tracker" {
-            let tt = ident(&self.trail_table())?;
-            db.ddl(&format!(
-                "create table if not exists {} ({}, attachment_id numeric(19,0), description text, record_id numeric(19,0), update_date timestamp, updater_id numeric(19,0), status varchar(255), changes text, allowedroles varchar(255))",
-                tt, id_col
-            ))
-            .await?;
-            db.ddl(&format!("create index if not exists \"ix_{}_record_id\" on {} (record_id)", self.trail_table(), tt)).await?;
+        let dt_name = self.data_table();
+        let dt = ident(&dt_name)?;
+        if db.is_mssql() {
+            if !db.table_exists(&dt_name).await {
+                db.ddl(&format!("create table {} (\"id\" int not null identity(1,1) primary key, \"dataupdate_id\" numeric(19,0) null)", dt)).await?;
+            }
+            db.add_column_if_missing(&dt_name, "dataupdate_id", "numeric(19,0)").await?;
+            if self.tracker_type != "DataStore" {
+                db.add_column_if_missing(&dt_name, "record_status", "nvarchar(255)").await?;
+            }
+            if self.tracker_type == "Tracker" {
+                let tt_name = self.trail_table();
+                let tt = ident(&tt_name)?;
+                if !db.table_exists(&tt_name).await {
+                    db.ddl(&format!(
+                        "create table {} (\"id\" int not null identity(1,1) primary key, \"attachment_id\" numeric(19,0), \"description\" nvarchar(max), \"record_id\" numeric(19,0), \"update_date\" datetime2, \"updater_id\" numeric(19,0), \"status\" nvarchar(255), \"changes\" nvarchar(max), \"allowedroles\" nvarchar(255))",
+                        tt
+                    ))
+                    .await?;
+                }
+                let ix = format!("ix_{}_record_id", tt_name);
+                db.ddl(&format!(
+                    "if not exists (select 1 from sys.indexes where name='{ix}' and object_id=object_id('{tt_name}')) create nonclustered index \"{ix}\" on {tt} (\"record_id\")"
+                ))
+                .await?;
+            }
+        } else {
+            let id_col = if db.is_sqlite() { "id integer primary key autoincrement" } else { "id serial primary key" };
+            db.ddl(&format!("create table if not exists {} ({}, dataupdate_id numeric(19,0) null)", dt, id_col)).await?;
+            db.add_column_if_missing(&dt_name, "dataupdate_id", "numeric(19,0)").await?;
+            if self.tracker_type != "DataStore" {
+                db.add_column_if_missing(&dt_name, "record_status", "varchar(255)").await?;
+            }
+            if self.tracker_type == "Tracker" {
+                let tt = ident(&self.trail_table())?;
+                db.ddl(&format!(
+                    "create table if not exists {} ({}, attachment_id numeric(19,0), description text, record_id numeric(19,0), update_date timestamp, updater_id numeric(19,0), status varchar(255), changes text, allowedroles varchar(255))",
+                    tt, id_col
+                ))
+                .await?;
+                db.ddl(&format!("create index if not exists \"ix_{}_record_id\" on {} (record_id)", self.trail_table(), tt)).await?;
+            }
         }
         for f in &self.fields {
             self.update_field_db(db, f).await?;
@@ -453,27 +497,47 @@ impl Tracker {
     pub async fn update_field_db(&self, db: &Db, f: &Row) -> Result<()> {
         let ft = s(f, "field_type");
         let name = s(f, "name").trim().to_string();
-        let Some(t) = sql_type(&ft) else { return Ok(()) };
+        let Some(t) = sql_type_for(db.dialect(), &ft) else { return Ok(()) };
         if name.is_empty() || name == "id" {
             return Ok(());
         }
-        let dt = ident(&self.data_table())?;
-        db.add_column_if_missing(&self.data_table(), &name, t).await?;
+        let dt_name = self.data_table();
+        let dt = ident(&dt_name)?;
+        db.add_column_if_missing(&dt_name, &name, t).await?;
         if matches!(ft.as_str(), "Branch" | "User" | "File" | "BelongsTo" | "TreeNode") {
-            db.ddl(&format!("create index if not exists \"ix_{}_{}\" on {} ({})", self.data_table(), name, dt, ident(&name)?)).await?;
+            let ix = format!("ix_{}_{}", dt_name, name);
+            if db.is_mssql() {
+                db.ddl(&format!(
+                    "if not exists (select 1 from sys.indexes where name='{ix}' and object_id=object_id('{dt_name}')) create nonclustered index \"{ix}\" on {dt} ({})",
+                    ident(&name)?
+                ))
+                .await?;
+            } else {
+                db.ddl(&format!("create index if not exists \"{ix}\" on {dt} ({})", ident(&name)?)).await?;
+            }
         }
         Ok(())
     }
 
     pub async fn create_index(&self, db: &Db) -> Result<()> {
-        let dt = ident(&self.data_table())?;
+        let dt_name = self.data_table();
+        let dt = ident(&dt_name)?;
         let mut names = csv(&s(&self.row, "searchfields"));
         names.extend(csv(&s(&self.row, "filterfields")));
         names.dedup();
         for n in names {
             if let Some(f) = self.field(&n) {
                 if !matches!(s(f, "field_type").as_str(), "Text Area" | "HasMany" | "FieldGroup") {
-                    db.ddl(&format!("create index if not exists \"ix_{}_{}\" on {} ({})", self.data_table(), n, dt, ident(&n)?)).await?;
+                    let ix = format!("ix_{}_{}", dt_name, n);
+                    if db.is_mssql() {
+                        db.ddl(&format!(
+                            "if not exists (select 1 from sys.indexes where name='{ix}' and object_id=object_id('{dt_name}')) create nonclustered index \"{ix}\" on {dt} ({})",
+                            ident(&n)?
+                        ))
+                        .await?;
+                    } else {
+                        db.ddl(&format!("create index if not exists \"{ix}\" on {dt} ({})", ident(&n)?)).await?;
+                    }
                 }
             }
         }
@@ -486,8 +550,17 @@ impl Tracker {
                 .collect();
             let safe: String = s(&ix, "name").chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
             if !cols.is_empty() {
-                db.ddl(&format!("drop index if exists \"ix_{}_{}\"", self.data_table(), safe)).await?;
-                db.ddl(&format!("create index \"ix_{}_{}\" on {} ({})", self.data_table(), safe, dt, cols.join(","))).await?;
+                let ix_name = format!("ix_{}_{}", dt_name, safe);
+                if db.is_mssql() {
+                    db.ddl(&format!(
+                        "if exists (select 1 from sys.indexes where name='{ix_name}' and object_id=object_id('{dt_name}')) drop index \"{ix_name}\" on {dt}"
+                    ))
+                    .await?;
+                    db.ddl(&format!("create nonclustered index \"{ix_name}\" on {dt} ({})", cols.join(","))).await?;
+                } else {
+                    db.ddl(&format!("drop index if exists \"{ix_name}\"")).await?;
+                    db.ddl(&format!("create index \"{ix_name}\" on {dt} ({})", cols.join(","))).await?;
+                }
             }
         }
         Ok(())
@@ -504,12 +577,12 @@ impl Tracker {
             let base = udt.to_ascii_lowercase();
             let base = base.split('(').next().unwrap_or(&base).trim();
             let ft = match base {
-                "int2" | "int4" | "int8" | "int" | "integer" | "bigint" | "smallint" => "Integer",
-                "numeric" | "decimal" | "float4" | "float8" | "real" | "float" | "double" | "double precision" => "Number",
+                "int2" | "int4" | "int8" | "int" | "integer" | "bigint" | "smallint" | "tinyint" => "Integer",
+                "numeric" | "decimal" | "float4" | "float8" | "real" | "float" | "double" | "double precision" | "money" | "smallmoney" => "Number",
                 "date" => "Date",
-                "timestamp" | "timestamptz" | "datetime" => "DateTime",
-                "bool" | "boolean" => "Checkbox",
-                "text" => "Text Area",
+                "timestamp" | "timestamptz" | "datetime" | "datetime2" | "smalldatetime" | "datetimeoffset" => "DateTime",
+                "bool" | "boolean" | "bit" => "Checkbox",
+                "text" | "ntext" => "Text Area",
                 _ => "Text",
             };
             db.insert("portal_tracker_field", &row! {"tracker_id"=>self.id,"name"=>name.clone(),"label"=>crate::entity::label_of(&name),"field_type"=>ft}).await?;
@@ -600,6 +673,18 @@ impl Tracker {
                 db.exec(&format!("update {} set {} where id={}", dt, sets.join(","), id), &db::no_params()).await?;
             }
             Ok(id)
+        } else if db.is_mssql() {
+            let sql = if cols.is_empty() {
+                format!("set nocount on; insert into {} default values; select cast(scope_identity() as bigint) as id; set nocount off", dt)
+            } else {
+                format!(
+                    "set nocount on; insert into {} ({}) values ({}); select cast(scope_identity() as bigint) as id; set nocount off",
+                    dt,
+                    cols.iter().map(|(k, _)| qcol(k)).collect::<Vec<_>>().join(","),
+                    cols.iter().map(|(_, v)| lit(v)).collect::<Vec<_>>().join(",")
+                )
+            };
+            db.first(&sql, &db::no_params()).await?.and_then(|r| i(&r, "id")).ok_or_else(|| anyhow!("insert failed"))
         } else {
             let sql = if cols.is_empty() {
                 format!("insert into {} default values returning id", dt)
@@ -1139,7 +1224,12 @@ impl Tracker {
                 return Ok((cur, prev, true));
             }
         } else if self.tracker_type != "DataStore" {
-            let r = db.first(&format!("insert into {} (record_status) values ('sys_draft') returning id", ident(&self.data_table())?), &db::no_params()).await?;
+            let sql = if db.is_mssql() {
+                format!("set nocount on; insert into {} (record_status) values ('sys_draft'); select cast(scope_identity() as bigint) as id; set nocount off", ident(&self.data_table())?)
+            } else {
+                format!("insert into {} (record_status) values ('sys_draft') returning id", ident(&self.data_table())?)
+            };
+            let r = db.first(&sql, &db::no_params()).await?;
             id = r.and_then(|r| i(&r, "id"));
             cur.insert("id".into(), json!(id));
         }
@@ -1268,17 +1358,22 @@ impl Tracker {
                 let sets: Vec<String> = set.iter().map(|(k, v)| format!("{}={}", qcol(k), lit(v))).collect();
                 db.exec(&format!("update {} set {} where id={}", dt, sets.join(","), rid), &db::no_params()).await?;
             } else {
-                let r = db
-                    .first(
-                        &format!(
-                            "insert into {} ({}) values ({}) returning id",
-                            dt,
-                            set.iter().map(|(k, _)| qcol(k)).collect::<Vec<_>>().join(","),
-                            set.iter().map(|(_, v)| lit(v)).collect::<Vec<_>>().join(",")
-                        ),
-                        &db::no_params(),
+                let sql = if db.is_mssql() {
+                    format!(
+                        "set nocount on; insert into {} ({}) values ({}); select cast(scope_identity() as bigint) as id; set nocount off",
+                        dt,
+                        set.iter().map(|(k, _)| qcol(k)).collect::<Vec<_>>().join(","),
+                        set.iter().map(|(_, v)| lit(v)).collect::<Vec<_>>().join(",")
                     )
-                    .await?;
+                } else {
+                    format!(
+                        "insert into {} ({}) values ({}) returning id",
+                        dt,
+                        set.iter().map(|(k, _)| qcol(k)).collect::<Vec<_>>().join(","),
+                        set.iter().map(|(_, v)| lit(v)).collect::<Vec<_>>().join(",")
+                    )
+                };
+                let r = db.first(&sql, &db::no_params()).await?;
                 id = r.and_then(|r| i(&r, "id"));
             }
         }

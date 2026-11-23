@@ -807,7 +807,82 @@ pub async fn tracker_tool_action(mut ctx: Ctx, act: &str, id: Option<i64>) -> Re
             ctx.flash(&format!("Trail file links fixed: {fixed} updated"));
         }
         "convert_text_columns" => {
-            ctx.flash("Nothing to do on Postgres/SQLite: text is already the idiomatic unlimited column type.");
+            if !db.is_mssql() {
+                ctx.flash("Nothing to do on Postgres/SQLite: text is already the idiomatic unlimited column type.");
+            } else {
+                let table_name = t.data_table();
+                if !db::ident_ok(&table_name) {
+                    ctx.flash(&format!("Refusing to alter an unexpected table name: {table_name}"));
+                } else {
+                    let size_mb = |db: &Db, tn: &str| {
+                        let db = db.clone();
+                        let tn = tn.to_string();
+                        async move {
+                            db.first(
+                                "select cast(sum(a.total_pages)*8.0/1024 as decimal(10,1)) as mb from sys.partitions p join sys.allocation_units a on a.container_id = p.partition_id where p.object_id = object_id(:t)",
+                                &row! {"t"=>tn},
+                            )
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|r| s(&r, "mb"))
+                            .unwrap_or_default()
+                        }
+                    };
+                    let before = size_mb(db, &table_name).await;
+                    let cols = db
+                        .rows(
+                            "select COLUMN_NAME as column_name, DATA_TYPE as data_type, IS_NULLABLE as is_nullable from INFORMATION_SCHEMA.COLUMNS where TABLE_SCHEMA = SCHEMA_NAME() and LOWER(TABLE_NAME) = LOWER(:t) and DATA_TYPE in ('text','ntext')",
+                            &row! {"t"=>table_name.clone()},
+                        )
+                        .await
+                        .unwrap_or_default();
+                    if cols.is_empty() {
+                        ctx.flash(&format!("No text columns on {table_name} - nothing to convert."));
+                    } else {
+                        let mut converted = vec![];
+                        let mut failed = vec![];
+                        for col in &cols {
+                            let cname = s(col, "column_name");
+                            let dtype = s(col, "data_type").to_ascii_lowercase();
+                            let nullable = s(col, "is_nullable").to_ascii_uppercase();
+                            if !db::ident_ok(&cname) {
+                                failed.push(format!("{cname} (unsafe column name)"));
+                                continue;
+                            }
+                            let newtype = if dtype == "ntext" { "nvarchar(max)" } else { "varchar(max)" };
+                            let nullclause = if nullable == "NO" { "NOT NULL" } else { "NULL" };
+                            let alter = format!("alter table [{table_name}] alter column [{cname}] {newtype} {nullclause}");
+                            let rewrite = format!("update [{table_name}] set [{cname}] = [{cname}]");
+                            match db.ddl(&alter).await {
+                                Ok(_) => match db.exec(&rewrite, &db::no_params()).await {
+                                    Ok(_) => converted.push(format!("{cname} ({dtype} -> {newtype})")),
+                                    Err(e) => {
+                                        failed.push(format!("{cname}: {e}"));
+                                        web::log_error(db, "tracker", "convert_text_columns", &e.to_string(), Some(&t.module), Some(&t.slug), ctx.uid()).await;
+                                    }
+                                },
+                                Err(e) => {
+                                    failed.push(format!("{cname}: {e}"));
+                                    web::log_error(db, "tracker", "convert_text_columns", &e.to_string(), Some(&t.module), Some(&t.slug), ctx.uid()).await;
+                                }
+                            }
+                        }
+                        if !converted.is_empty() {
+                            let _ = db.ddl(&format!("alter table [{table_name}] rebuild")).await;
+                        }
+                        let after = size_mb(db, &table_name).await;
+                        let mut msg = format!("Converted {} column(s) on {table_name}: {}", converted.len(), converted.join(", "));
+                        if !before.is_empty() && !after.is_empty() {
+                            msg.push_str(&format!(" (table size: {before} MB -> {after} MB)"));
+                        }
+                        if !failed.is_empty() {
+                            msg.push_str(&format!("; failed: {}", failed.join("; ")));
+                        }
+                        ctx.flash(&msg);
+                    }
+                }
+            }
         }
         _ => {}
     }

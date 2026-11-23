@@ -1,20 +1,25 @@
 //! Database layer: dynamic rows as JSON maps and named-parameter SQL.
 //!
-//! Supports PostgreSQL (`postgres://...`) and embedded SQLite (`sqlite://...`
-//! or `sqlite::memory:`). Tracker data tables are created at runtime with
-//! user-defined columns, so nothing here is statically typed. Named parameters
-//! (`:name`) are rendered as escaped SQL literals; on SQLite a compatibility
-//! shim translates common PostgreSQL expressions (`ILIKE`, `::casts`, `now()`,
-//! `interval '...'`, `EXTRACT(...)`, etc.).
+//! Supports PostgreSQL (`postgres://...`), SQL Server (`mssql://...`,
+//! `sqlserver://...`, `jdbc:sqlserver://...`, or ADO.NET `Server=...`),
+//! and embedded SQLite (`sqlite://...` or `sqlite::memory:`). Tracker data
+//! tables are created at runtime with user-defined columns, so nothing here is
+//! statically typed. Named parameters (`:name`) are rendered as escaped SQL
+//! literals; on SQLite and MSSQL compatibility shims translate common
+//! PostgreSQL expressions (`ILIKE`, `::casts`, `now()`, `interval '...'`,
+//! `EXTRACT(...)`, `LIMIT`/`OFFSET`, `NULLS LAST`, etc.).
 
 use anyhow::{anyhow, Result};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use serde_json::{Map, Value};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow, SqliteSynchronous};
 use sqlx::{Column, Row as _, TypeInfo, ValueRef};
 use std::str::FromStr;
 use std::time::Duration;
+use tiberius::{AuthMethod, Client, ColumnType, Config as TdsConfig, EncryptionLevel, QueryItem, SqlBrowser};
+use tokio::net::TcpStream;
+use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 pub type Row = Map<String, Value>;
 
@@ -22,12 +27,71 @@ pub type Row = Map<String, Value>;
 pub enum Dialect {
     Postgres,
     Sqlite,
+    Mssql,
+}
+
+#[derive(Debug)]
+struct MssqlErr(String);
+
+impl std::fmt::Display for MssqlErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MssqlErr {}
+
+#[derive(Clone)]
+struct MssqlManager {
+    config: TdsConfig,
+    connect_timeout: Duration,
+}
+
+impl bb8::ManageConnection for MssqlManager {
+    type Connection = Client<Compat<TcpStream>>;
+    type Error = MssqlErr;
+
+    async fn connect(&self) -> std::result::Result<Self::Connection, Self::Error> {
+        let cfg = self.config.clone();
+        let tcp = tokio::time::timeout(self.connect_timeout, TcpStream::connect_named(&cfg))
+            .await
+            .map_err(|_| MssqlErr(format!("MSSQL TCP connect timed out after {:?}", self.connect_timeout)))?
+            .map_err(|e| MssqlErr(format!("MSSQL TCP connect failed: {}", e)))?;
+        let _ = tcp.set_nodelay(true);
+        let mut client = tokio::time::timeout(self.connect_timeout, Client::connect(cfg, tcp.compat_write()))
+            .await
+            .map_err(|_| MssqlErr(format!("MSSQL login handshake timed out after {:?}", self.connect_timeout)))?
+            .map_err(|e| MssqlErr(format!("MSSQL login failed: {}", e)))?;
+        // Ensure ANSI/ISO behavior regardless of the SQL Server login's default language
+        let _ = client
+            .simple_query("SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON; SET DATEFORMAT ymd;")
+            .await
+            .map_err(|e| MssqlErr(format!("MSSQL session init failed: {}", e)))?
+            .into_results()
+            .await;
+        Ok(client)
+    }
+
+    async fn is_valid(&self, conn: &mut Self::Connection) -> std::result::Result<(), Self::Error> {
+        conn.simple_query("SELECT 1")
+            .await
+            .map_err(|e| MssqlErr(format!("MSSQL validation query failed: {}", e)))?
+            .into_results()
+            .await
+            .map_err(|e| MssqlErr(format!("MSSQL validation result failed: {}", e)))?;
+        Ok(())
+    }
+
+    fn has_broken(&self, _conn: &mut Self::Connection) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]
 enum Pool {
     Pg(PgPool),
     Sqlite(SqlitePool),
+    Mssql(bb8::Pool<MssqlManager>),
 }
 
 #[derive(Clone)]
@@ -35,6 +99,7 @@ pub struct Db {
     pool: Pool,
     dialect: Dialect,
     sqlite_localtime: bool,
+    mssql_utc: bool,
 }
 
 /// Only plain identifiers may be spliced into SQL as table/column names.
@@ -208,6 +273,88 @@ fn decode_sqlite(row: &SqliteRow) -> Row {
     m
 }
 
+fn decode_mssql(row: &tiberius::Row) -> Row {
+    use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime};
+    use rust_decimal::prelude::ToPrimitive;
+    let mut m = Row::new();
+    for (i, col) in row.columns().iter().enumerate() {
+        let v: Value = match col.column_type() {
+            ColumnType::Bit | ColumnType::Bitn => row.try_get::<bool, _>(i).ok().flatten().map(Value::Bool).unwrap_or(Value::Null),
+            ColumnType::Int1 => row.try_get::<u8, _>(i).ok().flatten().map(|x| Value::from(x as i64)).unwrap_or(Value::Null),
+            ColumnType::Int2 => row.try_get::<i16, _>(i).ok().flatten().map(|x| Value::from(x as i64)).unwrap_or(Value::Null),
+            ColumnType::Int4 => row.try_get::<i32, _>(i).ok().flatten().map(|x| Value::from(x as i64)).unwrap_or(Value::Null),
+            ColumnType::Int8 => row.try_get::<i64, _>(i).ok().flatten().map(Value::from).unwrap_or(Value::Null),
+            ColumnType::Intn => row
+                .try_get::<i64, _>(i)
+                .ok()
+                .flatten()
+                .map(Value::from)
+                .or_else(|| row.try_get::<i32, _>(i).ok().flatten().map(|x| Value::from(x as i64)))
+                .or_else(|| row.try_get::<i16, _>(i).ok().flatten().map(|x| Value::from(x as i64)))
+                .or_else(|| row.try_get::<u8, _>(i).ok().flatten().map(|x| Value::from(x as i64)))
+                .unwrap_or(Value::Null),
+            ColumnType::Float4 => row.try_get::<f32, _>(i).ok().flatten().map(|x| Value::from(x as f64)).unwrap_or(Value::Null),
+            ColumnType::Float8 => row.try_get::<f64, _>(i).ok().flatten().map(Value::from).unwrap_or(Value::Null),
+            ColumnType::Floatn => row
+                .try_get::<f64, _>(i)
+                .ok()
+                .flatten()
+                .map(Value::from)
+                .or_else(|| row.try_get::<f32, _>(i).ok().flatten().map(|x| Value::from(x as f64)))
+                .unwrap_or(Value::Null),
+            ColumnType::Decimaln | ColumnType::Numericn | ColumnType::Money | ColumnType::Money4 => match row.try_get::<rust_decimal::Decimal, _>(i).ok().flatten() {
+                Some(d) => {
+                    if d.fract().is_zero() {
+                        d.to_i64().map(Value::from).unwrap_or_else(|| Value::String(d.to_string()))
+                    } else {
+                        d.to_f64().map(Value::from).unwrap_or(Value::Null)
+                    }
+                }
+                None => Value::Null,
+            },
+            ColumnType::Daten => row
+                .try_get::<NaiveDate, _>(i)
+                .ok()
+                .flatten()
+                .map(|d| Value::String(d.format("%Y-%m-%d").to_string()))
+                .unwrap_or(Value::Null),
+            ColumnType::Timen => row
+                .try_get::<NaiveTime, _>(i)
+                .ok()
+                .flatten()
+                .map(|d| Value::String(d.format("%H:%M:%S").to_string()))
+                .unwrap_or(Value::Null),
+            ColumnType::Datetime | ColumnType::Datetime4 | ColumnType::Datetimen | ColumnType::Datetime2 => row
+                .try_get::<NaiveDateTime, _>(i)
+                .ok()
+                .flatten()
+                .map(|d| Value::String(ts_text(d)))
+                .unwrap_or(Value::Null),
+            ColumnType::DatetimeOffsetn => row
+                .try_get::<DateTime<FixedOffset>, _>(i)
+                .ok()
+                .flatten()
+                .map(|d| Value::String(ts_text(d.with_timezone(&Local).naive_local())))
+                .unwrap_or(Value::Null),
+            ColumnType::Guid => row
+                .try_get::<uuid::Uuid, _>(i)
+                .ok()
+                .flatten()
+                .map(|u| Value::String(u.to_string()))
+                .unwrap_or(Value::Null),
+            ColumnType::BigBinary | ColumnType::BigVarBin | ColumnType::Image => Value::Null,
+            _ => row
+                .try_get::<&str, _>(i)
+                .ok()
+                .flatten()
+                .map(|s| Value::String(s.to_string()))
+                .unwrap_or(Value::Null),
+        };
+        m.insert(col.name().to_string(), v);
+    }
+    m
+}
+
 pub fn no_params() -> Row {
     Row::new()
 }
@@ -215,6 +362,200 @@ pub fn no_params() -> Row {
 fn is_sqlite_url(url: &str) -> bool {
     let u = url.trim();
     u.starts_with("sqlite:") || u == ":memory:" || (!u.contains("://") && (u.ends_with(".db") || u.ends_with(".sqlite") || u.ends_with(".sqlite3")))
+}
+
+pub fn is_mssql_url(url: &str) -> bool {
+    let low = url.trim().to_ascii_lowercase();
+    low.starts_with("mssql://")
+        || low.starts_with("sqlserver://")
+        || low.starts_with("jdbc:sqlserver://")
+        || (low.contains("server=") && low.contains(';'))
+}
+
+fn apply_mssql_kv(cfg: &mut TdsConfig, user: &mut Option<String>, pass: &mut Option<String>, timeout_secs: &mut u64, key: &str, val: &str) {
+    let k = key.trim().to_ascii_lowercase();
+    let v = val.trim();
+    match k.as_str() {
+        "databasename" | "database" | "initial catalog" => {
+            if !v.is_empty() {
+                cfg.database(v);
+            }
+        }
+        "user" | "username" | "uid" | "user id" => {
+            if !v.is_empty() {
+                *user = Some(v.to_string());
+            }
+        }
+        "password" | "pwd" => {
+            *pass = Some(v.to_string());
+        }
+        "instancename" | "instance" => {
+            if !v.is_empty() {
+                cfg.instance_name(v);
+            }
+        }
+        "encrypt" => match v.to_ascii_lowercase().as_str() {
+            "true" | "yes" | "1" | "required" | "strict" => cfg.encryption(EncryptionLevel::Required),
+            "false" | "no" | "0" | "off" => cfg.encryption(EncryptionLevel::Off),
+            "not_supported" | "none" => cfg.encryption(EncryptionLevel::NotSupported),
+            _ => {}
+        },
+        "trustservercertificate" | "trust_cert" | "trust_server_certificate" => {
+            if matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "1") {
+                cfg.trust_cert();
+            }
+        }
+        "applicationname" | "application_name" => {
+            if !v.is_empty() {
+                cfg.application_name(v);
+            }
+        }
+        "logintimeout" | "connect_timeout" | "timeout" => {
+            if let Ok(n) = v.parse::<u64>() {
+                if n > 0 {
+                    *timeout_secs = n.clamp(1, 300);
+                }
+            }
+        }
+        "sockettimeout" => {
+            // JDBC socketTimeout is in milliseconds (e.g. 300000 in g5portal)
+            if let Ok(ms) = v.parse::<u64>() {
+                if ms >= 1000 {
+                    *timeout_secs = (ms / 1000).clamp(1, 300);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parse `mssql://user:pass@host:port/db?params`, `sqlserver://...`,
+/// `jdbc:sqlserver://host:port;databaseName=db;user=sa;password=...;encrypt=true;trustServerCertificate=true`,
+/// or an ADO.NET `Server=...;Database=...;User Id=...;Password=...` string.
+fn parse_mssql_config(url: &str) -> Result<(TdsConfig, Duration)> {
+    let raw = url.trim();
+    let low = raw.to_ascii_lowercase();
+    let mut timeout_secs = 30u64;
+
+    if low.starts_with("jdbc:sqlserver://") {
+        let rest = &raw["jdbc:sqlserver://".len()..];
+        let mut parts = rest.split(';');
+        let host_part = parts.next().unwrap_or("").trim();
+        let mut cfg = TdsConfig::new();
+        cfg.application_name("rustportal");
+        cfg.encryption(EncryptionLevel::Off);
+
+        // host[\instance][:port]
+        let (hp, inst) = match host_part.split_once('\\') {
+            Some((h, after)) => match after.split_once(':') {
+                Some((iname, port_s)) => ((h, Some(port_s)), Some(iname)),
+                None => ((h, None), Some(after)),
+            },
+            None => match host_part.rsplit_once(':') {
+                Some((h, port_s)) if port_s.chars().all(|c| c.is_ascii_digit()) => ((h, Some(port_s)), None),
+                _ => ((host_part, None), None),
+            },
+        };
+        if !hp.0.is_empty() {
+            cfg.host(hp.0);
+        }
+        if let Some(p) = hp.1.and_then(|s| s.parse::<u16>().ok()) {
+            cfg.port(p);
+        } else if inst.is_none() {
+            cfg.port(1433);
+        }
+        if let Some(iname) = inst.filter(|s| !s.is_empty()) {
+            cfg.instance_name(iname);
+        }
+
+        let mut user = None;
+        let mut pass = None;
+        for kv in parts {
+            let kv = kv.trim();
+            if kv.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = kv.split_once('=') {
+                apply_mssql_kv(&mut cfg, &mut user, &mut pass, &mut timeout_secs, k, v);
+            }
+        }
+        if let Some(u) = user {
+            cfg.authentication(AuthMethod::sql_server(u, pass.unwrap_or_default()));
+        }
+        return Ok((cfg, Duration::from_secs(timeout_secs)));
+    }
+
+    if low.starts_with("mssql://") || low.starts_with("sqlserver://") {
+        let scheme_len = if low.starts_with("mssql://") { "mssql://".len() } else { "sqlserver://".len() };
+        let rest = &raw[scheme_len..];
+        let (before_q, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let (authority, path) = before_q.split_once('/').unwrap_or((before_q, ""));
+        let (userinfo, hostport) = match authority.rsplit_once('@') {
+            Some((ui, hp)) => (Some(ui), hp),
+            None => (None, authority),
+        };
+
+        let mut cfg = TdsConfig::new();
+        cfg.application_name("rustportal");
+        cfg.encryption(EncryptionLevel::Off);
+
+        let (host_only, port_opt, inst_opt) = match hostport.split_once('\\') {
+            Some((h, after)) => match after.rsplit_once(':') {
+                Some((iname, p)) if p.chars().all(|c| c.is_ascii_digit()) => (h, p.parse::<u16>().ok(), Some(iname)),
+                _ => (h, None, Some(after)),
+            },
+            None => match hostport.rsplit_once(':') {
+                Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (h, p.parse::<u16>().ok(), None),
+                _ => (hostport, None, None),
+            },
+        };
+        if !host_only.is_empty() {
+            cfg.host(host_only);
+        }
+        if let Some(p) = port_opt {
+            cfg.port(p);
+        } else if inst_opt.is_none() {
+            cfg.port(1433);
+        }
+        if let Some(iname) = inst_opt.filter(|s| !s.is_empty()) {
+            cfg.instance_name(iname);
+        }
+
+        let db_name = path.trim_start_matches('/');
+        if !db_name.is_empty() {
+            let dec = urlencoding::decode(db_name).map(|d| d.into_owned()).unwrap_or_else(|_| db_name.to_string());
+            cfg.database(dec);
+        }
+
+        let mut user: Option<String> = None;
+        let mut pass: Option<String> = None;
+        if let Some(ui) = userinfo {
+            let (u_raw, p_raw) = ui.split_once(':').unwrap_or((ui, ""));
+            let u_dec = urlencoding::decode(u_raw).map(|d| d.into_owned()).unwrap_or_else(|_| u_raw.to_string());
+            let p_dec = urlencoding::decode(p_raw).map(|d| d.into_owned()).unwrap_or_else(|_| p_raw.to_string());
+            if !u_dec.is_empty() {
+                user = Some(u_dec);
+                pass = Some(p_dec);
+            }
+        }
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = pair.split_once('=') {
+                let v_dec = urlencoding::decode(v).map(|d| d.into_owned()).unwrap_or_else(|_| v.to_string());
+                apply_mssql_kv(&mut cfg, &mut user, &mut pass, &mut timeout_secs, k, &v_dec);
+            }
+        }
+        if let Some(u) = user {
+            cfg.authentication(AuthMethod::sql_server(u, pass.unwrap_or_default()));
+        }
+        return Ok((cfg, Duration::from_secs(timeout_secs)));
+    }
+
+    // ADO.NET style connection string (Server=...;Database=...;User Id=...;Password=...;)
+    let cfg = TdsConfig::from_ado_string(raw).map_err(|e| anyhow!("Invalid MSSQL connection string: {}", e))?;
+    Ok((cfg, Duration::from_secs(timeout_secs)))
 }
 
 fn sqlite_connect_url(url: &str) -> String {
@@ -241,6 +582,10 @@ impl Db {
 
     pub fn is_sqlite(&self) -> bool {
         self.dialect == Dialect::Sqlite
+    }
+
+    pub fn is_mssql(&self) -> bool {
+        self.dialect == Dialect::Mssql
     }
 
     /// `timezone`: the session time zone for SQL's now() / current_date (sqlx
@@ -273,7 +618,33 @@ impl Db {
                 timezone.as_deref().map(|z| z.trim().to_ascii_uppercase()).as_deref(),
                 Some("UTC" | "ETC/UTC")
             );
-            return Ok(Db { pool: Pool::Sqlite(pool), dialect: Dialect::Sqlite, sqlite_localtime });
+            return Ok(Db { pool: Pool::Sqlite(pool), dialect: Dialect::Sqlite, sqlite_localtime, mssql_utc: false });
+        }
+        if is_mssql_url(url) {
+            let (tds_cfg, connect_timeout) = parse_mssql_config(url)?;
+            let mgr = MssqlManager { config: tds_cfg, connect_timeout };
+            let pool = bb8::Pool::builder()
+                .max_size(max.max(2))
+                .connection_timeout(connect_timeout)
+                .test_on_check_out(true)
+                .build(mgr)
+                .await
+                .map_err(|e| anyhow!("MSSQL pool creation failed: {}", e))?;
+            // Verify connectivity eagerly at startup (matching sqlx::Pool::connect)
+            {
+                let mut conn = pool.get().await.map_err(|e| anyhow!("Cannot connect to MSSQL: {}", e))?;
+                conn.simple_query("SELECT 1")
+                    .await
+                    .map_err(|e| anyhow!("MSSQL initial health check failed: {}", e))?
+                    .into_results()
+                    .await
+                    .map_err(|e| anyhow!("MSSQL initial health check failed: {}", e))?;
+            }
+            let mssql_utc = matches!(
+                timezone.as_deref().map(|z| z.trim().to_ascii_uppercase()).as_deref(),
+                Some("UTC" | "ETC/UTC")
+            );
+            return Ok(Db { pool: Pool::Mssql(pool), dialect: Dialect::Mssql, sqlite_localtime: false, mssql_utc });
         }
         let tz = timezone.filter(|z| !z.is_empty() && z.chars().all(|c| c.is_ascii_alphanumeric() || "/_+-:".contains(c)));
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -289,14 +660,14 @@ impl Db {
             })
             .connect(url)
             .await?;
-        Ok(Db { pool: Pool::Pg(pool), dialect: Dialect::Postgres, sqlite_localtime: false })
+        Ok(Db { pool: Pool::Pg(pool), dialect: Dialect::Postgres, sqlite_localtime: false, mssql_utc: false })
     }
 
     fn prepare(&self, sql: &str) -> String {
-        if self.is_sqlite() {
-            crate::sqlite_compat::rewrite(sql, self.sqlite_localtime)
-        } else {
-            sql.to_string()
+        match self.dialect {
+            Dialect::Sqlite => crate::sqlite_compat::rewrite(sql, self.sqlite_localtime),
+            Dialect::Mssql => crate::mssql_compat::rewrite(sql, self.mssql_utc),
+            Dialect::Postgres => sql.to_string(),
         }
     }
 }
@@ -317,7 +688,7 @@ enum CursorInner {
         tx: sqlx::Transaction<'static, sqlx::Postgres>,
         chunk: usize,
     },
-    Sqlite {
+    Stream {
         rx: tokio::sync::mpsc::Receiver<Result<Vec<Row>>>,
     },
 }
@@ -337,7 +708,7 @@ impl Cursor {
                 let rows = sqlx::query(&q).persistent(false).fetch_all(&mut **tx).await?;
                 Ok(rows.iter().map(decode_pg).collect())
             }
-            CursorInner::Sqlite { rx } => match rx.recv().await {
+            CursorInner::Stream { rx } => match rx.recv().await {
                 Some(res) => res,
                 None => Ok(vec![]),
             },
@@ -386,7 +757,52 @@ impl Db {
                         let _ = tx.send(Ok(buf)).await;
                     }
                 });
-                Ok(Cursor { inner: CursorInner::Sqlite { rx } })
+                Ok(Cursor { inner: CursorInner::Stream { rx } })
+            }
+            Pool::Mssql(pool) => {
+                let pool = pool.clone();
+                let chunk = chunk.max(1);
+                let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<Row>>>(2);
+                tokio::spawn(async move {
+                    let mut conn = match pool.get().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.send(Err(anyhow!("{} -- query: {}", e, q))).await;
+                            return;
+                        }
+                    };
+                    let mut stream = match conn.simple_query(&q).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = tx.send(Err(anyhow!("{} -- query: {}", e, q))).await;
+                            return;
+                        }
+                    };
+                    let mut buf = Vec::with_capacity(chunk);
+                    loop {
+                        match stream.try_next().await {
+                            Ok(Some(QueryItem::Row(r))) => {
+                                buf.push(decode_mssql(&r));
+                                if buf.len() >= chunk {
+                                    let out = std::mem::replace(&mut buf, Vec::with_capacity(chunk));
+                                    if tx.send(Ok(out)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(Some(QueryItem::Metadata(_))) => {}
+                            Ok(None) => break,
+                            Err(e) => {
+                                let _ = tx.send(Err(anyhow!("{} -- query: {}", e, q))).await;
+                                return;
+                            }
+                        }
+                    }
+                    if !buf.is_empty() {
+                        let _ = tx.send(Ok(buf)).await;
+                    }
+                });
+                Ok(Cursor { inner: CursorInner::Stream { rx } })
             }
         }
     }
@@ -405,6 +821,17 @@ impl Db {
                     .map_err(|e| anyhow!("{} -- query: {}", e, q))?;
                 Ok(rows.iter().map(decode_sqlite).collect())
             }
+            Pool::Mssql(pool) => {
+                let mut conn = pool.get().await.map_err(|e| anyhow!("{} -- query: {}", e, q))?;
+                let rows = conn
+                    .simple_query(&q)
+                    .await
+                    .map_err(|e| anyhow!("{} -- query: {}", e, q))?
+                    .into_first_result()
+                    .await
+                    .map_err(|e| anyhow!("{} -- query: {}", e, q))?;
+                Ok(rows.iter().map(decode_mssql).collect())
+            }
         }
     }
 
@@ -421,6 +848,17 @@ impl Db {
                 let row = sqlx::query(&q).persistent(false).fetch_optional(pool).await
                     .map_err(|e| anyhow!("{} -- query: {}", e, q))?;
                 Ok(row.as_ref().map(decode_sqlite))
+            }
+            Pool::Mssql(pool) => {
+                let mut conn = pool.get().await.map_err(|e| anyhow!("{} -- query: {}", e, q))?;
+                let row = conn
+                    .simple_query(&q)
+                    .await
+                    .map_err(|e| anyhow!("{} -- query: {}", e, q))?
+                    .into_row()
+                    .await
+                    .map_err(|e| anyhow!("{} -- query: {}", e, q))?;
+                Ok(row.as_ref().map(decode_mssql))
             }
         }
     }
@@ -439,6 +877,14 @@ impl Db {
                     .map_err(|e| anyhow!("{} -- query: {}", e, q))?;
                 Ok(r.rows_affected())
             }
+            Pool::Mssql(pool) => {
+                let mut conn = pool.get().await.map_err(|e| anyhow!("{} -- query: {}", e, q))?;
+                let r = conn
+                    .execute(&q, &[])
+                    .await
+                    .map_err(|e| anyhow!("{} -- query: {}", e, q))?;
+                Ok(r.total())
+            }
         }
     }
 
@@ -452,6 +898,15 @@ impl Db {
             }
             Pool::Sqlite(pool) => {
                 sqlx::raw_sql(&q).execute(pool).await.map_err(|e| anyhow!("{} -- ddl: {}", e, q))?;
+            }
+            Pool::Mssql(pool) => {
+                let mut conn = pool.get().await.map_err(|e| anyhow!("{} -- ddl: {}", e, q))?;
+                conn.simple_query(&q)
+                    .await
+                    .map_err(|e| anyhow!("{} -- ddl: {}", e, q))?
+                    .into_results()
+                    .await
+                    .map_err(|e| anyhow!("{} -- ddl: {}", e, q))?;
             }
         }
         Ok(())
@@ -474,6 +929,22 @@ impl Db {
             }
             cols.push(ident(k)?);
             vals.push(lit(v));
+        }
+        if self.is_mssql() {
+            // SET NOCOUNT ON + SCOPE_IDENTITY() works even when tables have AFTER INSERT triggers;
+            // reset NOCOUNT OFF afterwards so subsequent exec() calls on the pooled connection report rows_affected().
+            let sql = if cols.is_empty() {
+                format!("set nocount on; insert into {} default values; select cast(scope_identity() as bigint) as id; set nocount off", ident(table)?)
+            } else {
+                format!(
+                    "set nocount on; insert into {} ({}) values ({}); select cast(scope_identity() as bigint) as id; set nocount off",
+                    ident(table)?,
+                    cols.join(","),
+                    vals.join(",")
+                )
+            };
+            let r = self.first(&sql, &no_params()).await?;
+            return r.and_then(|r| r.get("id").and_then(|v| v.as_i64())).ok_or_else(|| anyhow!("insert returned no id"));
         }
         let sql = if cols.is_empty() {
             format!("insert into {} default values returning id", ident(table)?)
@@ -507,6 +978,11 @@ impl Db {
         p.insert("t".into(), Value::String(table.to_string()));
         if self.is_sqlite() {
             self.count("select count(*) from sqlite_master where type='table' and name=:t", &p).await.unwrap_or(0) > 0
+        } else if self.is_mssql() {
+            self.count("select count(*) from information_schema.tables where table_schema=schema_name() and lower(table_name)=lower(:t)", &p)
+                .await
+                .unwrap_or(0)
+                > 0
         } else {
             self.count("select count(*) from information_schema.tables where table_schema='public' and table_name=:t", &p).await.unwrap_or(0) > 0
         }
@@ -518,6 +994,14 @@ impl Db {
         p.insert("c".into(), Value::String(col.to_string()));
         if self.is_sqlite() {
             self.count("select count(*) from pragma_table_info(:t) where lower(name)=lower(:c)", &p).await.unwrap_or(0) > 0
+        } else if self.is_mssql() {
+            self.count(
+                "select count(*) from information_schema.columns where table_schema=schema_name() and lower(table_name)=lower(:t) and lower(column_name)=lower(:c)",
+                &p,
+            )
+            .await
+            .unwrap_or(0)
+                > 0
         } else {
             self.count("select count(*) from information_schema.columns where table_schema='public' and table_name=:t and column_name=:c", &p).await.unwrap_or(0) > 0
         }
@@ -529,6 +1013,14 @@ impl Db {
         p.insert("t".into(), Value::String(table.to_string()));
         if self.is_sqlite() {
             let rows = self.rows("select name as column_name, type as udt_name from pragma_table_info(:t) order by cid", &p).await?;
+            Ok(rows.iter().map(|r| (s(r, "column_name"), s(r, "udt_name"))).collect())
+        } else if self.is_mssql() {
+            let rows = self
+                .rows(
+                    "select column_name as column_name, data_type as udt_name from information_schema.columns where table_schema=schema_name() and lower(table_name)=lower(:t) order by ordinal_position",
+                    &p,
+                )
+                .await?;
             Ok(rows.iter().map(|r| (s(r, "column_name"), s(r, "udt_name"))).collect())
         } else {
             let rows = self.rows("select column_name, udt_name from information_schema.columns where table_schema=current_schema() and table_name=:t order by ordinal_position", &p).await?;
@@ -543,6 +1035,10 @@ impl Db {
         if self.is_sqlite() {
             if !self.column_exists(table, col).await {
                 self.ddl(&format!("alter table {} add column {} {} null", qt, qc, sql_type)).await?;
+            }
+        } else if self.is_mssql() {
+            if !self.column_exists(table, col).await {
+                self.ddl(&format!("alter table {} add {} {} null", qt, qc, sql_type)).await?;
             }
         } else {
             self.ddl(&format!("alter table {} add column if not exists {} {} null", qt, qc, sql_type)).await?;
@@ -866,5 +1362,23 @@ mod tests {
             .await
             .expect("livequiz avg query");
         assert!(avg.is_some());
+    }
+
+    #[test]
+    fn mssql_url_detection_and_parsing() {
+        assert!(is_mssql_url("mssql://sa:Pass%401@localhost:1433/cbmyportal?encrypt=true&trustServerCertificate=true"));
+        assert!(is_mssql_url("sqlserver://sa:pass@db.local\\SQLEXPRESS/portal"));
+        assert!(is_mssql_url("jdbc:sqlserver://localhost:1433;databaseName=cbmyportal;user=sa;password=secret;encrypt=true;trustServerCertificate=true;socketTimeout=300000;"));
+        assert!(is_mssql_url("Server=localhost,1433;Database=cbmyportal;User Id=sa;Password=secret;TrustServerCertificate=true;"));
+        assert!(!is_mssql_url("postgres://postgres@localhost/rustportal"));
+        assert!(!is_mssql_url("sqlite://rustportal.db"));
+
+        let (_, t1) = parse_mssql_config("mssql://sa:P%40ss@localhost:1433/mydb?encrypt=true&trust_cert=true&timeout=45").expect("parse mssql://");
+        assert_eq!(t1, Duration::from_secs(45));
+
+        let (_, t2) = parse_mssql_config("jdbc:sqlserver://localhost:1433;databaseName=cbmyportal;user=sa;password=pw;encrypt=true;trustServerCertificate=true;socketTimeout=120000;").expect("parse jdbc:sqlserver://");
+        assert_eq!(t2, Duration::from_secs(120));
+
+        let (_, _) = parse_mssql_config("Server=localhost,1433;Database=cbmyportal;User Id=sa;Password=pw;TrustServerCertificate=true;").expect("parse ado string");
     }
 }

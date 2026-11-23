@@ -4,7 +4,7 @@ A portal framework for workflow and web systems, written in Rust: dynamic pages
 stored in the database, tracker modules with workflows, and the admin tools around
 them. Modules written for Grails/GSP-based portals can be imported and translated.
 
-Stack: axum, PostgreSQL or embedded SQLite (sqlx), Rhai for scripts, MiniJinja for templates.
+Stack: axum, PostgreSQL / Microsoft SQL Server (tiberius + bb8) / embedded SQLite (sqlx), Active Directory LDAP/LDAPS (ldap3), Rhai for scripts, MiniJinja for templates.
 
 ## Run
 
@@ -18,6 +18,21 @@ built-in SQL compatibility shim translates common PostgreSQL expressions
 (`ILIKE`, `::type` casts, `now()`, `interval '...'`, `EXTRACT(...)`,
 `DATE_TRUNC(...)`, `TO_CHAR(...)`, `STRING_AGG(...)`, `TRUNCATE TABLE`) so
 portal screens and standard modules work out of the box.
+
+### Microsoft SQL Server (MSSQL)
+
+    DATABASE_URL="mssql://sa:dbpassword@localhost:1433/cbmyportal?encrypt=true&trustServerCertificate=true" cargo run --release
+
+Also accepts `sqlserver://...`, g5portal's `jdbc:sqlserver://host:port;databaseName=...;user=...;password=...;encrypt=true;trustServerCertificate=true;` format, and ADO.NET `Server=...;Database=...;` connection strings (including named instances `host\INSTANCE`). A built-in T-SQL compatibility shim (`src/mssql_compat.rs`) translates PostgreSQL idioms (`ILIKE`, `::casts`, `now()`, `interval '...'`, `EXTRACT`, `DATE_TRUNC`, `TO_CHAR`, `IS [NOT] TRUE/FALSE`, `NULLS LAST/FIRST`, `LIMIT`/`OFFSET`, `RETURNING`, Unicode `N'...'`), tracker DDL uses MSSQL `IDENTITY(1,1)` / `nvarchar(max)` / `datetime2` / `bit`, and the tracker admin "Text -> varchar(max)" tool performs the full MSSQL column conversion and table rebuild.
+
+### Active Directory authentication
+
+Matches g5portal's LDAP/LDAPS authentication flow (`src/ad.rs`):
+- Users can log in (and authenticate via HTTP Basic on `/svc/*` endpoints) using either their `userid` (staff ID) or their `lanid` (`sAMAccountName`).
+- When `disable_lanid = false` and `adenable` is enabled, authentication binds with the configured service account across primary and secondary AD domains, searches `(sAMAccountName=<lanid>)`, and binds as the user's DN.
+- Falls back to the account's local bcrypt password unless `enforce_lanid` is on (and `lanidexception` is not set).
+- Configure live via `portal_setting` (`adenable`, `enforce_lanid`, `adtimeout`, `ad_tls_no_verify`, `adserver`/`adport`/`adsecure`/`addn`/`adpassword`/`adbase`, and `*2` for a secondary domain) or in `config.toml` under `[active_directory]`.
+- Admin "Update LAN ID" (`/user/updatelanid/{id}`) and Rhai helpers `ad_lookup(staff_ids)` / `update_lanid(user_id)` query Active Directory by `(employeeID=...)`.
 
 ### PostgreSQL (recommended for production / Grails DB sharing)
 

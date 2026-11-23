@@ -289,7 +289,7 @@ async fn show(mut ctx: Ctx, id: i64) -> Response {
 
     // Fetch module resources
     let fs = db
-        .first("select count(*) as n, coalesce(sum(size),0) as total, count(*) filter (where size is null) as unsized from file_link where module=:m", &p)
+        .first("select count(*) as n, coalesce(sum(cast(size as bigint)),0) as total, coalesce(sum(case when size is null then 1 else 0 end),0) as unsized from file_link where module=:m", &p)
         .await
         .ok()
         .flatten()

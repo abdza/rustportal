@@ -321,8 +321,110 @@ fn sqlite_default(table: &str, col: &str) -> &'static str {
     }
 }
 
+fn mssql_type(k: K) -> Option<&'static str> {
+    Some(match k {
+        K::Str | K::Choice(_) | K::Password => "nvarchar(255)",
+        K::Text | K::Code => "nvarchar(max)",
+        K::Bool => "bit",
+        K::Int => "bigint",
+        K::Date => "datetime2",
+        K::Ref(_) => "bigint",
+        K::Multi(..) => return None,
+    })
+}
+
+fn mssql_default(table: &str, col: &str) -> &'static str {
+    match (table, col) {
+        ("portal_user", "is_admin") => " default 0",
+        ("portal_user", "is_active") => " default 1",
+        ("portal_user", "reset_password") => " default 0",
+        ("portal_user", "email") => " default ''",
+        _ => "",
+    }
+}
+
 /// Create missing tables and add missing columns. Never drops or alters.
 pub async fn sync_schema(db: &Db, ents: &[Entity]) -> Result<()> {
+    if db.is_mssql() {
+        for e in ents {
+            let mut cols = vec!["\"id\" bigint identity(1,1) primary key".to_string(), "\"version\" bigint not null default 0".to_string()];
+            for f in &e.fields {
+                match f.kind {
+                    K::Multi(_, join, own, other) => {
+                        if !db.table_exists(join).await {
+                            db.ddl(&format!("create table \"{}\" (\"{}\" bigint not null, \"{}\" bigint not null)", join, own, other)).await?;
+                        }
+                    }
+                    k => {
+                        let t = if e.table == "file_link" && f.name == "path" { "nvarchar(max)" } else { mssql_type(k).unwrap() };
+                        let def = mssql_default(e.table, f.name);
+                        cols.push(format!("\"{}\" {} null{}", f.name, t, def));
+                    }
+                }
+            }
+            if !db.table_exists(e.table).await {
+                db.ddl(&format!("create table \"{}\" ({})", e.table, cols.join(", "))).await?;
+            } else {
+                // Add any columns introduced since the table was first created.
+                let existing: Vec<String> = db.table_columns(e.table).await?.into_iter().map(|(c, _)| c.to_ascii_lowercase()).collect();
+                for f in &e.fields {
+                    if matches!(f.kind, K::Multi(..)) {
+                        continue;
+                    }
+                    if !existing.iter().any(|c| c == &f.name.to_ascii_lowercase()) {
+                        let t = if e.table == "file_link" && f.name == "path" { "nvarchar(max)" } else { mssql_type(f.kind).unwrap() };
+                        let def = mssql_default(e.table, f.name);
+                        db.ddl(&format!("alter table \"{}\" add \"{}\" {} null{}", e.table, f.name, t, def)).await?;
+                    }
+                }
+                // Tables created by Hibernate (g5portal) often have NOT NULL version without a default.
+                let v = db
+                    .first(
+                        "select column_default, is_nullable from information_schema.columns where table_schema=schema_name() and lower(table_name)=lower(:t) and lower(column_name)='version'",
+                        &crate::row! {"t"=>e.table},
+                    )
+                    .await?;
+                if let Some(c) = v {
+                    if c.get("column_default").map(|x| x.is_null()).unwrap_or(true) {
+                        let cname = format!("df_{}_version", e.table);
+                        let _ = db
+                            .ddl(&format!("alter table \"{}\" add constraint \"{}\" default 0 for \"version\"", e.table, cname))
+                            .await;
+                    }
+                }
+            }
+        }
+        if !db.table_exists("portal_session").await {
+            db.ddl("create table \"portal_session\" (\"id\" nvarchar(80) primary key, \"data\" nvarchar(max), \"updated\" datetime2 default getdate())").await?;
+        }
+        let page_ix = format!("ix_{}_ms", crate::db::page_t());
+        let idxs: Vec<(&str, &str, &str)> = vec![
+            ("ix_user_role_user", "user_role", "\"user_id\""),
+            ("ix_ptf_tracker", "portal_tracker_field", "\"tracker_id\""),
+            ("ix_pts_tracker", "portal_tracker_status", "\"tracker_id\""),
+            ("ix_ptt_tracker", "portal_tracker_transition", "\"tracker_id\""),
+            ("ix_ptr_tracker", "portal_tracker_role", "\"tracker_id\""),
+            ("ix_tracker_ms", "portal_tracker", "\"module\", \"slug\""),
+            ("ix_filelink_ms", "file_link", "\"module\", \"slug\""),
+            ("ix_audit_date", "portal_audit_trail", "\"date\""),
+            ("ix_portal_tree_node_tree", "portal_tree_node", "\"tree_id\", \"lft\""),
+        ];
+        for (ix, tbl, cols) in idxs {
+            db.ddl(&format!(
+                "if not exists (select 1 from sys.indexes where name='{ix}' and object_id=object_id('{tbl}')) create nonclustered index \"{ix}\" on \"{tbl}\" ({cols})"
+            ))
+            .await?;
+        }
+        let pt = crate::db::page_t();
+        db.ddl(&format!(
+            "if not exists (select 1 from sys.indexes where name='{ix}' and object_id=object_id('{pt}')) create nonclustered index \"{ix}\" on \"{pt}\" (\"module\", \"slug\")",
+            ix = page_ix,
+            pt = pt
+        ))
+        .await?;
+        return Ok(());
+    }
+
     if db.is_sqlite() {
         for e in ents {
             let mut cols = vec!["id integer primary key autoincrement".to_string(), "version bigint not null default 0".to_string()];

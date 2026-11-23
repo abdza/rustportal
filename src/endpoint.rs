@@ -50,11 +50,17 @@ pub async fn serve(ctx: Ctx, module: String, slug: String, rest: String) -> Resp
             let creds = ctx.headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Basic "))
                 .and_then(|x| base64::engine::general_purpose::STANDARD.decode(x).ok()).and_then(|x| String::from_utf8(x).ok());
             let mut ok = false;
-            if let Some((u, p)) = creds.as_deref().and_then(|c| c.split_once(':')) {
-                if let Some(user) = web::find_user_by_staffid(ctx.db(), u).await {
-                    if b(&user, "is_active") && bcrypt::verify(p, &s(&user, "password")).unwrap_or(false) && role_ok(&ctx, &ep, &user).await {
-                        ok = true;
-                        remote_user = u.to_string();
+            if let Some(raw_creds) = creds.as_deref() {
+                if let Some((u, p)) = raw_creds.split_once(':') {
+                    if let Some(user) = web::find_user_for_login(ctx.db(), u).await {
+                        let via = format!("endpoint {}/{}", s(&ep, "module"), s(&ep, "slug"));
+                        if b(&user, "is_active")
+                            && crate::ad::endpoint_basic_check(&ctx.st, &user, raw_creds, p, &via).await
+                            && role_ok(&ctx, &ep, &user).await
+                        {
+                            ok = true;
+                            remote_user = s(&user, "userid");
+                        }
                     }
                 }
             }

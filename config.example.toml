@@ -3,6 +3,9 @@ port = 9090
 address = "0.0.0.0"
 # PostgreSQL (recommended for production / sharing a DB with a Grails portal):
 database_url = "postgres://postgres@localhost/rustportal"
+# Microsoft SQL Server (supports mssql://, sqlserver://, g5portal's jdbc:sqlserver://, or ADO.NET Server=...):
+# database_url = "mssql://sa:dbpassword@localhost:1433/cbmyportal?encrypt=true&trustServerCertificate=true"
+# database_url = "jdbc:sqlserver://localhost:1433;databaseName=cbmyportal;user=sa;password=dbpassword;encrypt=true;trustServerCertificate=true;socketTimeout=300000;"
 # Or use embedded SQLite for zero-setup single-file deployment (no DB server needed):
 # database_url = "sqlite://rustportal.db"
 upload_dir = "uploads"
@@ -40,6 +43,8 @@ app_name = "Portal"
 # link on "Designed by <app name> Team" in the footer
 # credits_url = "https://example.com/"
 allow_registration = false
+# Set true to disable Active Directory authentication completely (local passwords only, matching g5portal's server.disable_lanid):
+disable_lanid = false
 session_hours = 12
 # Optional: session inactivity timeout in minutes (overrides session_hours;
 # can also be overridden live via Settings -> portal.session_minutes)
@@ -51,6 +56,35 @@ port = 1025
 from = "portal@localhost"
 # starttls = true
 disabled = false
+
+# Active Directory (LDAP / LDAPS) authentication, matching g5portal.
+# Every field here can also be set or overridden live via portal_setting using the
+# same keys as g5portal: adenable, enforce_lanid, adtimeout, ad_tls_no_verify,
+# adserver / adport / adsecure / addn / adpassword / adbase (primary domain), and
+# adserver2 / adport2 / adsecure2 / addn2 / adpassword2 / adbase2 (secondary domain).
+# [active_directory]
+# enabled = false
+# enforce_lanid = false
+# timeout_ms = 5000
+# tls_no_verify = true
+#
+# [[active_directory.domains]]
+# label = "primary"
+# server = "ldaps.domain1.example.com"
+# port = 636
+# secure = true
+# bind_dn = "CN=svc_ldap,OU=LdapService,DC=domain1,DC=example,DC=com"
+# bind_password = "service_password"
+# base_dn = "DC=domain1,DC=example,DC=com"
+#
+# [[active_directory.domains]]
+# label = "secondary"
+# server = "ldaps.domain2.example.com"
+# port = 636
+# secure = true
+# bind_dn = "CN=svc_ldap,OU=Application Usage,DC=domain2,DC=example,DC=com"
+# bind_password = "service_password"
+# base_dn = "DC=domain2,DC=example,DC=com"
 
 # [google_oauth]
 # client_id = ""

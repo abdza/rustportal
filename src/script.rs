@@ -635,6 +635,22 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
     reg!("user_by_staffid", |x, sid: &str| api_user_staff(x, sid));
     reg!("user_by_userid", |x, sid: &str| api_user_staff(x, sid));
     reg!("users_with_role", |x, m: &str, r: &str| api_users_with_role(x, m, r));
+    // Active Directory helpers (matching g5portal User.adLookup / User.updatelanid)
+    reg!("ad_lookup", |x, ids: Dynamic| async move {
+        let list: Vec<String> = match d2j(&ids) {
+            Value::Array(a) => a.iter().map(vs).collect(),
+            Value::String(s) => vec![s],
+            _ => vec![],
+        };
+        Ok(crate::ad::ad_lookup(&x.st, &list, 40).await)
+    });
+    reg!("update_lanid", |x, uid: i64| async move {
+        let Some(u) = x.db().get("portal_user", uid).await? else { return Ok(Value::Null) };
+        match crate::ad::update_user_lanid(&x.st, &u).await? {
+            Some(lanid) => Ok(json!(lanid)),
+            None => Ok(Value::Null),
+        }
+    });
     // may the current user open page module/slug (its allowedroles, as the router checks
     // them)? () when there is no such page
     reg!("page_allowed", |x, m: &str, sl: &str| async move {

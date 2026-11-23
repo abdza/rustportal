@@ -188,8 +188,8 @@ fn written_table(head: &str) -> Option<String> {
     if name == "only" {
         name = words.next()?;
     }
-    // strip the column list "(", schema and quotes
-    let name = name.split('(').next()?.rsplit('.').next()?.trim_matches('"').to_string();
+    // strip the column list "(", schema and quotes/brackets
+    let name = name.split('(').next()?.rsplit('.').next()?.trim_matches(|c| matches!(c, '"' | '[' | ']')).to_string();
     if name.is_empty() { None } else { Some(name) }
 }
 

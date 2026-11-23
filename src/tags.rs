@@ -239,7 +239,7 @@ if(df=='Before'){{$('#{n}').val(a?('<'+a):'');}}else if(df=='After'){{$('#{n}').
                 }
             }
         } else if ftype == "User" {
-            let q = format!("select d.v, u.name from ({}) d left join portal_user u on u.id::text = d.v::text order by d.v", distinct.replace(" order by ", " order by ").trim_end());
+            let q = format!("select d.v, u.name from (select distinct {c} as v from {tb}) d left join portal_user u on u.id::text = d.v::text order by d.v", c = qcol(&name), tb = table);
             for r in sc.db().rows(&q, &Row::new()).await.unwrap_or_default() {
                 o.push_str(&opt(&s(&r, "v"), &s(&r, "name"), &cur));
             }
