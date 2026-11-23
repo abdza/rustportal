@@ -651,6 +651,109 @@ fn build_engine(inner: &Arc<Inner>) -> Engine {
             None => Ok(Value::Null),
         }
     });
+    // Source Code Management (scm module) helpers
+    reg!("scm_default_repo_root", |x| async move { Ok(json!(crate::scm::default_repo_root(x.db()).await)) });
+    reg!("scm_portal_base_url", |x| async move {
+        let rb = x.base.lock().unwrap().clone();
+        Ok(crate::scm::portal_base_url(x.db(), None, &rb).await.map(|v| json!(v)).unwrap_or(Value::Null))
+    });
+    reg!("scm_portal_base_url", |x, pref: Dynamic| async move {
+        let rb = x.base.lock().unwrap().clone();
+        let p = if pref.is_unit() { None } else { Some(pref.to_string()) };
+        Ok(crate::scm::portal_base_url(x.db(), p.as_deref(), &rb).await.map(|v| json!(v)).unwrap_or(Value::Null))
+    });
+    reg!("scm_clone_url", |x, repo: Dynamic| async move {
+        let rb = x.base.lock().unwrap().clone();
+        Ok(crate::scm::clone_url_for(x.db(), &obj(d2j(&repo)), None, &rb).await.map(|v| json!(v)).unwrap_or(Value::Null))
+    });
+    reg!("scm_clone_url", |x, repo: Dynamic, base: Dynamic| async move {
+        let rb = x.base.lock().unwrap().clone();
+        let b = if base.is_unit() { None } else { Some(base.to_string()) };
+        Ok(crate::scm::clone_url_for(x.db(), &obj(d2j(&repo)), b.as_deref(), &rb).await.map(|v| json!(v)).unwrap_or(Value::Null))
+    });
+    reg!("scm_configure", |x, repo: Dynamic, hook_url: Dynamic| async move {
+        let _ = x;
+        let hu = if hook_url.is_unit() { None } else { Some(hook_url.to_string()) };
+        Ok(Box::pin(crate::scm::configure_repo(&obj(d2j(&repo)), hu.as_deref())).await)
+    });
+    reg!("scm_verify", |x, repo: Dynamic| async move { Ok(Box::pin(crate::scm::verify(x.db(), &obj(d2j(&repo)))).await) });
+    reg!("scm_poll", |x, repo: Dynamic, source: &str| async move {
+        Ok(Box::pin(crate::scm::poll(x.db(), &obj(d2j(&repo)), x.uid(), source, 30)).await)
+    });
+    reg!("scm_poll", |x, repo: Dynamic, source: &str, lock_wait: i64| async move {
+        Ok(Box::pin(crate::scm::poll(x.db(), &obj(d2j(&repo)), x.uid(), source, lock_wait.max(1) as u64)).await)
+    });
+    reg!("scm_approve", |x, repo: Dynamic, change: Dynamic| async move {
+        Ok(Box::pin(crate::scm::approve(x.db(), &obj(d2j(&repo)), &obj(d2j(&change)), x.user.as_ref(), 60)).await)
+    });
+    reg!("scm_approve", |x, repo: Dynamic, change: Dynamic, lock_wait: i64| async move {
+        Ok(Box::pin(crate::scm::approve(x.db(), &obj(d2j(&repo)), &obj(d2j(&change)), x.user.as_ref(), lock_wait.max(1) as u64)).await)
+    });
+    reg!("scm_dependency_check", |x, repo: Dynamic, change: Dynamic| async move {
+        Ok(Box::pin(crate::scm::dependency_check(x.db(), &obj(d2j(&repo)), &obj(d2j(&change)))).await)
+    });
+    reg!("scm_provision", |x, opts: Dynamic| async move {
+        let rb = x.base.lock().unwrap().clone();
+        Ok(Box::pin(crate::scm::provision(x.db(), &obj(d2j(&opts)), x.uid(), &rb)).await)
+    });
+    reg!("scm_browsable_rev", |x, repo: Dynamic, rev: Dynamic| async move {
+        let rv = if rev.is_unit() { None } else { Some(rev.to_string()) };
+        Ok(crate::scm::browsable_rev(x.db(), &obj(d2j(&repo)), rv.as_deref()).await.unwrap_or(Value::Null))
+    });
+    reg!("scm_browse_tree", |x, repo: Dynamic, rev: &str, path: Dynamic| async move {
+        let _ = x;
+        let p = if path.is_unit() { None } else { Some(path.to_string()) };
+        Ok(crate::scm::browse_tree(&obj(d2j(&repo)), rev, p.as_deref()).await)
+    });
+    reg!("scm_browse_file", |x, repo: Dynamic, rev: &str, path: Dynamic| async move {
+        let _ = x;
+        let p = if path.is_unit() { None } else { Some(path.to_string()) };
+        Ok(crate::scm::browse_file(&obj(d2j(&repo)), rev, p.as_deref(), crate::scm::MAX_DIFF).await)
+    });
+    reg!("scm_browse_file", |x, repo: Dynamic, rev: &str, path: Dynamic, max_chars: i64| async move {
+        let _ = x;
+        let p = if path.is_unit() { None } else { Some(path.to_string()) };
+        Ok(crate::scm::browse_file(&obj(d2j(&repo)), rev, p.as_deref(), max_chars.max(1) as usize).await)
+    });
+    reg!("scm_browse_log", |x, repo: Dynamic, rev: &str, path: Dynamic, limit: i64, offset: i64| async move {
+        let _ = x;
+        let p = if path.is_unit() { None } else { Some(path.to_string()) };
+        Ok(crate::scm::browse_log(&obj(d2j(&repo)), rev, p.as_deref(), limit.max(1) as usize, offset.max(0) as usize).await)
+    });
+    reg!("scm_browse_commit", |x, repo: Dynamic, rev: &str| async move {
+        let _ = x;
+        Ok(crate::scm::browse_commit(&obj(d2j(&repo)), rev, crate::scm::MAX_DIFF).await)
+    });
+    reg!("scm_browse_commit", |x, repo: Dynamic, rev: &str, max_chars: i64| async move {
+        let _ = x;
+        Ok(crate::scm::browse_commit(&obj(d2j(&repo)), rev, max_chars.max(1) as usize).await)
+    });
+    reg!("scm_browse_search", |x, repo: Dynamic, rev: &str, q: &str, mode: &str, limit: i64, depth: i64| async move {
+        let _ = x;
+        Ok(crate::scm::browse_search(&obj(d2j(&repo)), rev, q, mode, limit.max(1) as usize, depth.max(0) as usize).await)
+    });
+    e.register_fn("scm_safe_path", |p: Dynamic| -> Dynamic {
+        let raw = if p.is_unit() { None } else { Some(p.to_string()) };
+        match crate::scm::safe_path(raw.as_deref()) {
+            Some(s) => Dynamic::from(s),
+            None => Dynamic::UNIT,
+        }
+    });
+    e.register_fn("scm_check_repo_path", |p: &str| -> Dynamic {
+        match crate::scm::check_repo_path(p) {
+            Some(msg) => Dynamic::from(msg),
+            None => Dynamic::UNIT,
+        }
+    });
+    e.register_fn("scm_constant_time_eq", |a: &str, b: &str| -> bool {
+        crate::endpoint::constant_time_eq(a.as_bytes(), b.as_bytes())
+    });
+    e.register_fn("scm_endpoint_slug", |repo: Dynamic| -> String {
+        crate::scm::Vcs::from_repo(&obj(d2j(&repo))).endpoint_slug().to_string()
+    });
+    e.register_fn("scm_diff_html", |raw: &str, max_lines: i64| -> String {
+        crate::scm::diff_html(raw, max_lines.max(1) as usize)
+    });
     // may the current user open page module/slug (its allowedroles, as the router checks
     // them)? () when there is no such page
     reg!("page_allowed", |x, m: &str, sl: &str| async move {
@@ -1521,6 +1624,14 @@ impl Sc {
         env.add_function("request_path", move || path.clone());
         let x = self.inner.clone();
         env.add_function("request_base", move || x.base.lock().unwrap().clone());
+        func!("scm_default_repo_root", |x, a, kw| async move {
+            let _ = (a, kw);
+            Ok(MV::from(crate::scm::default_repo_root(x.db()).await))
+        });
+        env.add_function("scm_diff_html", |raw: MV, max_lines: Option<i64>| -> MV {
+            let s = if raw.is_undefined() || raw.is_none() { String::new() } else { raw.to_string() };
+            MV::from_safe_string(crate::scm::diff_html(&s, max_lines.unwrap_or(4000).max(1) as usize))
+        });
         let x = self.inner.clone();
         env.add_function("session_get", move |k: String| -> MV {
             if SESSION_RESERVED.contains(&k.as_str()) {

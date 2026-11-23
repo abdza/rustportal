@@ -336,7 +336,10 @@ async fn show_extras(ctx: &mut Ctx, e: &Entity, r: &Row) -> String {
     let mut o = String::new();
     match e.name {
         "portalErrorLog" => o.push_str(&post_button(ctx, &format!("/portalErrorLog/resolve/{}", id), "Mark resolved", "btn-outline-primary", None)),
-        "portalEndpoint" => o.push_str(&format!("<code>/svc/{}/{}</code> ", esc(&s(r, "module")), esc(&s(r, "slug")))),
+        "portalEndpoint" => {
+            o.push_str(&format!("<code>/svc/{}/{}</code> ", esc(&s(r, "module")), esc(&s(r, "slug"))));
+            o.push_str(&crate::endpoint::check_target_html(r));
+        }
         "portalModuleAccessReview" => o.push_str(&post_button(ctx, &format!("/portalModuleAccessReview/approve/{}", id), "Approve review", "btn-outline-success", Some("Confirm that the access list of this module is correct?"))),
         _ => {}
     }

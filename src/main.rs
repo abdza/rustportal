@@ -23,6 +23,7 @@ mod mssql_compat;
 mod oauth;
 mod page;
 mod scheduler;
+mod scm;
 mod script;
 mod sqlite_compat;
 mod tags;
@@ -216,8 +217,9 @@ async fn dispatch(State(_st): State<St>, ctx: Ctx) -> Response {
         ["run", m, sl, rest @ ..] => page::runpage(ctx, m, sl, rest.iter().map(|x| x.to_string()).collect()).await,
         ["download", sl] => files::download(ctx, "portal", sl).await,
         ["download", m, sl] => files::download(ctx, m, sl).await,
-        ["svc", m, sl, rest @ ..] => {
-            let r = if rest.is_empty() { String::new() } else { format!("/{}", rest.join("/")) };
+        ["svc", m, sl, ..] => {
+            let prefix = format!("/svc/{}/{}", m, sl);
+            let r = ctx.path.strip_prefix(&prefix).unwrap_or("").to_string();
             endpoint::serve(ctx, m.to_string(), sl.to_string(), r).await
         }
         [c, rest @ ..] if ctx.st.entity(c).is_some() || SPECIAL.contains(c) => {
@@ -254,8 +256,15 @@ async fn dispatch(State(_st): State<St>, ctx: Ctx) -> Response {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let mut argv: Vec<String> = std::env::args().collect();
     if argv.get(1).map(|x| x.as_str()) == Some("--") {
         argv.remove(1);
