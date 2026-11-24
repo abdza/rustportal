@@ -1632,6 +1632,14 @@ impl Sc {
             let s = if raw.is_undefined() || raw.is_none() { String::new() } else { raw.to_string() };
             MV::from_safe_string(crate::scm::diff_html(&s, max_lines.unwrap_or(4000).max(1) as usize))
         });
+        env.add_function("scm_file_icon", |name: MV, is_dir: Option<bool>| -> MV {
+            let s = if name.is_undefined() || name.is_none() { String::new() } else { name.to_string() };
+            MV::from_safe_string(crate::scm::file_icon_html(&s, is_dir.unwrap_or(false)))
+        });
+        env.add_function("scm_file_type", |name: MV, is_dir: Option<bool>| -> String {
+            let s = if name.is_undefined() || name.is_none() { String::new() } else { name.to_string() };
+            crate::scm::file_type_label(&s, is_dir.unwrap_or(false))
+        });
         let x = self.inner.clone();
         env.add_function("session_get", move |k: String| -> MV {
             if SESSION_RESERVED.contains(&k.as_str()) {

@@ -231,6 +231,113 @@ pub fn diff_html(raw: &str, max_lines: usize) -> String {
     out
 }
 
+/// Return a Bootstrap Icons `<i>` tag with an appropriate icon and colour for a
+/// repository folder or file (by extension or well-known filename).
+pub fn file_icon_html(name: &str, is_dir: bool) -> String {
+    let (cls, color) = if is_dir {
+        ("bi-folder-fill", "#e3a008")
+    } else {
+        let base = name.rsplit('/').next().unwrap_or(name);
+        let base = base.rsplit('\\').next().unwrap_or(base);
+        let low = base.to_ascii_lowercase();
+        let ext = low.rsplit_once('.').map(|(pre, e)| if pre.is_empty() { "" } else { e }).unwrap_or("");
+        match ext {
+            // Web / templates
+            "html" | "htm" | "xhtml" | "gsp" | "jsp" | "ejs" | "hbs" | "ftl" | "jinja" | "jinja2" | "j2" | "vue" | "svelte" => ("bi-filetype-html", "#e34c26"),
+            "css" | "less" => ("bi-filetype-css", "#264de4"),
+            "scss" => ("bi-filetype-scss", "#c6538c"),
+            "sass" => ("bi-filetype-sass", "#c6538c"),
+            "js" | "mjs" | "cjs" => ("bi-filetype-js", "#d4a017"),
+            "jsx" => ("bi-filetype-jsx", "#0ea5e9"),
+            "ts" | "mts" | "cts" | "tsx" => ("bi-filetype-tsx", "#3178c6"),
+            // Backend / JVM / systems / scripting
+            "java" => ("bi-filetype-java", "#b07219"),
+            "groovy" | "gradle" => ("bi-file-earmark-code", "#4298b8"),
+            "kt" | "kts" => ("bi-file-earmark-code", "#7f52ff"),
+            "rs" => ("bi-file-earmark-code", "#c2410c"),
+            "go" => ("bi-file-earmark-code", "#00add8"),
+            "rhai" => ("bi-file-earmark-code", "#6f42c1"),
+            "py" | "pyw" | "pyi" | "cgi" | "wsgi" => ("bi-filetype-py", "#3572a5"),
+            "rb" | "rake" | "gemspec" => ("bi-filetype-rb", "#cc342d"),
+            "php" | "phtml" => ("bi-filetype-php", "#6e5494"),
+            "cs" | "csx" => ("bi-filetype-cs", "#178600"),
+            "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "swift" | "scala" | "dart" | "lua" | "pl" | "pm" | "r" | "m" | "mm" | "zig" | "nim" | "ex" | "exs" | "erl" | "hs" | "clj" | "vb" | "vbs" => ("bi-file-earmark-code", "#4f46e5"),
+            "sh" | "bash" | "zsh" | "ksh" | "fish" | "bat" | "cmd" | "ps1" | "psm1" | "psd1" => ("bi-filetype-sh", "#2e7d32"),
+            "sql" | "ddl" | "dml" | "plsql" => ("bi-filetype-sql", "#0284c7"),
+            // Data / config / markup
+            "json" | "jsonc" | "json5" => ("bi-filetype-json", "#ca8a04"),
+            "yml" | "yaml" => ("bi-filetype-yml", "#cb171e"),
+            "xml" | "xsd" | "xsl" | "xslt" | "pom" | "plist" | "csproj" | "vbproj" | "fsproj" | "sln" | "config" | "wsdl" => ("bi-filetype-xml", "#ea580c"),
+            "toml" | "ini" | "cfg" | "conf" | "properties" | "env" => ("bi-file-earmark-ruled", "#64748b"),
+            "md" | "markdown" => ("bi-filetype-md", "#0969da"),
+            "mdx" => ("bi-filetype-mdx", "#0969da"),
+            "csv" | "tsv" => ("bi-filetype-csv", "#15803d"),
+            "txt" | "log" | "rst" | "adoc" | "text" => ("bi-filetype-txt", "#57606a"),
+            "lock" => ("bi-file-earmark-lock", "#64748b"),
+            "diff" | "patch" => ("bi-file-earmark-diff", "#0f766e"),
+            // Office / documents
+            "pdf" => ("bi-filetype-pdf", "#dc2626"),
+            "doc" => ("bi-filetype-doc", "#1d4ed8"),
+            "docx" | "odt" | "rtf" => ("bi-filetype-docx", "#1d4ed8"),
+            "xls" => ("bi-filetype-xls", "#15803d"),
+            "xlsx" | "xlsm" | "ods" => ("bi-filetype-xlsx", "#15803d"),
+            "ppt" => ("bi-filetype-ppt", "#c2410c"),
+            "pptx" | "odp" => ("bi-filetype-pptx", "#c2410c"),
+            // Images / media / fonts
+            "png" => ("bi-filetype-png", "#7c3aed"),
+            "jpg" | "jpeg" => ("bi-filetype-jpg", "#7c3aed"),
+            "gif" => ("bi-filetype-gif", "#7c3aed"),
+            "svg" => ("bi-filetype-svg", "#d97706"),
+            "bmp" => ("bi-filetype-bmp", "#7c3aed"),
+            "tif" | "tiff" => ("bi-filetype-tiff", "#7c3aed"),
+            "psd" => ("bi-filetype-psd", "#2563eb"),
+            "ai" => ("bi-filetype-ai", "#ea580c"),
+            "heic" | "heif" => ("bi-filetype-heic", "#7c3aed"),
+            "webp" | "ico" | "icns" | "avif" | "raw" => ("bi-file-earmark-image", "#7c3aed"),
+            "mp3" => ("bi-filetype-mp3", "#db2777"),
+            "wav" => ("bi-filetype-wav", "#db2777"),
+            "aac" => ("bi-filetype-aac", "#db2777"),
+            "ogg" | "flac" | "m4a" | "wma" => ("bi-file-earmark-music", "#db2777"),
+            "mp4" => ("bi-filetype-mp4", "#db2777"),
+            "mov" => ("bi-filetype-mov", "#db2777"),
+            "avi" | "mkv" | "webm" | "wmv" | "flv" | "m4v" => ("bi-file-earmark-play", "#db2777"),
+            "ttf" => ("bi-filetype-ttf", "#6b7280"),
+            "otf" => ("bi-filetype-otf", "#6b7280"),
+            "woff" | "woff2" => ("bi-filetype-woff", "#6b7280"),
+            "eot" => ("bi-file-earmark-font", "#6b7280"),
+            // Archives / binaries / keys
+            "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "jar" | "war" | "ear" | "apk" | "deb" | "rpm" | "nupkg" => ("bi-file-earmark-zip", "#b45309"),
+            "exe" | "msi" => ("bi-filetype-exe", "#475569"),
+            "dll" | "so" | "dylib" | "bin" | "class" | "o" | "a" | "obj" | "lib" | "pyc" | "pyo" | "wasm" | "db" | "sqlite" | "sqlite3" | "dat" => ("bi-file-earmark-binary", "#475569"),
+            "key" | "pem" | "crt" | "cer" | "pub" | "p12" | "pfx" | "jks" | "keystore" => ("bi-filetype-key", "#b91c1c"),
+            _ => match low.as_str() {
+                "dockerfile" | "makefile" | "jenkinsfile" | "vagrantfile" | "procfile" | "rakefile" | "gemfile" | "gradlew" | "mvnw" => ("bi-file-earmark-code", "#0284c7"),
+                ".gitignore" | ".hgignore" | ".dockerignore" | ".editorconfig" | ".gitattributes" | ".htaccess" | ".env" | ".npmrc" | ".nvmrc" | ".hgrc" | ".babelrc" | ".eslintrc" | ".prettierrc" => ("bi-file-earmark-ruled", "#64748b"),
+                "license" | "licence" | "copying" | "notice" | "authors" | "readme" | "changelog" | "todo" => ("bi-file-earmark-text", "#57606a"),
+                _ if low.starts_with("dockerfile.") => ("bi-file-earmark-code", "#0284c7"),
+                _ if low.starts_with(".env.") => ("bi-file-earmark-ruled", "#64748b"),
+                _ => ("bi-file-earmark", "#57606a"),
+            },
+        }
+    };
+    format!("<i class=\"bi {}\" style=\"color:{};margin-right:6px\" aria-hidden=\"true\"></i>", cls, color)
+}
+
+/// Human-friendly file type label for the SCM explorer table.
+pub fn file_type_label(name: &str, is_dir: bool) -> String {
+    if is_dir {
+        return "Folder".to_string();
+    }
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let base = base.rsplit('\\').next().unwrap_or(base);
+    if let Some((pre, ext)) = base.rsplit_once('.') {
+        if !pre.is_empty() && !ext.is_empty() && ext.len() <= 10 {
+            return ext.to_ascii_uppercase();
+        }
+    }
+    "File".to_string()
+}
+
 /// Validate a repository filesystem path for `scm_repository.repo_path`.
 pub fn check_repo_path(path: &str) -> Option<String> {
     let p = path.trim();
@@ -2926,22 +3033,64 @@ mod tests {
         let hook_out = sc_ok.eval(&s(&hook_page, "content"), &Row::new()).unwrap();
         assert!(hook_out.as_str().unwrap().starts_with("ok: Raised 1 change request"), "hook_out: {}", hook_out);
 
-        // 3. Check segregation of duties in Approve's enabledcondition:
-        //    Alice (pusher) MUST NOT see Approve; Bob (checker) MUST see Approve!
+        // 3. Check validation gate & segregation of duties:
+        //    - Alice (pusher) cannot validate or approve her own push.
+        //    - Bob (approver) cannot approve before at least 1 validation.
+        //    - Multiple other users (Carol & Dave) can validate once each.
+        //    - Once validated, Bob can approve and merge into main.
+        let carol_id = st.db.insert("portal_user", &row! {"userid"=>"carol", "name"=>"Carol User", "email"=>"carol@example.com", "is_active"=>true, "is_admin"=>false}).await.unwrap();
+        let dave_id = st.db.insert("portal_user", &row! {"userid"=>"dave", "name"=>"Dave User", "email"=>"dave@example.com", "is_active"=>true, "is_admin"=>false}).await.unwrap();
+        st.db.insert("user_role", &row! {"user_id"=>carol_id, "module"=>"scm", "role"=>"User"}).await.unwrap();
+        st.db.insert("user_role", &row! {"user_id"=>dave_id, "module"=>"scm", "role"=>"User"}).await.unwrap();
+        let carol = st.db.first("select * from portal_user where id=:id", &row! {"id"=>carol_id}).await.unwrap().unwrap();
+        let dave = st.db.first("select * from portal_user where id=:id", &row! {"id"=>dave_id}).await.unwrap().unwrap();
+
         let cr_t = Tracker::load(&st.db, "scm", "scm_change").await.unwrap();
         let cr = cr_t.first_row(&st.db, Some(&row! {"repository_id"=>repo_id}), None).await.unwrap().unwrap();
         let cr_id = i(&cr, "id").unwrap();
         assert_eq!(i(&cr, "pushed_by"), Some(alice_id), "Alice should be mapped by email");
 
+        let validate_tr = cr_t.transitions.iter().find(|t| t.name == "Validate").unwrap();
         let approve_tr = cr_t.transitions.iter().find(|t| t.name == "Approve").unwrap();
         let sc_alice = crate::script::Sc::new(st.clone(), Some(alice.clone()), Row::new(), "t".into(), "/".into());
         let sc_bob = crate::script::Sc::new(st.clone(), Some(bob.clone()), Row::new(), "t".into(), "/".into());
-        assert!(!cr_t.test_enabled(&sc_alice, approve_tr, Some(&cr)).await, "pusher must not be allowed to approve own push!");
-        assert!(cr_t.test_enabled(&sc_bob, approve_tr, Some(&cr)).await, "checker must be allowed to approve!");
+        let sc_carol = crate::script::Sc::new(st.clone(), Some(carol.clone()), Row::new(), "t".into(), "/".into());
+        let sc_dave = crate::script::Sc::new(st.clone(), Some(dave.clone()), Row::new(), "t".into(), "/".into());
 
-        // 4. Run post_scm_approve as Bob -> settles CR to Merged
+        // Before validation: pusher cannot validate/approve; Bob cannot approve yet; Carol can validate.
+        assert!(!cr_t.test_enabled(&sc_alice, validate_tr, Some(&cr)).await, "pusher must not validate own push!");
+        assert!(!cr_t.test_enabled(&sc_alice, approve_tr, Some(&cr)).await, "pusher must not approve own push!");
+        assert!(!cr_t.test_enabled(&sc_bob, approve_tr, Some(&cr)).await, "approver must not approve before validation!");
+        assert!(cr_t.test_enabled(&sc_carol, validate_tr, Some(&cr)).await, "another user must be allowed to validate!");
+
+        // Server-side post_scm_approve also refuses unvalidated CR
         let post_app = crate::page::find_page(&st.db, "scm", "post_scm_approve").await.unwrap();
-        sc_bob.eval(&s(&post_app, "content"), &row! {"datas"=>Value::Object(cr.clone())}).expect("post_scm_approve");
+        sc_bob.eval(&s(&post_app, "content"), &row! {"datas"=>Value::Object(cr.clone())}).expect("post_scm_approve unvalidated");
+        assert_eq!(s(&cr_t.get(&st.db, cr_id).await.unwrap(), "record_status"), "Pending Review");
+
+        // 4a. Carol validates -> status becomes Validated (1), Carol can no longer validate again, Dave still can!
+        let post_val = crate::page::find_page(&st.db, "scm", "post_scm_validate").await.unwrap();
+        let mut cr_v1_in = cr_t.get(&st.db, cr_id).await.unwrap();
+        cr_v1_in.insert("validation_remarks".into(), json!("Checked locally, LGTM"));
+        sc_carol.eval(&s(&post_val, "content"), &row! {"datas"=>Value::Object(cr_v1_in)}).expect("post_scm_validate carol");
+        let cr_v1 = cr_t.get(&st.db, cr_id).await.unwrap();
+        assert_eq!(s(&cr_v1, "record_status"), "Validated");
+        assert_eq!(i(&cr_v1, "validation_count"), Some(1));
+        assert!(!cr_t.test_enabled(&sc_carol, validate_tr, Some(&cr_v1)).await, "same user must not validate twice!");
+        assert!(cr_t.test_enabled(&sc_dave, validate_tr, Some(&cr_v1)).await, "second user must still be able to validate!");
+        assert!(cr_t.test_enabled(&sc_bob, approve_tr, Some(&cr_v1)).await, "approver must be allowed to approve after >=1 validation!");
+
+        // 4b. Dave also validates -> validation_count becomes 2
+        let mut cr_v2_in = cr_v1.clone();
+        cr_v2_in.insert("validation_remarks".into(), json!("Second pair of eyes ok"));
+        sc_dave.eval(&s(&post_val, "content"), &row! {"datas"=>Value::Object(cr_v2_in)}).expect("post_scm_validate dave");
+        let cr_v2 = cr_t.get(&st.db, cr_id).await.unwrap();
+        assert_eq!(s(&cr_v2, "record_status"), "Validated");
+        assert_eq!(i(&cr_v2, "validation_count"), Some(2));
+        assert!(!cr_t.test_enabled(&sc_alice, approve_tr, Some(&cr_v2)).await, "pusher still cannot approve own push!");
+
+        // 4c. Run post_scm_approve as Bob -> settles CR to Merged
+        sc_bob.eval(&s(&post_app, "content"), &row! {"datas"=>Value::Object(cr_v2.clone())}).expect("post_scm_approve");
         let cr_after = cr_t.get(&st.db, cr_id).await.unwrap();
         assert_eq!(s(&cr_after, "record_status"), "Merged");
 
@@ -2952,6 +3101,7 @@ mod tests {
         assert!(rshow.contains("Payments"));
         let (_, cshow) = render(&bob, "scm_change_show_default", row! {"id"=>cr_id}, row! {"datas"=>Value::Object(cr_after.clone())}).await;
         assert!(cshow.contains("Add README"));
+        assert!(cshow.contains("Carol User") && cshow.contains("Dave User"), "change page should list both validators");
 
         let cs_t = Tracker::load(&st.db, "scm", "scm_changeset").await.unwrap();
         let cs = cs_t.first_row(&st.db, Some(&row! {"change_id"=>cr_id}), None).await.unwrap().unwrap();
@@ -2961,9 +3111,13 @@ mod tests {
         for view in ["tree", "log", "commit"] {
             let (_, html) = render(&bob, "explore", row! {"repo"=>"payments", "view"=>view}, Row::new()).await;
             assert!(html.contains("Payments"), "explore view={} failed", view);
+            if view == "tree" || view == "commit" {
+                assert!(html.contains("bi-filetype-md"), "expected markdown icon in explore view={}", view);
+            }
         }
         let (_, fhtml) = render(&bob, "explore", row! {"repo"=>"payments", "view"=>"file", "path"=>"README.md"}, Row::new()).await;
         assert!(fhtml.contains("# Payments"));
+        assert!(fhtml.contains("bi-filetype-md"));
         for mode in ["content", "messages", "history"] {
             let (_, shtml) = render(&bob, "explore", row! {"repo"=>"payments", "view"=>"search", "q"=>"hello", "mode"=>mode}, Row::new()).await;
             assert!(shtml.contains("Payments"), "explore search mode={} failed", mode);
@@ -2988,5 +3142,24 @@ mod tests {
         assert!(errs_ok.is_empty(), "valid emails should pass validation: {:?}", errs_ok);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn file_icons_and_types() {
+        assert!(file_icon_html("src", true).contains("bi-folder-fill"));
+        assert_eq!(file_type_label("src", true), "Folder");
+        assert!(file_icon_html("Main.java", false).contains("bi-filetype-java"));
+        assert_eq!(file_type_label("Main.java", false), "JAVA");
+        assert!(file_icon_html("app/views/index.gsp", false).contains("bi-filetype-html"));
+        assert!(file_icon_html("src/endpoint.rs", false).contains("bi-file-earmark-code"));
+        assert!(file_icon_html("hgweb.cgi", false).contains("bi-filetype-py"));
+        assert!(file_icon_html("Dockerfile", false).contains("bi-file-earmark-code"));
+        assert_eq!(file_type_label("Dockerfile", false), "File");
+        assert!(file_icon_html(".gitignore", false).contains("bi-file-earmark-ruled"));
+        assert_eq!(file_type_label(".gitignore", false), "File");
+        assert!(file_icon_html("archive.zip", false).contains("bi-file-earmark-zip"));
+        assert!(file_icon_html("report.xlsx", false).contains("bi-filetype-xlsx"));
+        assert!(file_icon_html("logo.png", false).contains("bi-filetype-png"));
+        assert!(file_icon_html("unknown.xyz123", false).contains("bi-file-earmark"));
     }
 }

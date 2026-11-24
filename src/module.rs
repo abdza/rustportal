@@ -25,6 +25,7 @@ pub struct ExportOpts {
     pub roles: bool,
     pub trees: bool,
     pub menus: bool,
+    pub endpoints: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -166,7 +167,7 @@ async fn page_slug(db: &Db, id: Option<i64>) -> Value {
 
 pub async fn export(st: &St, module: &str, with_roles: bool) -> Result<PathBuf> {
     let dir = folder(st, module);
-    export_to(st, module, &dir, ExportOpts { files: false, roles: with_roles, trees: true, menus: false }).await?;
+    export_to(st, module, &dir, ExportOpts { files: false, roles: with_roles, trees: true, menus: false, endpoints: false }).await?;
     Ok(dir)
 }
 
@@ -426,17 +427,21 @@ pub async fn export_to(st: &St, module: &str, dir: &Path, opts: ExportOpts) -> R
     } else {
         let _ = std::fs::remove_file(dir.join("schedulerlist.json"));
     }
-    let eps = db.rows("select * from portal_endpoint where module=:m order by slug", &row! {"m"=>module}).await?;
-    if !eps.is_empty() {
-        let earr: Vec<Value> = eps
-            .iter()
-            .map(|x| {
-                let mut o = pick(x, ENDPOINT_KEYS);
-                o.insert("had_auth_token".into(), json!(!s(x, "auth_token").is_empty()));
-                Value::Object(o)
-            })
-            .collect();
-        write_json(&dir.join("endpointlist.json"), &Value::Array(earr))?;
+    if opts.endpoints {
+        let eps = db.rows("select * from portal_endpoint where module=:m order by slug", &row! {"m"=>module}).await?;
+        if !eps.is_empty() {
+            let earr: Vec<Value> = eps
+                .iter()
+                .map(|x| {
+                    let mut o = pick(x, ENDPOINT_KEYS);
+                    o.insert("had_auth_token".into(), json!(!s(x, "auth_token").is_empty()));
+                    Value::Object(o)
+                })
+                .collect();
+            write_json(&dir.join("endpointlist.json"), &Value::Array(earr))?;
+        } else {
+            let _ = std::fs::remove_file(dir.join("endpointlist.json"));
+        }
     } else {
         let _ = std::fs::remove_file(dir.join("endpointlist.json"));
     }
@@ -1641,5 +1646,51 @@ mod tests {
         eprintln!("real grails zips: {} ok, failures: {:?}", ok, bad);
         let _ = std::fs::remove_dir_all(&base);
         assert!(bad.is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_and_import_endpoints_opt_in() {
+        use std::sync::{Arc, Mutex};
+        let base = tmpdir("ep_opt");
+        let db_path = base.join("test.db");
+        let db = Db::connect(&format!("sqlite://{}", db_path.display()), 2, None).await.unwrap();
+        let entities = crate::entity::entities();
+        crate::entity::sync_schema(&db, &entities).await.unwrap();
+        db.insert("portal_endpoint", &row! {
+            "module" => "scm", "slug" => "hg", "name" => "Prod HG", "handler_type" => "CGI",
+            "target" => "C:\\Python39\\python.exe D:\\scm\\hgweb.cgi", "auth_mode" => "Basic", "enabled" => true,
+        }).await.unwrap();
+        let st: St = Arc::new(crate::web::AppState {
+            db: db.clone(),
+            cfg: crate::web::Config::default(),
+            entities,
+            excel_jobs: Mutex::new(HashMap::new()),
+            rt: tokio::runtime::Handle::current(),
+        });
+
+        let out_dir = base.join("scm_export");
+        // Export WITHOUT endpoints -> no endpointlist.json
+        export_to(&st, "scm", &out_dir, ExportOpts { endpoints: false, ..Default::default() }).await.unwrap();
+        assert!(!out_dir.join("endpointlist.json").exists(), "endpointlist.json should not be exported when endpoints=false");
+
+        // Export WITH endpoints -> endpointlist.json is written
+        export_to(&st, "scm", &out_dir, ExportOpts { endpoints: true, ..Default::default() }).await.unwrap();
+        assert!(out_dir.join("endpointlist.json").is_file(), "endpointlist.json should be exported when endpoints=true");
+
+        // Re-export WITHOUT endpoints -> stale endpointlist.json is removed
+        export_to(&st, "scm", &out_dir, ExportOpts { endpoints: false, ..Default::default() }).await.unwrap();
+        assert!(!out_dir.join("endpointlist.json").exists(), "stale endpointlist.json should be removed when endpoints=false");
+
+        // Importing a package with a different endpointlist.json when opts.endpoints=false preserves prod endpoint
+        std::fs::write(
+            out_dir.join("endpointlist.json"),
+            r#"[{"module":"scm","slug":"hg","name":"Linux HG","handler_type":"CGI","target":"/usr/bin/python3 /srv/hgweb.cgi","auth_mode":"Basic","enabled":false}]"#,
+        ).unwrap();
+        import_from_opts(&st, "scm", &out_dir, &ImportOpts { endpoints: false, ..Default::default() }).await.unwrap();
+        let ep = db.first("select * from portal_endpoint where module='scm' and slug='hg'", &Row::new()).await.unwrap().unwrap();
+        assert_eq!(s(&ep, "target"), "C:\\Python39\\python.exe D:\\scm\\hgweb.cgi");
+        assert!(b(&ep, "enabled"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -243,6 +243,7 @@ fn action_bar(id: i64, name: &str, csrf: &str, is_admin: bool, is_dev: bool, suf
             "<label for='files{s}'>Files:</label><input type=\"checkbox\" name=\"files\" id=\"files{s}\" /> \
              <label for='trees{s}'>Trees:</label><input type=\"checkbox\" name=\"trees\" id=\"trees{s}\" title=\"Include this module's trees in the export. On import trees are taken whenever the package has them.\" /> \
              <label for='menus{s}'>Menus:</label><input type=\"checkbox\" name=\"menus\" id=\"menus{s}\" title=\"Include this module's menu entries in the export, so importing it elsewhere can wire up the megamenu and sidebar.\" /> \
+             <label for='endpoints{s}'>Endpoints:</label><input type=\"checkbox\" name=\"endpoints\" id=\"endpoints{s}\" title=\"Include this module's HTTP endpoints in the export/import. Leave unticked to keep existing server endpoints untouched.\" /> \
              <label for='user{s}'>{user_lbl}</label><input type=\"checkbox\" name=\"user\" id=\"user{s}\" /> \
              <a class=\"edit\" href=\"/portalModule/edit/{id}\">Edit</a> \
              <input class=\"delete\" type=\"submit\" name=\"op\" value=\"Export\" onclick=\"return confirm('Export module {qn}?');\" /> ",
@@ -1152,13 +1153,14 @@ async fn delete_or_op(mut ctx: Ctx, id: i64) -> Response {
     let user_on = ctx.params.contains_key("user");
     let tree_on = ctx.params.contains_key("trees");
     let menu_on = ctx.params.contains_key("menus");
+    let ep_on = ctx.params.contains_key("endpoints");
 
     if op == "Export" {
         if !is_dev_of(&ctx, &name).await {
             return ctx.status(StatusCode::FORBIDDEN, "Not allowed").await;
         }
         let dir = folder(&ctx.st, &name);
-        let opts = ExportOpts { files: file_on, roles: user_on, trees: tree_on, menus: menu_on };
+        let opts = ExportOpts { files: file_on, roles: user_on, trees: tree_on, menus: menu_on, endpoints: ep_on };
         return match export_to(&ctx.st, &name, &dir, opts).await {
             Ok(()) => {
                 let d2 = dir.clone();
@@ -1183,6 +1185,9 @@ async fn delete_or_op(mut ctx: Ctx, id: i64) -> Response {
         }
         if user_on {
             qs.push("staff=on");
+        }
+        if ep_on {
+            qs.push("endpoints=on");
         }
         let suffix = if qs.is_empty() { String::new() } else { format!("?{}", qs.join("&")) };
         return ctx.redirect(&format!("/portalModule/importpreview/{id}{suffix}")).await;
@@ -1324,7 +1329,7 @@ async fn importform(mut ctx: Ctx) -> Response {
             }
             mid
         };
-        return ctx.redirect(&format!("/portalModule/importpreview/{mod_id}?files=on&staff=on")).await;
+        return ctx.redirect(&format!("/portalModule/importpreview/{mod_id}?files=on&staff=on&endpoints=on")).await;
     }
 
     let csrf = ctx.csrf_field();
@@ -1388,8 +1393,10 @@ async fn importpreview(mut ctx: Ctx, id: i64) -> Response {
     let staff_on = !ctx.p("staff").is_empty() && (dir.join("userrolelist.json").is_file() || dir.join("userroles.json").is_file());
     let tree_on = dir.join("treelist.json").is_file();
     let menu_on = dir.join("menulist.json").is_file();
+    let endpoints_present = dir.join("endpointlist.json").is_file();
+    let endpoints_on = !ctx.p("endpoints").is_empty() && endpoints_present && ctx.is_admin();
 
-    let diff = match generate_import_diff(&ctx, &name, ExportOpts { files: file_on, roles: staff_on, trees: tree_on, menus: menu_on }).await {
+    let diff = match generate_import_diff(&ctx, &name, ExportOpts { files: file_on, roles: staff_on, trees: tree_on, menus: menu_on, endpoints: endpoints_present }).await {
         Ok(d) => d,
         Err(e) => {
             ctx.flash(&format!("Error generating import diff: {}", e));
@@ -1414,6 +1421,16 @@ async fn importpreview(mut ctx: Ctx, id: i64) -> Response {
          <span class=\"property-value\">Puts the module in the header megamenu and gives its pages a sidebar. Entries this module added before are updated or removed to match; anything you added by hand is left alone.</span></div>"
     } else {
         ""
+    };
+    let endpoints_box = if endpoints_present && ctx.is_admin() {
+        let chk = if endpoints_on { " checked=\"checked\"" } else { "" };
+        format!(
+            "<div class=\"fieldcontain\" style=\"margin-bottom:1em;\">\
+             <label for=\"endpoints\"><input type=\"checkbox\" name=\"endpoints\" id=\"endpoints\" value=\"on\"{chk}/> Import this module's HTTP endpoints</label>\
+             <span class=\"property-value\">Updates this module's endpoints from <code>endpointlist.json</code>. Untick to keep existing endpoints configured on this server.</span></div>"
+        )
+    } else {
+        String::new()
     };
 
     let settings_html = if !settings.is_empty() {
@@ -1496,12 +1513,13 @@ async fn importpreview(mut ctx: Ctx, id: i64) -> Response {
   <h1>Import Preview: {ename}</h1>
   {flash_html}
   <p>Review the changes below before importing. Lines starting with <span style="color:#cf222e;">-</span> show the current state that will be replaced, lines starting with <span style="color:#1a7f37;">+</span> show the incoming changes.
-  <br/>Importing files: <strong>{f_yn}</strong>, staff roles: <strong>{s_yn}</strong>, trees: <strong>{t_yn}</strong>{tree_note}</p>
+  <br/>Importing files: <strong>{f_yn}</strong>, staff roles: <strong>{s_yn}</strong>, trees: <strong>{t_yn}</strong>{tree_note}, endpoints: <strong>{e_yn}</strong></p>
   {diff_html}
   <form action="/portalModule/confirmimport/{id}" method="POST">
     {csrf}
     {f_hid}{s_hid}
     {menu_box}
+    {endpoints_box}
     {settings_html}
     {sched_html}
     <fieldset class="form">
@@ -1520,6 +1538,7 @@ async fn importpreview(mut ctx: Ctx, id: i64) -> Response {
         f_yn = if file_on { "Yes" } else { "No" },
         s_yn = if staff_on { "Yes" } else { "No" },
         t_yn = if tree_on { "Yes" } else { "No" },
+        e_yn = if endpoints_on { "Yes" } else { "No" },
         tree_note = if tree_on && !staff_on { " (structure only, no role holders)" } else { "" },
         f_hid = if file_on { "<input type=\"hidden\" name=\"files\" value=\"on\"/>" } else { "" },
         s_hid = if staff_on { "<input type=\"hidden\" name=\"staff\" value=\"on\"/>" } else { "" },
@@ -1551,8 +1570,11 @@ async fn confirmimport(mut ctx: Ctx, id: i64) -> Response {
     let tree_on = dir.join("treelist.json").is_file();
     let menu_present = dir.join("menulist.json").is_file();
     let menu_on = !ctx.p("menus").is_empty() && menu_present;
-    let endpoints_on = ctx.is_admin();
-    let endpoints_skipped = dir.join("endpointlist.json").is_file() && !endpoints_on;
+    let endpoints_present = dir.join("endpointlist.json").is_file();
+    let endpoints_wanted = !ctx.p("endpoints").is_empty() && endpoints_present;
+    let endpoints_on = ctx.is_admin() && endpoints_wanted;
+    let endpoints_skipped_perm = endpoints_present && !ctx.is_admin();
+    let endpoints_skipped_unticked = endpoints_present && ctx.is_admin() && !endpoints_wanted;
 
     let mut setting_choices = HashMap::new();
     let mut scheduler_choices = HashMap::new();
@@ -1574,7 +1596,7 @@ async fn confirmimport(mut ctx: Ctx, id: i64) -> Response {
     let mut kept_sch: Vec<String> = scheduler_choices.iter().filter(|(_, v)| v.as_str() == "keep").map(|(k, _)| k.clone()).collect();
     kept_sch.sort();
 
-    let mut difftext = generate_import_diff(&ctx, &name, ExportOpts { files: file_on, roles: staff_on, trees: tree_on, menus: menu_present })
+    let mut difftext = generate_import_diff(&ctx, &name, ExportOpts { files: file_on, roles: staff_on, trees: tree_on, menus: menu_present, endpoints: endpoints_on })
         .await
         .unwrap_or_default();
     if !kept_set.is_empty() {
@@ -1583,8 +1605,11 @@ async fn confirmimport(mut ctx: Ctx, id: i64) -> Response {
     if !kept_sch.is_empty() {
         difftext = format!("Schedules kept as they are on this server (not imported):\n  {}\n\n{}", kept_sch.join("\n  "), difftext);
     }
-    if endpoints_skipped {
+    if endpoints_skipped_perm {
         difftext = format!("Endpoints in this package were NOT imported: only a system administrator can bring them in.\n\n{}", difftext);
+    }
+    if endpoints_skipped_unticked {
+        difftext = format!("Endpoints in this package were NOT imported, because the endpoints box was unticked.\n\n{}", difftext);
     }
     if menu_present && !menu_on {
         difftext = format!("Menu entries in this package were NOT imported, because the menu box was unticked.\n\n{}", difftext);
@@ -1626,8 +1651,11 @@ async fn confirmimport(mut ctx: Ctx, id: i64) -> Response {
             if !kept_sch.is_empty() {
                 notes.push(format!("{} schedule(s) kept as already set here", kept_sch.len()));
             }
-            if endpoints_skipped {
+            if endpoints_skipped_perm {
                 notes.push("endpoints not imported - a system administrator has to do that".into());
+            }
+            if endpoints_skipped_unticked {
+                notes.push("endpoints kept as already set here".into());
             }
             if menu_present && !menu_on {
                 notes.push("menu entries not added".into());

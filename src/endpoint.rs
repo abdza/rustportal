@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use serde_json::Value;
 use std::path::Path;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Splits a CGI `target` into argv on spaces, honouring double quotes.
 /// Matches g5portal's `PortalEndpoint.argv`: allows naming an interpreter ahead of
@@ -238,7 +238,7 @@ pub async fn serve(ctx: Ctx, module: String, slug: String, rest: String) -> Resp
             }
         }
     }
-    let timeout = std::time::Duration::from_secs(i(&ep, "timeout_seconds").unwrap_or(300).clamp(1, 3600) as u64);
+    let timeout = std::time::Duration::from_secs(i(&ep, "timeout_seconds").unwrap_or(300).clamp(1, 86400) as u64);
     let ctype = ctx.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     if s(&ep, "handler_type") == "Proxy" {
         let url = format!("{}{}{}", s(&ep, "target").trim_end_matches('/'), rest, if ctx.query.is_empty() { String::new() } else { format!("?{}", ctx.query) });
@@ -285,20 +285,39 @@ pub async fn serve(ctx: Ctx, module: String, slug: String, rest: String) -> Resp
         .env("REQUEST_METHOD", &ctx.method)
         .env("PATH_INFO", &path_info)
         .env("QUERY_STRING", &ctx.query)
-        .env("CONTENT_TYPE", &ctype)
         .env("REMOTE_ADDR", &ctx.ip)
         .env("REMOTE_USER", &remote_user)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(windows)]
+    for k in ["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "PATHEXT", "SYSTEMDRIVE", "PROGRAMDATA"] {
+        if let Ok(v) = std::env::var(k) {
+            cmd.env(k, v);
+        }
+    }
+    #[cfg(unix)]
+    if let Ok(v) = std::env::var("TMPDIR") {
+        cmd.env("TMPDIR", v);
+    }
+    if !ctype.is_empty() {
+        cmd.env("CONTENT_TYPE", &ctype);
+    }
     if !ctx.body.is_empty() || ctx.headers.contains_key(header::CONTENT_LENGTH) {
         cmd.env("CONTENT_LENGTH", ctx.body.len().to_string());
     }
-    // Forward all request headers (except Authorization) as HTTP_* (required by hgweb / wire protocols).
+    // Forward request headers as HTTP_* (required by hgweb / wire protocols).
+    // Omit Authorization, Content-Type, Content-Length (RFC 3875 §4.1.18), and
+    // Expect (the HTTP server already handled 100-continue; forwarding it makes
+    // hgweb's wsgicgi prepend a stray "Status: 100 Continue" to stdout).
     let mut http_hdrs: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
     for (k, v) in &ctx.headers {
-        if k == header::AUTHORIZATION {
+        if k == header::AUTHORIZATION
+            || k == header::CONTENT_TYPE
+            || k == header::CONTENT_LENGTH
+            || k == header::EXPECT
+        {
             continue;
         }
         if let Ok(val) = v.to_str() {
@@ -333,34 +352,161 @@ pub async fn serve(ctx: Ctx, module: String, slug: String, rest: String) -> Resp
         Err(e) => return plain(StatusCode::INTERNAL_SERVER_ERROR, &format!("Cannot start handler: {}", e)),
     };
     if let Some(mut stdin) = child.stdin.take() {
-        let body = ctx.body.clone();
+        let body = ctx.body;
         tokio::spawn(async move {
             let _ = stdin.write_all(&body).await;
             let _ = stdin.shutdown().await;
         });
     }
-    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(o)) => {
-            if !o.stderr.is_empty() {
-                let err = String::from_utf8_lossy(&o.stderr);
+    // Drain stderr concurrently so the CGI child never blocks on a full stderr pipe buffer.
+    let stderr_task = child.stderr.take().map(|mut err_pipe| {
+        tokio::spawn(async move {
+            let mut captured = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = err_pipe.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                if captured.len() < 4096 {
+                    let take = (4096 - captured.len()).min(n);
+                    captured.extend_from_slice(&buf[..take]);
+                }
+            }
+            captured
+        })
+    });
+    let Some(mut stdout) = child.stdout.take() else {
+        return plain(StatusCode::INTERNAL_SERVER_ERROR, "Cannot read handler output");
+    };
+
+    // Read CGI response headers incrementally so large responses (e.g. `hg clone` / `git clone`)
+    // begin streaming to the client immediately instead of buffering the entire payload in RAM.
+    const MAX_CGI_HEAD: usize = 64 * 1024;
+    let mut hdr_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 8192];
+    let mut eof = false;
+    let mut split: Option<(usize, usize)> = None;
+    let head_deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tokio::time::timeout_at(head_deadline, stdout.read(&mut tmp)).await {
+            Ok(Ok(0)) => {
+                eof = true;
+                break;
+            }
+            Ok(Ok(n)) => {
+                hdr_buf.extend_from_slice(&tmp[..n]);
+                split = find_cgi_header_end(&hdr_buf);
+                if split.is_some() || hdr_buf.len() >= MAX_CGI_HEAD {
+                    break;
+                }
+            }
+            Ok(Err(e)) => {
+                let _ = child.kill().await;
+                log_cgi_stderr(&module, &slug, stderr_task).await;
+                return plain(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                log_cgi_stderr(&module, &slug, stderr_task).await;
+                return plain(StatusCode::GATEWAY_TIMEOUT, "Handler timed out");
+            }
+        }
+    }
+
+    if hdr_buf.is_empty() {
+        let _ = child.wait().await;
+        log_cgi_stderr(&module, &slug, stderr_task).await;
+        return plain(StatusCode::BAD_GATEWAY, "Endpoint produced no response");
+    }
+
+    let (head, leftover) = match split {
+        Some((p, n)) => (String::from_utf8_lossy(&hdr_buf[..p]).to_string(), hdr_buf[p + n..].to_vec()),
+        None => (String::new(), hdr_buf),
+    };
+
+    if eof {
+        let _ = child.wait().await;
+        log_cgi_stderr(&module, &slug, stderr_task).await;
+        return build_cgi_response_with_body(&head, axum::body::Body::from(leftover));
+    }
+
+    // Stream remaining stdout chunks directly to the HTTP response with an inactivity timeout
+    // per chunk; dropping the response (e.g. client disconnect) drops `child` (kill_on_drop).
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+    let log_mod = module.clone();
+    let log_slug = slug.clone();
+    tokio::spawn(async move {
+        if !leftover.is_empty() && tx.send(Ok(axum::body::Bytes::from(leftover))).await.is_err() {
+            return;
+        }
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            match tokio::time::timeout(timeout, stdout.read(&mut chunk)).await {
+                Ok(Ok(0)) => {
+                    let _ = child.wait().await;
+                    log_cgi_stderr(&log_mod, &log_slug, stderr_task).await;
+                    break;
+                }
+                Ok(Ok(n)) => {
+                    if tx.send(Ok(axum::body::Bytes::copy_from_slice(&chunk[..n]))).await.is_err() {
+                        let _ = child.kill().await;
+                        break;
+                    }
+                }
+                Ok(Err(e)) => {
+                    let _ = child.kill().await;
+                    log_cgi_stderr(&log_mod, &log_slug, stderr_task).await;
+                    let _ = tx.send(Err(e)).await;
+                    break;
+                }
+                Err(_) => {
+                    let _ = child.kill().await;
+                    eprintln!("[endpoint {}/{}] stream timed out after {}s of inactivity", log_mod, log_slug, timeout.as_secs());
+                    log_cgi_stderr(&log_mod, &log_slug, stderr_task).await;
+                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Handler timed out"))).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    build_cgi_response_with_body(&head, axum::body::Body::from_stream(RxStream(rx)))
+}
+
+struct RxStream(tokio::sync::mpsc::Receiver<Result<axum::body::Bytes, std::io::Error>>);
+
+impl futures_util::Stream for RxStream {
+    type Item = Result<axum::body::Bytes, std::io::Error>;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_recv(cx)
+    }
+}
+
+async fn log_cgi_stderr(module: &str, slug: &str, task: Option<tokio::task::JoinHandle<Vec<u8>>>) {
+    if let Some(t) = task {
+        if let Ok(Ok(raw)) = tokio::time::timeout(std::time::Duration::from_secs(2), t).await {
+            if !raw.is_empty() {
+                let err = String::from_utf8_lossy(&raw);
                 let clip: String = err.chars().take(2000).collect();
                 eprintln!("[endpoint {}/{}] stderr: {}", module, slug, clip.trim());
             }
-            o.stdout
         }
-        Ok(Err(e)) => return plain(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        Err(_) => return plain(StatusCode::GATEWAY_TIMEOUT, "Handler timed out"),
-    };
-    if out.is_empty() {
-        return plain(StatusCode::BAD_GATEWAY, "Endpoint produced no response");
     }
-    // split CGI headers from the body
-    let split = out.windows(4).position(|w| w == b"\r\n\r\n").map(|p| (p, 4)).or_else(|| out.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2)));
-    let (head, body) = match split {
-        Some((p, n)) => (String::from_utf8_lossy(&out[..p]).to_string(), out[p + n..].to_vec()),
-        None => (String::new(), out),
-    };
-    let mut resp = body.into_response();
+}
+
+fn find_cgi_header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| (p, 4))
+        .or_else(|| buf.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2)))
+}
+
+fn build_cgi_response_with_body(head: &str, body: axum::body::Body) -> Response {
+    // Construct an empty-header response rather than `Vec<u8>::into_response()`, which
+    // pre-populates `content-type: application/octet-stream` and would produce a
+    // duplicate Content-Type header ahead of the CGI script's own Content-Type.
+    let mut resp = Response::new(body);
     for line in head.lines() {
         if let Some((k, v)) = line.split_once(':') {
             if k.eq_ignore_ascii_case("status") {
@@ -373,6 +519,15 @@ pub async fn serve(ctx: Ctx, module: String, slug: String, rest: String) -> Resp
         }
     }
     resp
+}
+
+#[cfg(test)]
+fn build_cgi_response(out: Vec<u8>) -> Response {
+    let (head, body) = match find_cgi_header_end(&out) {
+        Some((p, n)) => (String::from_utf8_lossy(&out[..p]).to_string(), out[p + n..].to_vec()),
+        None => (String::new(), out),
+    };
+    build_cgi_response_with_body(&head, axum::body::Body::from(body))
 }
 
 #[cfg(test)]
@@ -395,5 +550,169 @@ mod tests {
         assert!(constant_time_eq(b"secret123", b"secret123"));
         assert!(!constant_time_eq(b"secret123", b"secret124"));
         assert!(!constant_time_eq(b"secret123", b"secret12"));
+    }
+
+    #[test]
+    fn cgi_response_has_single_content_type_from_script() {
+        let raw = b"Status: 200 Script output follows\r\nContent-Type: application/mercurial-0.1\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        let resp = build_cgi_response(raw);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cts: Vec<&str> = resp.headers().get_all(header::CONTENT_TYPE).iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(cts, vec!["application/mercurial-0.1"]);
+    }
+
+    #[tokio::test]
+    async fn hgweb_cgi_clone_and_push_over_http() {
+        use axum::routing::any;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let has_hg = tokio::process::Command::new("hg").arg("--version").output().await.map(|o| o.status.success()).unwrap_or(false);
+        let has_hgweb = tokio::process::Command::new("python3")
+            .args(["-c", "from mercurial.hgweb import hgweb, wsgicgi"])
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_hg || !has_hgweb {
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join(format!("rp_hgweb_test_{}_{}", std::process::id(), crate::web::token()));
+        let repos_dir = tmp.join("repos");
+        let repo = repos_dir.join("g5portal");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |cmd: &str, args: &[&str], dir: &Path| {
+            let o = std::process::Command::new(cmd).args(args).current_dir(dir).output().unwrap();
+            assert!(o.status.success(), "{} {:?} failed: {}", cmd, args, String::from_utf8_lossy(&o.stderr));
+        };
+        run("hg", &["init"], &repo);
+        std::fs::write(repo.join("hello.txt"), "initial\n").unwrap();
+        run("hg", &["add", "hello.txt"], &repo);
+        run("hg", &["commit", "-m", "init", "-u", "tester"], &repo);
+
+        let cfg_path = repos_dir.join("hgweb.config");
+        std::fs::write(&cfg_path, format!("[paths]\n/ = {}/*\n\n[web]\nallow-push = *\npush_ssl = false\n", repos_dir.display())).unwrap();
+        let cgi_path = repos_dir.join("hgweb.cgi");
+        std::fs::write(
+            &cgi_path,
+            "import os\nfrom mercurial.hgweb import hgweb, wsgicgi\napplication = hgweb(os.environ['HGWEB_CONFIG'].encode('utf-8'))\nwsgicgi.launch(application)\n",
+        ).unwrap();
+
+        let db_path = tmp.join("test.db");
+        let db = crate::db::Db::connect(&format!("sqlite://{}", db_path.display()), 2, None).await.unwrap();
+        let entities = crate::entity::entities();
+        crate::entity::sync_schema(&db, &entities).await.unwrap();
+        db.insert("portal_endpoint", &row! {
+            "module" => "scm", "slug" => "hg", "name" => "HG", "handler_type" => "CGI",
+            "target" => format!("python3 {}", cgi_path.display()),
+            "working_dir" => repos_dir.to_string_lossy().to_string(),
+            "env_json" => serde_json::json!({"HGWEB_CONFIG": cfg_path.to_string_lossy(), "HGENCODING": "UTF-8"}).to_string(),
+            "auth_mode" => "None",
+            "enabled" => true,
+        }).await.unwrap();
+
+        let st: crate::web::St = Arc::new(crate::web::AppState {
+            db,
+            cfg: crate::web::Config::default(),
+            entities,
+            excel_jobs: Mutex::new(HashMap::new()),
+            rt: tokio::runtime::Handle::current(),
+        });
+        let app = axum::Router::new()
+            .fallback(any(|ctx: Ctx| async move {
+                let r = ctx.path.strip_prefix("/svc/scm/hg").unwrap_or("").to_string();
+                serve(ctx, "scm".to_string(), "hg".to_string(), r).await
+            }))
+            .with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let clone_dir = tmp.join("cloned");
+        let url = format!("http://{}/svc/scm/hg/g5portal", addr);
+        let cl = tokio::process::Command::new("hg")
+            .args(["clone", &url, clone_dir.to_str().unwrap()])
+            .output()
+            .await
+            .unwrap();
+        assert!(cl.status.success(), "hg clone failed:\nstdout: {}\nstderr: {}", String::from_utf8_lossy(&cl.stdout), String::from_utf8_lossy(&cl.stderr));
+        assert_eq!(std::fs::read_to_string(clone_dir.join("hello.txt")).unwrap(), "initial\n");
+
+        // Also verify hg push (which sends POST with Expect: 100-continue)
+        std::fs::write(clone_dir.join("pushed.txt"), "from clone\n").unwrap();
+        run("hg", &["add", "pushed.txt"], &clone_dir);
+        run("hg", &["commit", "-m", "push test", "-u", "tester"], &clone_dir);
+        let ps = tokio::process::Command::new("hg")
+            .args(["push"])
+            .current_dir(&clone_dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(ps.status.success(), "hg push failed:\nstdout: {}\nstderr: {}", String::from_utf8_lossy(&ps.stdout), String::from_utf8_lossy(&ps.stderr));
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn cgi_streams_large_output_beyond_per_chunk_timeout() {
+        use axum::routing::any;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let has_py = tokio::process::Command::new("python3").arg("--version").output().await.map(|o| o.status.success()).unwrap_or(false);
+        if !has_py {
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join(format!("rp_stream_test_{}_{}", std::process::id(), crate::web::token()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let script = tmp.join("slow_stream.py");
+        std::fs::write(
+            &script,
+            "import sys, time\nsys.stdout.buffer.write(b'Status: 200 OK\\r\\nContent-Type: application/octet-stream\\r\\n\\r\\n')\nsys.stdout.buffer.flush()\nfor i in range(4):\n    time.sleep(0.45)\n    sys.stdout.buffer.write(f'chunk-{i}\\n'.encode())\n    sys.stdout.buffer.flush()\n",
+        ).unwrap();
+
+        let db_path = tmp.join("test.db");
+        let db = crate::db::Db::connect(&format!("sqlite://{}", db_path.display()), 2, None).await.unwrap();
+        let entities = crate::entity::entities();
+        crate::entity::sync_schema(&db, &entities).await.unwrap();
+        // timeout_seconds=1, total script runtime ~1.8s across 4 chunks -> would 504 if buffered!
+        db.insert("portal_endpoint", &row! {
+            "module" => "scm", "slug" => "stream", "name" => "Stream", "handler_type" => "CGI",
+            "target" => format!("python3 {}", script.display()),
+            "auth_mode" => "None",
+            "timeout_seconds" => 1,
+            "enabled" => true,
+        }).await.unwrap();
+
+        let st: crate::web::St = Arc::new(crate::web::AppState {
+            db,
+            cfg: crate::web::Config::default(),
+            entities,
+            excel_jobs: Mutex::new(HashMap::new()),
+            rt: tokio::runtime::Handle::current(),
+        });
+        let app = axum::Router::new()
+            .fallback(any(|ctx: Ctx| async move {
+                serve(ctx, "scm".to_string(), "stream".to_string(), "/".to_string()).await
+            }))
+            .with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resp = reqwest::get(format!("http://{}/svc/scm/stream/", addr)).await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body = resp.text().await.unwrap();
+        assert_eq!(body, "chunk-0\nchunk-1\nchunk-2\nchunk-3\n");
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
