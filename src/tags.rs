@@ -1144,6 +1144,14 @@ pub async fn tracker_updates(sc: &Sc, t: &Tracker, id: i64) -> String {
         if let Some(a) = i(r, "attachment_id") {
             if let Ok(Some(fl)) = db.get("file_link", a).await {
                 o.push_str(&format!("Attached file : <a href=\"/fileLink/get/{}\">{}</a><br/>", a, esc(&s(&fl, "name"))));
+                // pictures are shown in the trail (a g6 portal only links them)
+                if !crate::db::g6() && (crate::files::is_image_name(&s(&fl, "name")) || crate::files::is_image_name(&s(&fl, "path"))) {
+                    o.push_str(&format!(
+                        "<a href=\"/fileLink/get/{a}?inline=1\" target=\"_blank\" class=\"trail-image\"><img src=\"/fileLink/get/{a}?inline=1\" alt=\"{n}\" loading=\"lazy\" class=\"img-fluid border rounded my-2\" style=\"max-height:480px\"/></a><br/>",
+                        a = a,
+                        n = esc(&s(&fl, "name"))
+                    ));
+                }
             }
         }
         o.push_str(&format!("</td><td>{}</td><td>{}</td></tr>", esc(&s(r, "updater_name")), esc(&crate::groovy::java_date(&s(r, "update_date"), "HH:mm a dd-MMM-yy"))));

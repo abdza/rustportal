@@ -159,13 +159,18 @@ pub async fn upload(mut ctx: Ctx) -> Response {
     }
 }
 
+/// Whether a file name looks like a picture a browser can show inline.
+pub fn is_image_name(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].iter().any(|x| lower.ends_with(x))
+}
+
 /// HTML for a file link (used by display tags).
 pub async fn link_html(db: &Db, id: i64) -> String {
     match db.get("file_link", id).await {
         Ok(Some(f)) => {
             let name = s(&f, "name");
-            let lower = name.to_lowercase();
-            if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".gif") {
+            if is_image_name(&name) {
                 format!("<a href='/fileLink/get/{id}'><img src='/fileLink/get/{id}?inline=1' style='max-height:120px;max-width:200px' alt='{n}'/></a>", id = id, n = esc(&name))
             } else {
                 format!("<a href='/fileLink/get/{}' class='filelink'><i class='bi bi-paperclip'></i> {}</a>", id, esc(&name))
