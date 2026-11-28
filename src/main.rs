@@ -108,7 +108,7 @@ async fn controller(mut ctx: Ctx, c: &str, action: &str, idtxt: Option<String>) 
         ("portalTracker", "dropdownlist") => return tracker_web::dropdownlist(ctx).await,
         ("portalTracker", "api_list") => return tracker_web::api_list(ctx).await,
         ("portalTrackerField", "onchange") => return tracker_web::onchange(ctx).await,
-        ("portalTrackerField", "updateDb" | "createIndex" | "fromTable" | "multifields" | "excelTemplate" | "excelTemplateFields" | "submitExcelTemplate") => {
+        ("portalTrackerField", "updateDb" | "createIndex" | "defaultErrorChecks" | "fromTable" | "multifields" | "excelTemplate" | "excelTemplateFields" | "submitExcelTemplate") => {
             return tracker_admin::field_action(ctx, action, id).await;
         }
         ("portalTracker", "index") => return tracker_admin::index(ctx).await,

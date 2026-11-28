@@ -524,7 +524,11 @@ pub async fn field_errors(sc: &Sc, t: &Tracker, f: &Row, datas: &Row) -> Vec<(St
                 // a Grails portal's message is a Groovy expression, usually a quoted string
                 let evaluated = match crate::tracker::groovy_default(&custom) {
                     crate::tracker::GroovyDefault::Value(v) => Ok(v),
-                    crate::tracker::GroovyDefault::Code(code) => sc.eval(&code, &row! {"datas"=>Value::Object(datas.clone()),"field"=>Value::Object(f.clone()),"value"=>val.clone()}),
+                    crate::tracker::GroovyDefault::Code(code) => {
+                        // g6 messages are Groovy: single-quoted strings, val.toString().size()...
+                        let code = if crate::db::g6() || code.contains('\'') || crate::tracker::looks_groovy_snippet(&code) { crate::tracker::groovy_tracker_script(&code) } else { code };
+                        sc.eval(&code, &row! {"datas"=>Value::Object(datas.clone()),"field"=>Value::Object(f.clone()),"value"=>val.clone(),"val"=>val.clone()})
+                    }
                 };
                 match evaluated {
                     Ok(v) if !vs(&v).is_empty() => vs(&v),

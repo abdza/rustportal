@@ -585,10 +585,25 @@ impl Tracker {
                 "text" | "ntext" => "Text Area",
                 _ => "Text",
             };
-            db.insert("portal_tracker_field", &row! {"tracker_id"=>self.id,"name"=>name.clone(),"label"=>crate::entity::label_of(&name),"field_type"=>ft}).await?;
+            let fid = db.insert("portal_tracker_field", &row! {"tracker_id"=>self.id,"name"=>name.clone(),"label"=>crate::entity::label_of(&name),"field_type"=>ft}).await?;
+            create_default_error_checks(db, fid).await;
             n += 1;
         }
         Ok(n)
+    }
+
+    /// Gives every field of this tracker the default error checks it is missing (see
+    /// `default_error_checks`). Checks a developer already has, edited or not, are left alone.
+    /// Returns how many checks were created.
+    pub async fn create_default_error_checks(&self, db: &Db) -> usize {
+        let ids = db.rows("select id from portal_tracker_field where tracker_id=:t order by id", &row! {"t"=>self.id}).await.unwrap_or_default();
+        let mut n = 0;
+        for r in ids {
+            if let Some(fid) = i(&r, "id") {
+                n += create_default_error_checks(db, fid).await;
+            }
+        }
+        n
     }
 
     // ---------------- reading ----------------
@@ -1440,6 +1455,68 @@ pub fn groovy_default(code: &str) -> GroovyDefault {
     GroovyDefault::Code(r)
 }
 
+// ---------------- default field error checks ----------------
+
+/// The error checks worth having on a field of this type, as `portal_tracker_error` rows
+/// (without `field_id`). They mirror the column `updatedb` creates, so a value the database
+/// would truncate or refuse is caught on the form instead. A check is recognised by its
+/// description, so a developer can change its format or message freely.
+///
+/// Date and DateTime get nothing: the date pickers already enforce the format.
+/// Same checks, descriptions and messages as g6portal's PortalTrackerField.defaultErrorChecks().
+pub fn default_error_checks(field_type: &str, name: &str) -> Vec<Row> {
+    use std::sync::OnceLock;
+    // email, user_email, email_address, requester_e_mail... but not email_status or email_sent_date
+    static EMAIL: OnceLock<regex::Regex> = OnceLock::new();
+    let email = EMAIL.get_or_init(|| regex::Regex::new(r"^(?i)(?:.*[_ \-])?e[_\-]?mail(?:[_\-]?(?:address|addr|id))?$").unwrap());
+    let mut checks = vec![];
+    match field_type {
+        // varchar(256), see updatedb
+        "Text" => {
+            checks.push(row! {"description"=>"Auto: Maximum length","error_type"=>"Format","format"=>"(?s).{0,256}",
+                "error_msg"=>"field.label + ' cannot be longer than 256 characters (currently ' + val.toString().size() + ')'"});
+            if email.is_match(name.trim()) {
+                checks.push(row! {"description"=>"Auto: E-mail address","error_type"=>"E-mail"});
+            }
+        }
+        // numeric(24,0)
+        "Integer" => checks.push(row! {"description"=>"Auto: Whole number","error_type"=>"Format","format"=>r"-?\d{1,24}",
+            "error_msg"=>"field.label + ' must be a whole number of at most 24 digits'"}),
+        // decimal(24,6): 18 digits before the point; extra decimals are only rounded, so not refused
+        "Number" => checks.push(row! {"description"=>"Auto: Numeric","error_type"=>"Format","format"=>r"-?(\d{1,18}(\.\d*)?|\.\d+)",
+            "error_msg"=>"field.label + ' must be a number with at most 18 digits before the decimal point'"}),
+        _ => {}
+    }
+    checks
+}
+
+/// Adds whichever of `default_error_checks` the field does not have yet, matched by
+/// description. Safe to run again. Returns how many checks were created.
+pub async fn create_default_error_checks(db: &Db, field_id: i64) -> usize {
+    let Ok(Some(f)) = db.get("portal_tracker_field", field_id).await else { return 0 };
+    let existing: std::collections::HashSet<String> = db
+        .rows("select description from portal_tracker_error where field_id=:f", &row! {"f"=>field_id})
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| s(r, "description").trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    let mut n = 0;
+    for mut c in default_error_checks(&s(&f, "field_type"), &s(&f, "name")) {
+        if existing.contains(&s(&c, "description")) {
+            continue;
+        }
+        c.insert("field_id".into(), json!(field_id));
+        c.insert("allow_submission".into(), json!(false));
+        match db.insert("portal_tracker_error", &c).await {
+            Ok(_) => n += 1,
+            Err(e) => eprintln!("could not create default error check '{}' for field {}: {}", s(&c, "description"), s(&f, "name"), e),
+        }
+    }
+    n
+}
+
 pub fn looks_groovy_snippet(code: &str) -> bool {
     code.contains("g6portal.")
         || code.contains("def ")
@@ -1575,6 +1652,7 @@ pub fn groovy_tracker_script(code: &str) -> String {
     s = s.replace(" as Long", "");
     s = s.replace(" as Integer", "");
     s = s.replace(".size()", ".len()");
+    s = s.replace(".toString()", ".to_string()");
     s = s.replace("return null", "return ()");
 
     // Line-by-line fixes: `def x = ...`, `arr << x`, and braceless single-line `if(...) stmt`
@@ -1683,6 +1761,39 @@ mod default_tests {
         assert!(matches!(groovy_default("'#1a237e'"), GroovyDefault::Value(Value::String(v)) if v == "#1a237e"));
         assert!(matches!(groovy_default("session?.curuser?.userID"), GroovyDefault::Code(c) if c == "curuser?.userid"));
         assert!(matches!(groovy_default("params.event_id_default"), GroovyDefault::Code(c) if c == "params.event_id_default"));
+    }
+
+    #[test]
+    fn default_error_checks_match_g6() {
+        let names = |ft: &str, n: &str| default_error_checks(ft, n).iter().map(|c| s(c, "description")).collect::<Vec<_>>();
+        assert_eq!(names("Text", "title"), vec!["Auto: Maximum length"]);
+        for n in ["email", "user_email", "Email_Address", "requester_e_mail", "emailid"] {
+            assert_eq!(names("Text", n).len(), 2, "{n}");
+        }
+        for n in ["email_status", "email_sent_date", "gmail"] {
+            assert_eq!(names("Text", n).len(), 1, "{n}");
+        }
+        assert_eq!(names("Integer", "x"), vec!["Auto: Whole number"]);
+        assert_eq!(names("Number", "x"), vec!["Auto: Numeric"]);
+        assert!(names("Date", "x").is_empty() && names("DateTime", "x").is_empty() && names("Text Area", "x").is_empty());
+        // formats as tags::field_errors applies them (whole match)
+        let fmt = |ft: &str| regex::Regex::new(&format!("^(?:{})$", s(&default_error_checks(ft, "x")[0], "format"))).unwrap();
+        assert!(fmt("Text").is_match(&"a\nb".repeat(50)) && !fmt("Text").is_match(&"x".repeat(257)));
+        assert!(fmt("Integer").is_match("-123") && !fmt("Integer").is_match("1.5") && !fmt("Integer").is_match(&"9".repeat(25)));
+        let num = fmt("Number");
+        assert!(num.is_match("12.3456789") && num.is_match(".5") && num.is_match("-3") && num.is_match("4.") && !num.is_match("abc") && !num.is_match(&"9".repeat(19)));
+        // the Groovy messages evaluate once translated
+        let eng = rhai::Engine::new();
+        let mut scope = rhai::Scope::new();
+        let mut field = rhai::Map::new();
+        field.insert("label".into(), "Title".into());
+        scope.push("field", field);
+        scope.push("val", "x".repeat(300));
+        let msg: String = eng.eval_with_scope(&mut scope, &groovy_tracker_script(&s(&default_error_checks("Text", "x")[0], "error_msg"))).unwrap();
+        assert_eq!(msg, "Title cannot be longer than 256 characters (currently 300)");
+        for ft in ["Integer", "Number"] {
+            let _: String = eng.eval_with_scope(&mut scope, &groovy_tracker_script(&s(&default_error_checks(ft, "x")[0], "error_msg"))).unwrap();
+        }
     }
 
     #[test]

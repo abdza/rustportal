@@ -998,6 +998,9 @@ async fn after_save(ctx: &Ctx, e: &Entity, id: i64, created: bool) -> Option<Str
                 ensure_module(db, &db.get(e.table, id).await?.map(|r| s(&r, "module")).unwrap_or_default()).await;
             }
             "portalTrackerField" => {
+                if created {
+                    crate::tracker::create_default_error_checks(db, id).await;
+                }
                 if let Some(f) = db.get(e.table, id).await? {
                     if let Some(t) = Tracker::by_id(db, i(&f, "tracker_id").unwrap_or(0)).await {
                         t.updatedb(db).await?;

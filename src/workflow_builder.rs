@@ -887,7 +887,8 @@ pub async fn builder_action(ctx: Ctx, act: &str) -> Response {
                         .insert("portal_tracker_field", &row! {"tracker_id"=>t.id,"name"=>name.clone(),"label"=>label,"field_type"=>ft,"field_order"=>next_order})
                         .await
                     {
-                        Ok(_) => {
+                        Ok(fid) => {
+                            crate::tracker::create_default_error_checks(db, fid).await;
                             next_order += 1;
                             added.push(name);
                         }

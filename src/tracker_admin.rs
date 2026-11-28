@@ -330,6 +330,7 @@ pub async fn show(mut ctx: Ctx, id: i64) -> Response {
   <li><a class="create" href="/portalTrackerField/fromTable/{id}" onclick="return confirm('Import from table?');">From Table</a></li>
   <li><a class="create" href="/portalTrackerField/updateDb/{id}">Update DB</a></li>
   <li><a class="create" href="/portalTrackerField/createIndex/{id}">Create Index</a></li>
+  <li><a class="create" href="/portalTrackerField/defaultErrorChecks/{id}" onclick="return confirm('Create the default error checks every field is missing?');">Default Error Checks</a></li>
   <li><a class="create" href="/portalTracker/fix_file_links/{id}">Fix FileLinks</a></li>
   <li><a class="create" href="/portalTracker/fix_trail_file_links/{id}">Fix Trail FileLinks</a></li>
   <li><a class="create" href="/portalTracker/convert_text_columns/{id}" onclick="return confirm('Convert this tracker\'s text columns to varchar(max)?');">Text &rarr; varchar(max)</a></li>
@@ -915,6 +916,11 @@ pub async fn field_action(mut ctx: Ctx, act: &str, id: Option<i64>) -> Response 
             }
             ctx.redirect(&format!("/portalTracker/show/{tid}#fields-tab")).await
         }
+        "defaultErrorChecks" => {
+            let n = t.create_default_error_checks(db).await;
+            ctx.flash(&if n > 0 { format!("Created {n} default error check(s)") } else { "All fields already have their default error checks".to_string() });
+            ctx.redirect(&format!("/portalTracker/show/{tid}#fields-tab")).await
+        }
         "fromTable" => {
             match t.from_table(db).await {
                 Ok(n) => ctx.flash(&format!("Fields imported from DB ({n} added)")),
@@ -938,11 +944,8 @@ pub async fn field_action(mut ctx: Ctx, act: &str, id: Option<i64>) -> Response 
                     }
                     let lbl = labels.get(idx).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).unwrap_or_else(|| nm.clone());
                     let ft = types.get(idx).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).unwrap_or_else(|| "Text".into());
-                    if db
-                        .insert("portal_tracker_field", &row! {"tracker_id"=>tid,"name"=>nm,"label"=>lbl,"field_type"=>ft})
-                        .await
-                        .is_ok()
-                    {
+                    if let Ok(fid) = db.insert("portal_tracker_field", &row! {"tracker_id"=>tid,"name"=>nm,"label"=>lbl,"field_type"=>ft}).await {
+                        crate::tracker::create_default_error_checks(db, fid).await;
                         added += 1;
                     }
                 }
@@ -1143,7 +1146,8 @@ $('#addfield').on('click', function() {{
                             let _ = db.update("portal_tracker_field", fid, &d).await;
                             saved += 1;
                         }
-                    } else if db.insert("portal_tracker_field", &d).await.is_ok() {
+                    } else if let Ok(fid) = db.insert("portal_tracker_field", &d).await {
+                        crate::tracker::create_default_error_checks(db, fid).await;
                         saved += 1;
                     }
                 }
